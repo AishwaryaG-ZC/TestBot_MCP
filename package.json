@@ -1,32 +1,27 @@
 {
-  "name": "qa_testing_poc",
+  "name": "testbot-mcp-workspace",
   "version": "1.0.0",
-  "description": "QA testing POC with Testbot MCP and dashboard webapp",
+  "description": "Testbot MCP",
   "main": "index.js",
   "scripts": {
-    "test": "playwright test",
-    "test:ui": "playwright test --ui",
-    "test:report": "playwright show-report",
-    "test:dashboard": "playwright test && npm run dashboard:build",
-    "db:up": "docker compose up -d",
-    "db:down": "docker compose down"
+    "dev:webapp": "npm run dev -w webapp",
+    "start:testbot": "npm start -w @testbot/mcp",
+    "test:webapp": "npm run test -w webapp",
+    "test:testbot": "npm run test -w @testbot/mcp"
   },
+  "workspaces": [
+    "testbot-mcp",
+    "webapp"
+  ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/krishsharma1008/ShipCruiseTour_POC.git"
+    "url": "git+https://github.com/krishsharma1008/TestBot_MCP.git"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/krishsharma1008/ShipCruiseTour_POC/issues"
-  },
-  "homepage": "https://github.com/krishsharma1008/ShipCruiseTour_POC#readme",
+  "license": "MIT",
   "devDependencies": {
-    "@playwright/test": "^1.57.0",
-    "node-fetch": "^2.7.0"
-  },
-  "dependencies": {
-    "dotenv": "^17.2.3"
+    "@playwright/mcp": "^0.0.61",
+    "@playwright/test": "^1.58.2"
   }
 }

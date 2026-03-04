@@ -1,39 +1,41 @@
-# Node modules
+# Dependencies
 node_modules/
 
-# Test results and reports
-test-results/
-test-results.json
-playwright-report/
-testbot-reports/
-playwright/.cache/
-
-# Custom dashboard generated files
-# custom-report/
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# IDE files
-.vscode/
-.idea/
-.claude/
-*.swp
-*.swo
-*~
-
-# Logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Environment variables
+# Environment
 .env
 .env.local
 .env.*.local
 
-# AI Agent
-# ai-agent-reports/
-*.backup.*
+# Test outputs
+test-results/
+testbot-reports/
+playwright-report/
+.last-run.json
+
+# Cache
+.testbot-cascade/
+.testbot-windsurf/
+.testbot-jira-cache/
+.cascade-temp/
+.cascade-workspace/
+.ai-agent-temp/
+ai-agent-requests/
+
+# Build
+dist/
+build/
+*.tgz
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# Debug
+debug/

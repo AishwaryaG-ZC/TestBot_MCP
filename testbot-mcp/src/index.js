@@ -1,236 +1,476 @@
 /**
  * Testbot MCP Server
  * One-command testing with AI-powered analysis for any project
- * 
+ *
  * Usage: User says "test my app using testbot mcp" in Cursor/Windsurf
  */
 
-// Load environment variables first (silent mode)
-require('dotenv').config();
+// Load environment variables - try multiple paths since CWD varies when launched from IDE
+const path = require('path');
+const dotenvPaths = [
+  path.join(__dirname, '.env'),
+  path.join(__dirname, '..', '.env'),
+  path.join(__dirname, '..', '..', '.env'),
+  path.join(process.cwd(), '.env'),
+];
+for (const envPath of dotenvPaths) {
+  const { error } = require('dotenv').config({ path: envPath });
+  if (!error) { break; } // stop at first working .env
+}
 
-const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
-const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
-const {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} = require('@modelcontextprotocol/sdk/types.js');
+const { fork } = require('child_process');
+const fs = require('fs');
+const { URL } = require('url');
+const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
+const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
+const { z } = require('zod');
 
+const Logger = require('./logger');
 const AutoDetector = require('./auto-detector');
 const PlaywrightIntegration = require('./playwright-integration');
-const PlaywrightMCPClient = require('./playwright-mcp-client');
-const PlaywrightMCPIntegration = require('./playwright-mcp-integration');
-const ResultsMerger = require('./results-merger');
-const ContextGatherer = require('./context-gatherer');
 const AIAnalyzer = require('./ai-providers/index');
-const JiraClient = require('./jira/client');
 const ReportGenerator = require('./report-generator');
 const DashboardLauncher = require('./dashboard-launcher');
 const ConfigUILauncher = require('./config-ui-launcher');
-const AgentContextRequester = require('./agent-context-requester');
-const OpenAITestGenerator = require('./test-generator-openai');
+
+const UI_SUBMISSION_SCHEMA = z.object({
+  testType: z.enum(['frontend', 'backend', 'both']),
+  scope: z.enum(['codebase', 'diff']).optional(),
+  baseURL: z.string().url(),
+  startCommand: z.string().min(1).max(500),
+  generateTests: z.boolean(),
+  openDashboard: z.boolean(),
+  credentials: z.object({
+    username: z.string().max(200).optional(),
+    password: z.string().max(200).optional(),
+  }).optional(),
+  prd: z.object({
+    name: z.string().min(1).max(255),
+    contentType: z.string().min(1).max(128).optional(),
+    textContent: z.string().min(1).max(500000),
+  }).optional().nullable(),
+});
+
+const WORKFLOW_OBJECT_SCHEMA = z.object({
+  name: z.string().min(1).max(200),
+  description: z.string().max(4000).optional(),
+  steps: z.array(z.string().min(1).max(500)).max(100).optional(),
+  criticalAssertions: z.array(z.string().min(1).max(500)).max(100).optional(),
+}).passthrough();
+
+const CODEBASE_CONTEXT_SCHEMA = z.object({
+  pages: z.array(z.any()).optional(),
+  apiEndpoints: z.array(z.any()).optional(),
+  workflows: z.array(z.union([z.string().min(1).max(500), WORKFLOW_OBJECT_SCHEMA])).optional(),
+}).passthrough();
+
+const PLAYWRIGHT_MCP_OPTIONS_SCHEMA = z.object({
+  enabled: z.boolean().optional(),
+  mcpPackageName: z.literal('@playwright/mcp').optional(),
+  mcpVersion: z.string().regex(/^(?!latest$)[0-9A-Za-z._-]+$/).optional(),
+  noInstall: z.boolean().optional(),
+}).optional();
+
+const RESULT_MERGE_OPTIONS_SCHEMA = z.object({
+  dedupeStrategy: z.enum(['legacy', 'strict']).optional(),
+}).optional();
+
+const LOG_REDACTION_OPTIONS_SCHEMA = z.object({
+  enabled: z.boolean().optional(),
+  level: z.enum(['balanced', 'strict']).optional(),
+}).optional();
 
 class TestbotMCPServer {
   constructor() {
-    this.server = new Server(
-      {
-        name: 'testbot-mcp',
-        version: '1.0.0',
-      },
-      {
-        capabilities: {
-          tools: {},
-        },
-      }
-    );
+    Logger.initialize();
+    console.error('[DEBUG] TestBot MCP Server starting - VERSION WITH ZOD SCHEMAS');
+    this.server = new McpServer({
+      name: "testbot-mcp",
+      version: "1.1.0"
+    });
 
-    this.setupToolHandlers();
+    this.registerTools();
     this.setupErrorHandling();
   }
 
-  setupToolHandlers() {
-    // List available tools
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [
-        {
-          name: 'testbot_configure',
-          description: 'Analyze a project and return configuration options before testing. Use this first to understand the project structure, then use the returned configuration with testbot_test_my_app. Returns detected settings and questions for the user to answer.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the project to analyze (defaults to current workspace)',
-              },
-            },
-          },
-        },
-        {
-          name: 'testbot_test_my_app',
-          description: 'Test your application end-to-end with AI-powered analysis. Generates tests, runs them, analyzes failures with AI, and opens a beautiful dashboard with results. For best results, run testbot_configure first to get recommended settings.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the project to test (defaults to current workspace)',
-              },
-              testType: {
-                type: 'string',
-                enum: ['frontend', 'backend', 'both'],
-                description: 'Type of tests to run',
-              },
-              generateTests: {
-                type: 'boolean',
-                description: 'Whether to generate new tests (true) or use existing tests (false)',
-              },
-              prdFile: {
-                type: 'string',
-                description: 'Path to PRD/requirements document for test generation (optional)',
-              },
-              codebaseContext: {
-                type: 'object',
-                description: 'Structured codebase context from AI agent analysis (pages, apiEndpoints, workflows)',
-                properties: {
-                  pages: {
-                    type: 'array',
-                    description: 'Frontend pages/routes with their components and interactions',
-                  },
-                  apiEndpoints: {
-                    type: 'array',
-                    description: 'Backend API endpoints with methods and schemas',
-                  },
-                  workflows: {
-                    type: 'array',
-                    description: 'Main user workflows to test',
-                  },
-                },
-              },
-              baseURL: {
-                type: 'string',
-                description: 'Base URL for the application under test',
-              },
-              port: {
-                type: 'number',
-                description: 'Port number the app runs on',
-              },
-              startCommand: {
-                type: 'string',
-                description: 'Command to start the app server (e.g., "npm start")',
-              },
-              aiProvider: {
-                type: 'string',
-                enum: ['sarvam', 'cascade', 'windsurf', 'openai', 'none'],
-                description: 'AI provider for failure analysis',
-              },
-              openaiApiKey: {
-                type: 'string',
-                description: 'OpenAI API key for test generation (or set OPENAI_API_KEY env var)',
-              },
-              aiApiKey: {
-                type: 'string',
-                description: 'API key for the AI provider',
-              },
-              jira: {
-                type: 'object',
-                description: 'Jira integration configuration',
-                properties: {
-                  enabled: { type: 'boolean' },
-                  baseUrl: { type: 'string' },
-                  email: { type: 'string' },
-                  apiToken: { type: 'string' },
-                  projectKey: { type: 'string' },
-                },
-              },
-              openDashboard: {
-                type: 'boolean',
-                description: 'Whether to automatically open the dashboard after tests (default: true)',
-              },
-            },
-          },
-        },
-        {
-          name: 'testbot_analyze_failures',
-          description: 'Analyze existing test failures with AI without running new tests',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the project',
-              },
-              testResultsPath: {
-                type: 'string',
-                description: 'Path to test-results.json file',
-              },
-              aiProvider: {
-                type: 'string',
-                enum: ['sarvam', 'cascade', 'windsurf'],
-                description: 'AI provider for failure analysis',
-              },
-            },
-            required: ['projectPath'],
-          },
-        },
-        {
-          name: 'testbot_generate_report',
-          description: 'Generate a dashboard report from existing test results',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the project',
-              },
-              testResultsPath: {
-                type: 'string',
-                description: 'Path to test-results.json file',
-              },
-              openDashboard: {
-                type: 'boolean',
-                description: 'Whether to automatically open the dashboard',
-              },
-            },
-            required: ['projectPath'],
-          },
-        },
-      ],
-    }));
+  createAutoDetector() {
+    return new AutoDetector();
+  }
 
-    // Handle tool calls
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: args } = request.params;
+  createConfigUILauncher(config = {}) {
+    return new ConfigUILauncher(config);
+  }
 
-      try {
-        switch (name) {
-          case 'testbot_configure':
-            return await this.handleConfigure(args);
-          case 'testbot_test_my_app':
-            return await this.handleTestMyApp(args);
-          case 'testbot_analyze_failures':
-            return await this.handleAnalyzeFailures(args);
-          case 'testbot_generate_report':
-            return await this.handleGenerateReport(args);
-          default:
-            throw new Error(`Unknown tool: ${name}`);
-        }
-      } catch (error) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Error: ${error.message}\n${error.stack}`,
-            },
-          ],
-          isError: true,
-        };
+  writeRunStatus(statusFile, data) {
+    try {
+      fs.writeFileSync(
+        statusFile,
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          ...data,
+        }, null, 2)
+      );
+    } catch (error) {
+      Logger.error('Index', 'Failed to write run status', error, { statusFile });
+    }
+  }
+
+  extractPortFromBaseURL(baseURL, fallbackPort) {
+    try {
+      const parsed = new URL(baseURL);
+      return parsed.port ? parseInt(parsed.port, 10) : fallbackPort;
+    } catch {
+      return fallbackPort;
+    }
+  }
+
+  persistUploadedPrd(statusDir, prdPayload) {
+    if (!prdPayload?.textContent) {
+      return undefined;
+    }
+
+    const allowedExtensions = new Set(['.md', '.txt', '.json', '.yaml', '.yml']);
+    const originalName = path.basename(prdPayload.name || 'uploaded-prd.md');
+    const ext = path.extname(originalName).toLowerCase();
+    const safeExt = allowedExtensions.has(ext) ? ext : '.md';
+    const fileName = `uploaded-prd${safeExt}`;
+    const filePath = path.join(statusDir, fileName);
+
+    fs.writeFileSync(filePath, prdPayload.textContent, 'utf-8');
+    return filePath;
+  }
+
+  validateUISubmission(rawConfig) {
+    const parsed = UI_SUBMISSION_SCHEMA.safeParse(rawConfig);
+    if (!parsed.success) {
+      const firstIssue = parsed.error.issues[0];
+      const error = new Error(`Invalid configuration payload: ${firstIssue?.message || 'unknown error'}`);
+      error.code = 'CONFIG_INVALID';
+      throw error;
+    }
+    return parsed.data;
+  }
+
+  normalizeCodebaseContext(input) {
+    if (!input) {
+      return null;
+    }
+
+    const normalized = { ...input };
+    if (Array.isArray(input.workflows)) {
+      normalized.workflows = input.workflows
+        .map((workflow) => {
+          if (typeof workflow === 'string') {
+            const name = workflow.trim();
+            if (!name) return null;
+            return {
+              name,
+              description: name,
+              steps: [],
+            };
+          }
+
+          if (!workflow || typeof workflow !== 'object') {
+            return null;
+          }
+
+          const name = String(workflow.name || workflow.description || '').trim();
+          if (!name) {
+            return null;
+          }
+
+          return {
+            ...workflow,
+            name,
+            steps: Array.isArray(workflow.steps)
+              ? workflow.steps.map((step) => String(step))
+              : [],
+            criticalAssertions: Array.isArray(workflow.criticalAssertions)
+              ? workflow.criticalAssertions.map((item) => String(item))
+              : [],
+          };
+        })
+        .filter(Boolean);
+    }
+
+    return normalized;
+  }
+
+  createBasePipelineConfig(context, params) {
+    return {
+      projectPath: context.projectPath,
+      projectName: context.projectName,
+      language: context.language,
+      ecosystem: context.ecosystem,
+      testType: params.testType || 'both',
+      generateTests: params.generateTests !== false,
+      prdFile: params.prdFile,
+      codebaseContext: this.normalizeCodebaseContext(params.codebaseContext),
+      baseURL: params.baseURL || context.baseURL,
+      port: params.port || context.port,
+      startCommand: params.startCommand || context.startCommand,
+      jira: params.jira,
+      openDashboard: params.openDashboard !== false,
+      generationMode: params.generationMode || 'openai-first',
+      artifactMode: params.artifactMode || 'hybrid',
+      browserMode: params.browserMode || 'chromium',
+      validateGeneratedTests: params.validateGeneratedTests !== false,
+      aiFailureAnalysis: params.aiFailureAnalysis !== false,
+      playwrightMcp: params.playwrightMcp || {},
+      resultMerge: params.resultMerge || {},
+      logRedaction: params.logRedaction || {},
+    };
+  }
+
+  async continuePipelineAfterConfig({
+    waitForConfig,
+    runId,
+    statusFile,
+    statusDir,
+    baseConfig,
+  }) {
+    try {
+      const uiSubmission = await waitForConfig;
+      const validatedConfig = this.validateUISubmission(uiSubmission);
+
+      this.writeRunStatus(statusFile, {
+        runId,
+        phase: 'config_received',
+        message: 'Configuration received from UI.',
+        project: baseConfig.projectName,
+      });
+
+      const prdFile = this.persistUploadedPrd(statusDir, validatedConfig.prd);
+      const finalConfig = {
+        ...baseConfig,
+        testType: validatedConfig.testType,
+        generateTests: validatedConfig.generateTests,
+        openDashboard: validatedConfig.openDashboard,
+        startCommand: validatedConfig.startCommand,
+        baseURL: validatedConfig.baseURL,
+        port: this.extractPortFromBaseURL(validatedConfig.baseURL, baseConfig.port),
+        prdFile,
+      };
+
+      if (validatedConfig.credentials?.username || validatedConfig.credentials?.password) {
+        finalConfig.testCredentials = validatedConfig.credentials;
       }
+
+      this.writeRunStatus(statusFile, {
+        runId,
+        phase: 'starting_pipeline',
+        message: 'Validated configuration. Starting pipeline worker...',
+        project: baseConfig.projectName,
+      });
+
+      this.runPipelineInBackground(finalConfig, runId);
+
+      this.writeRunStatus(statusFile, {
+        runId,
+        phase: 'started',
+        message: 'Pipeline worker started.',
+        project: baseConfig.projectName,
+      });
+    } catch (error) {
+      const errorCode = error.code === 'CONFIG_INVALID'
+        ? 'CONFIG_INVALID'
+        : (String(error.message).toLowerCase().includes('timeout') ? 'CONFIG_TIMEOUT' : 'CONFIG_ERROR');
+
+      this.writeRunStatus(statusFile, {
+        runId,
+        phase: 'error',
+        message: `Configuration failed: ${error.message}`,
+        error: error.message,
+        errorCode,
+        project: baseConfig.projectName,
+      });
+      Logger.error('Index', 'Configuration UI flow failed', error, { runId, errorCode });
+    }
+  }
+
+  /**
+   * Fork a background worker to run the full test pipeline.
+   * Returns immediately so the MCP request handler can respond fast.
+   */
+  runPipelineInBackground(config, runId) {
+    const workerPath = path.join(__dirname, 'pipeline-worker.js');
+    Logger.info('Index', `Forking pipeline worker in background`, { runId, projectPath: config.projectPath });
+
+    const child = fork(workerPath, [], {
+      stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+      env: { ...process.env },
     });
+
+    // Pipe worker stderr to our stderr for debugging
+    if (child.stderr) {
+      child.stderr.on('data', (data) => {
+        process.stderr.write(data);
+      });
+    }
+
+    // Send config to worker via IPC
+    child.send({ config, runId });
+
+    // Disconnect IPC and unref so MCP server is not blocked
+    child.on('message', () => {}); // drain any messages
+    setTimeout(() => {
+      try { child.disconnect(); } catch (e) { /* already disconnected */ }
+    }, 1000);
+    child.unref();
+
+    Logger.info('Index', `Pipeline worker forked`, { pid: child.pid, runId });
+  }
+
+  registerTools() {
+    this.server.registerTool(
+      'testbot_configure',
+      {
+        description: 'Analyze a project and return configuration options before testing. Use this first to understand the project structure, then use the returned configuration with testbot_test_my_app. Returns detected settings and questions for the user to answer.',
+        inputSchema: z.object({
+          projectPath: z.string().optional().describe('Path to the project to analyze (defaults to current workspace)'),
+        }),
+      },
+      async (args, extra) => {
+        console.error('[DEBUG] testbot_configure called with args:', JSON.stringify(args));
+        Logger.mcp('Index', `Tool called: testbot_configure`, { args: Logger.redact(args) });
+        try {
+          const result = await this.handleConfigure(args);
+          console.error('[DEBUG] testbot_configure returning result');
+          return result;
+        } catch (error) {
+          console.error('[DEBUG] testbot_configure error:', error.message);
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Error: ${error.message}\n${error.stack}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+
+    this.server.registerTool(
+      'testbot_test_my_app',
+      {
+        description: 'Test your application end-to-end with AI-powered analysis. Opens a configuration UI by default, then generates tests, runs them, analyzes failures with AI, and opens a dashboard with results. Returns immediately with a run ID and config URL while awaiting configuration.',
+        inputSchema: z.object({
+          projectPath: z.string().optional().describe('Path to the project to test (defaults to current workspace)'),
+          testType: z.enum(['frontend', 'backend', 'both']).optional().describe('Type of tests to run'),
+          generateTests: z.boolean().optional().describe('Whether to generate new tests (true) or use existing tests (false)'),
+          prdFile: z.string().optional().describe('Path to PRD/requirements document for test generation (optional)'),
+          codebaseContext: CODEBASE_CONTEXT_SCHEMA.optional().describe('Structured codebase context from AI agent analysis (pages, apiEndpoints, workflows)'),
+          baseURL: z.string().optional().describe('Base URL for the application under test'),
+          port: z.number().optional().describe('Port number the app runs on'),
+          startCommand: z.string().optional().describe('Command to start the app server (e.g., "npm start")'),
+          jira: z.object({
+            enabled: z.boolean().optional(),
+            baseUrl: z.string().optional(),
+            email: z.string().optional(),
+            apiToken: z.string().optional(),
+            projectKey: z.string().optional(),
+          }).optional().describe('Jira integration configuration'),
+          openDashboard: z.boolean().optional().describe('Whether to automatically open the dashboard after tests (default: true)'),
+          showConfigUI: z.boolean().optional().describe('Show configuration UI before starting pipeline (default: true)'),
+          generationMode: z.enum(['openai-first', 'openai-only', 'template-only', 'saas-only']).optional().describe('Generation strategy'),
+          artifactMode: z.enum(['hybrid', 'full']).optional().describe('Artifact capture mode'),
+          browserMode: z.enum(['chromium', 'smoke-matrix', 'full-matrix']).optional().describe('Browser execution mode'),
+          validateGeneratedTests: z.boolean().optional().describe('Validate generated tests before execution'),
+          aiFailureAnalysis: z.boolean().optional().describe('Enable AI analysis for failed tests'),
+          playwrightMcp: PLAYWRIGHT_MCP_OPTIONS_SCHEMA.describe('Playwright MCP execution options'),
+          resultMerge: RESULT_MERGE_OPTIONS_SCHEMA.describe('Result merge options'),
+          logRedaction: LOG_REDACTION_OPTIONS_SCHEMA.describe('Log redaction controls'),
+        }),
+      },
+      async (args, extra) => {
+        console.error('[DEBUG] testbot_test_my_app called with args:', JSON.stringify(args));
+        Logger.mcp('Index', `Tool called: testbot_test_my_app`, { args: Logger.redact(args) });
+        try {
+          const result = await this.handleTestMyApp(args);
+          console.error('[DEBUG] testbot_test_my_app returning result');
+          return result;
+        } catch (error) {
+          console.error('[DEBUG] testbot_test_my_app error:', error.message);
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Error: ${error.message}\n${error.stack}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+
+    this.server.registerTool(
+      'testbot_analyze_failures',
+      {
+        description: 'Analyze existing test failures with AI without running new tests',
+        inputSchema: z.object({
+          projectPath: z.string().describe('Path to the project'),
+          testResultsPath: z.string().optional().describe('Path to test-results.json file'),
+          aiProvider: z.enum(['sarvam', 'cascade', 'windsurf']).optional().describe('AI provider for failure analysis'),
+        }),
+      },
+      async (args, extra) => {
+        Logger.mcp('Index', `Tool called: testbot_analyze_failures`, { args: Logger.redact(args) });
+        try {
+          return await this.handleAnalyzeFailures(args);
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Error: ${error.message}\n${error.stack}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+
+    this.server.registerTool(
+      'testbot_generate_report',
+      {
+        description: 'Generate a dashboard report from existing test results',
+        inputSchema: z.object({
+          projectPath: z.string().describe('Path to the project'),
+          testResultsPath: z.string().optional().describe('Path to test-results.json file'),
+          openDashboard: z.boolean().optional().describe('Whether to automatically open the dashboard'),
+        }),
+      },
+      async (args, extra) => {
+        Logger.mcp('Index', `Tool called: testbot_generate_report`, { args: Logger.redact(args) });
+        try {
+          return await this.handleGenerateReport(args);
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Error: ${error.message}\n${error.stack}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
   }
 
   setupErrorHandling() {
-    this.server.onerror = (error) => {
-      console.error('[Testbot MCP Error]', error);
-    };
+    process.on('uncaughtException', (error) => {
+      Logger.error('Index', `[Testbot MCP Uncaught Exception]`, error);
+    });
+
+    process.on('unhandledRejection', (reason, promise) => {
+      Logger.error('Index', `[Testbot MCP Unhandled Rejection]`, { reason, promise });
+    });
 
     process.on('SIGINT', async () => {
       await this.server.close();
@@ -242,56 +482,56 @@ class TestbotMCPServer {
    * Configure tool: Analyze project and return configuration options
    */
   async handleConfigure(params) {
-    const log = (msg) => console.error(`[Testbot] ${msg}`);
-    const fs = require('fs');
-    const path = require('path');
+    Logger.mcp('Index', 'handleConfigure called', { params: Logger.redact(params) });
 
     try {
       const projectPath = params.projectPath || process.cwd();
-      
-      log('Analyzing project for configuration...');
-      
+
+      Logger.info('Index', 'Analyzing project for configuration...');
+
       // 1. Auto-detect project settings
       const detector = new AutoDetector();
       const context = await detector.detect(projectPath);
-      
-      log(`Detected project: ${context.projectName}`);
-      log(`Framework detection: ${context.hasPlaywright ? 'Playwright found' : 'No Playwright config'}`);
-      
+
+      Logger.info('Index', `Detected project: ${context.projectName} (${context.language})`);
+      Logger.info('Index', `Framework detection: ${context.hasPlaywright ? 'Playwright found' : 'No Playwright config'}`);
+
       // 2. Scan for existing tests
       const existingTests = this.scanExistingTests(projectPath);
-      log(`Found ${existingTests.count} existing test files`);
-      
+      Logger.info('Index', `Found ${existingTests.count} existing test files`);
+
       // 3. Check for PRD/requirements files
       const prdFiles = this.findPRDFiles(projectPath);
-      log(`Found ${prdFiles.length} potential PRD files`);
-      
+      Logger.info('Index', `Found ${prdFiles.length} potential PRD files`);
+
       // 4. Check for Jira configuration
       const hasJiraConfig = context.hasJira || !!(
-        process.env.JIRA_BASE_URL && 
-        process.env.JIRA_API_TOKEN && 
+        process.env.JIRA_BASE_URL &&
+        process.env.JIRA_API_TOKEN &&
         process.env.JIRA_PROJECT_KEY
       );
-      
+
       // 5. Build configuration response with questions
       const config = {
         projectInfo: {
           name: context.projectName,
           path: context.projectPath,
+          language: context.language,
+          ecosystem: context.ecosystem,
           framework: this.detectFramework(context),
           port: context.port,
           baseURL: context.baseURL,
           startCommand: context.startCommand,
           hasPlaywrightConfig: context.hasPlaywright,
           hasExistingTests: existingTests.count > 0,
-          existingTestFiles: existingTests.files.slice(0, 10), // Show first 10
+          existingTestFiles: existingTests.files.slice(0, 10),
           totalTestFiles: existingTests.count,
           testDirectories: context.testDirs,
         },
         prdFiles: prdFiles,
         jiraAvailable: hasJiraConfig,
         aiProviderAvailable: !!(process.env.SARVAM_API_KEY || process.env.AI_API_KEY),
-        
+
         // Questions for the user to answer
         questions: [
           {
@@ -303,20 +543,20 @@ class TestbotMCPServer {
           },
           {
             id: 'generateTests',
-            prompt: existingTests.count > 0 
+            prompt: existingTests.count > 0
               ? `Found ${existingTests.count} existing tests. Generate new tests or use existing?`
               : 'No existing tests found. Should I generate tests?',
-            options: existingTests.count > 0 
+            options: existingTests.count > 0
               ? ['generate_new', 'use_existing', 'both']
               : ['generate_new', 'skip'],
             default: existingTests.count > 0 ? 'use_existing' : 'generate_new',
             description: 'generate_new creates tests from codebase analysis, use_existing runs your current tests'
           },
         ],
-        
+
         // Context prompt for the AI agent to analyze codebase
         contextPrompt: this.buildContextPrompt(projectPath, context),
-        
+
         // Recommended configuration based on detection
         recommendedConfig: {
           projectPath: context.projectPath,
@@ -330,7 +570,7 @@ class TestbotMCPServer {
           openDashboard: true,
         }
       };
-      
+
       // Add PRD question if files found
       if (prdFiles.length > 0) {
         config.questions.push({
@@ -341,7 +581,7 @@ class TestbotMCPServer {
           description: 'PRD files help generate more accurate tests based on requirements'
         });
       }
-      
+
       // Add Jira question if available
       if (hasJiraConfig) {
         config.questions.push({
@@ -352,7 +592,7 @@ class TestbotMCPServer {
           description: 'Fetch active Jira stories and generate tests from acceptance criteria'
         });
       }
-      
+
       // Add AI analysis question
       if (config.aiProviderAvailable) {
         config.questions.push({
@@ -373,7 +613,7 @@ class TestbotMCPServer {
         ],
       };
     } catch (error) {
-      log(`Configuration error: ${error.message}`);
+      Logger.error('Index', `Configuration error`, error);
       throw error;
     }
   }
@@ -387,10 +627,10 @@ class TestbotMCPServer {
     const testDirs = ['tests', 'test', '__tests__', 'spec', 'specs', 'e2e', 'cypress', 'playwright'];
     const testPatterns = ['.spec.js', '.spec.ts', '.test.js', '.test.ts', '.e2e.js', '.e2e.ts'];
     const files = [];
-    
+
     const scanDir = (dir) => {
       if (!fs.existsSync(dir)) return;
-      
+
       try {
         const entries = fs.readdirSync(dir, { withFileTypes: true });
         for (const entry of entries) {
@@ -407,15 +647,15 @@ class TestbotMCPServer {
         // Ignore permission errors
       }
     };
-    
+
     // Scan test directories
     for (const testDir of testDirs) {
       scanDir(path.join(projectPath, testDir));
     }
-    
+
     // Also check root for test files
     scanDir(projectPath);
-    
+
     return {
       count: files.length,
       files: files
@@ -429,27 +669,26 @@ class TestbotMCPServer {
     const fs = require('fs');
     const path = require('path');
     const prdPatterns = [
-      'prd.md', 'PRD.md', 'plan.md', 'Plan.md', 
+      'prd.md', 'PRD.md', 'plan.md', 'Plan.md',
       'requirements.md', 'Requirements.md', 'REQUIREMENTS.md',
       'spec.md', 'specs.md', 'specification.md',
       'docs/prd.md', 'docs/requirements.md', 'docs/plan.md',
       'documentation/prd.md', 'documentation/requirements.md',
     ];
-    
+
     const found = [];
-    
+
     for (const pattern of prdPatterns) {
       const filePath = path.join(projectPath, pattern);
       if (fs.existsSync(filePath)) {
         found.push(pattern);
       }
     }
-    
+
     // Also check for README if nothing else found
     if (found.length === 0) {
       const readmePath = path.join(projectPath, 'README.md');
       if (fs.existsSync(readmePath)) {
-        // Check if README has requirements/features section
         try {
           const content = fs.readFileSync(readmePath, 'utf-8').toLowerCase();
           if (content.includes('requirements') || content.includes('features') || content.includes('user stories')) {
@@ -460,7 +699,7 @@ class TestbotMCPServer {
         }
       }
     }
-    
+
     return found;
   }
 
@@ -470,14 +709,18 @@ class TestbotMCPServer {
   detectFramework(context) {
     const packageJson = context.packageJson;
     if (!packageJson?.dependencies && !packageJson?.devDependencies) {
+      // For non-Node.js projects, return language-based framework
+      if (context.language && context.language !== 'javascript') {
+        return context.language.charAt(0).toUpperCase() + context.language.slice(1);
+      }
       return 'Unknown';
     }
-    
+
     const allDeps = {
       ...packageJson.dependencies,
       ...packageJson.devDependencies
     };
-    
+
     if (allDeps.next) return 'Next.js';
     if (allDeps.nuxt) return 'Nuxt.js';
     if (allDeps['@angular/core']) return 'Angular';
@@ -488,7 +731,7 @@ class TestbotMCPServer {
     if (allDeps.fastify) return 'Fastify';
     if (allDeps.koa) return 'Koa';
     if (allDeps.nest) return 'NestJS';
-    
+
     return 'Node.js';
   }
 
@@ -501,6 +744,7 @@ Please analyze the codebase at ${projectPath} and provide structured information
 
 **Project Info:**
 - Name: ${context.projectName}
+- Language: ${context.language || 'Unknown'}
 - Framework: ${this.detectFramework(context)}
 - Port: ${context.port}
 - Base URL: ${context.baseURL}
@@ -528,9 +772,21 @@ Please analyze the codebase at ${projectPath} and provide structured information
     }
   ],
   "workflows": [
-    "User registration flow",
-    "User login flow",
-    "Main feature workflow"
+    {
+      "name": "User registration flow",
+      "description": "New user can create an account",
+      "steps": ["Navigate to register", "Fill form", "Submit", "Verify success state"]
+    },
+    {
+      "name": "User login flow",
+      "description": "Existing user signs in",
+      "steps": ["Navigate to login", "Enter credentials", "Submit", "Verify redirect to dashboard"]
+    },
+    {
+      "name": "Main feature workflow",
+      "description": "Core value path for primary feature",
+      "steps": ["Open feature page", "Perform action", "Verify persisted result"]
+    }
   ],
   "testPriorities": [
     { "feature": "Authentication", "priority": "high", "reason": "Core functionality" },
@@ -553,320 +809,168 @@ Return the JSON structure above based on what you find in the codebase.
 
   /**
    * Main tool: Test the app end-to-end
+   * Returns immediately and runs the pipeline in a background worker.
    */
   async handleTestMyApp(params) {
-    const log = (msg) => console.error(`[Testbot] ${msg}`);
+    if (params?.logRedaction) {
+      Logger.setRedaction(params.logRedaction);
+    }
 
-    try {
-      // 1. Auto-detect project context
-      log('Detecting project settings...');
-      const detector = new AutoDetector();
-      const context = await detector.detect(params.projectPath || process.cwd());
+    Logger.mcp('Index', 'handleTestMyApp called', { params: Logger.redact(params) });
 
-      log(`Project: ${context.projectName}`);
-      log(`Path: ${context.projectPath}`);
+    // 1. Fast auto-detection (~100ms)
+    Logger.info('Index', 'Detecting project settings...');
+    const detector = this.createAutoDetector();
+    const context = await detector.detect(params.projectPath || process.cwd());
 
-      // Merge params with detected context
-      const config = {
-        projectPath: context.projectPath,
-        projectName: context.projectName,
-        testType: params.testType || 'both',
-        generateTests: params.generateTests !== false,
-        prdFile: params.prdFile,
-        codebaseContext: params.codebaseContext || null,
-        baseURL: params.baseURL || context.baseURL,
-        port: params.port || context.port,
-        startCommand: params.startCommand || context.startCommand,
-        aiProvider: params.aiProvider || process.env.AI_PROVIDER || 'sarvam',
-        aiApiKey: params.aiApiKey || process.env.SARVAM_API_KEY || process.env.AI_API_KEY,
-        openaiApiKey: params.openaiApiKey || process.env.OPENAI_API_KEY,
-        jira: params.jira,
-        openDashboard: params.openDashboard !== false,
-      };
+    Logger.info('Index', `Project: ${context.projectName} (${context.language})`, { path: context.projectPath });
 
-      // 2. Jira integration (optional)
-      let jiraStories = null;
-      if (config.jira?.enabled) {
-        log('Fetching Jira stories...');
-        const jiraClient = new JiraClient(config.jira);
-        jiraStories = await jiraClient.fetchActiveStories();
-        log(`Found ${jiraStories.length} active stories`);
-      }
+    // 2. Merge params with detected context
+    const baseConfig = this.createBasePipelineConfig(context, params);
 
-      // 3. Check existing tests FIRST
-      const existingTests = this.scanExistingTests(config.projectPath);
-      log(`Found ${existingTests.count} existing test files`);
+    // 3. Generate a unique run ID
+    const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const statusDir = path.join(baseConfig.projectPath, 'testbot-reports', '.runs', runId);
+    const statusFile = path.join(statusDir, 'status.json');
+    fs.mkdirSync(statusDir, { recursive: true });
 
-      // 4. Gather codebase context
-      let codebaseContext = config.codebaseContext;
-      const contextGatherer = new ContextGatherer({ projectPath: config.projectPath });
-      
-      if (config.generateTests && !codebaseContext) {
-        log('Gathering codebase context automatically...');
-        codebaseContext = await contextGatherer.gatherRichContext();
-        log(`Found ${codebaseContext.pages?.length || 0} pages, ${codebaseContext.apiEndpoints?.length || 0} API endpoints`);
-      }
+    // Write initial status
+    this.writeRunStatus(statusFile, {
+      runId,
+      phase: 'queued',
+      message: 'Pipeline queued.',
+      project: baseConfig.projectName,
+    });
 
-      // 5. If NO tests exist, use OpenAI to generate intelligent tests
-      if (existingTests.count === 0 && config.openaiApiKey) {
-        log('No existing tests found. Using OpenAI to generate intelligent tests...');
-        
-        // Try to get supplemental context from the AI agent
-        const agentRequester = new AgentContextRequester({ projectPath: config.projectPath });
-        const agentContext = await agentRequester.requestContext(codebaseContext);
-        
-        // Merge auto-gathered context with agent context
-        if (agentContext) {
-          log('Merging auto-gathered context with agent insights...');
-          codebaseContext = agentRequester.mergeContexts(codebaseContext, agentContext);
-        }
-        
-        // Check if we should launch config UI (when no PRD provided)
-        let prdContent = null;
-        let userConfig = {};
-        
-        if (!config.prdFile && !params.codebaseContext) {
-          // Launch configuration UI to get PRD and preferences
-          log('Launching configuration UI...');
-          const configUI = new ConfigUILauncher({ port: 54321 });
-          
-          try {
-            userConfig = await configUI.launch({
-              projectPath: config.projectPath,
-              projectName: config.projectName,
-              framework: codebaseContext.projectStructure?.framework || 'auto',
-              baseURL: config.baseURL,
-              port: config.port,
-              startCommand: config.startCommand,
-            });
-            
-            prdContent = userConfig.prd;
-            if (userConfig.testType) config.testType = userConfig.testType;
-            if (userConfig.baseURL) config.baseURL = userConfig.baseURL;
-            
-            log('User configuration received');
-          } catch (uiError) {
-            log(`Config UI not used: ${uiError.message}`);
-            // Continue without user input - will generate basic tests
-          }
-        } else if (config.prdFile) {
-          // Read PRD file
-          const fs = require('fs');
-          try {
-            prdContent = fs.readFileSync(config.prdFile, 'utf-8');
-            log(`Read PRD file: ${config.prdFile}`);
-          } catch (error) {
-            log(`Could not read PRD file: ${error.message}`);
-          }
-        }
-        
-        // Generate tests with OpenAI
-        log('Generating tests with OpenAI...');
-        const openaiGenerator = new OpenAITestGenerator({
-          projectPath: config.projectPath,
-          apiKey: config.openaiApiKey,
-          model: process.env.OPENAI_MODEL || 'gpt-4o',
-        });
-        
-        const generatedTests = await openaiGenerator.generateTests({
-          context: codebaseContext,
-          prd: prdContent,
-          testType: config.testType,
-          projectInfo: {
-            name: config.projectName,
-            framework: codebaseContext.projectStructure?.framework,
-            baseURL: config.baseURL,
-            startCommand: config.startCommand,
-          },
-          options: {
-            includeSmoke: userConfig.includeSmoke !== false,
-            includeWorkflows: userConfig.includeWorkflows !== false,
-            includeErrorStates: userConfig.includeErrorStates,
-          },
-        });
-        
-        const summary = openaiGenerator.getSummary();
-        log(`Generated ${summary.totalFiles} test file(s) with OpenAI`);
-        log(`  - Smoke: ${summary.byType.smoke}, Frontend: ${summary.byType.frontend}, API: ${summary.byType.api}, Workflow: ${summary.byType.workflow}`);
-        
-      } else if (existingTests.count === 0 && !config.openaiApiKey) {
-        // No tests and no OpenAI key - provide clear instructions
-        log('No existing tests found and OPENAI_API_KEY not set.');
-        log('To enable AI-powered test generation, add to .env: OPENAI_API_KEY=sk-proj-...');
-        log('Falling back to template-based test generation...');
-        
-        // Fall back to template-based generation
-        const playwrightMCP = new PlaywrightMCPClient(config);
-        await playwrightMCP.generateTests({
-          context: codebaseContext || { pages: [], apiEndpoints: [], workflows: [] },
-          testType: config.testType,
-          projectPath: config.projectPath,
-        });
-      }
+    const showConfigUI = params.showConfigUI !== false;
+    const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
 
-      // 6. Generate tests using template generator (if tests exist or OpenAI generation skipped)
-      log('Setting up Playwright...');
-      const playwright = new PlaywrightIntegration(config);
-      const playwrightMCP = new PlaywrightMCPClient(config);
-      
-      // Re-check tests after potential generation
-      const testsAfterGeneration = this.scanExistingTests(config.projectPath);
-      
-      // Generate additional tests if needed and we have context
-      if (config.generateTests && (codebaseContext || config.prdFile || jiraStories) && testsAfterGeneration.count > 0) {
-        log('Generating additional intelligent tests...');
-        
-        // Use PlaywrightMCPClient for additional test generation
-        const generationResult = await playwrightMCP.generateTests({
-          context: codebaseContext,
-          testType: config.testType,
-          projectPath: config.projectPath,
-          prdFile: config.prdFile,
-        });
-        
-        log(`Generated ${generationResult.generated} additional test files`);
-        
-        // Also generate from Jira stories if available
-        if (jiraStories && jiraStories.length > 0) {
-          log('Generating tests from Jira stories...');
-          await playwright.generateTests({
-            prdFile: config.prdFile,
-            jiraStories,
-            testType: config.testType,
-          });
-        }
-      }
-
-      // 5. Run tests (with optional parallel Playwright MCP execution)
-      log('Running tests...');
-      
-      // Check if parallel MCP execution is enabled
-      const mcpParallelEnabled = process.env.PLAYWRIGHT_MCP_PARALLEL === 'true' || 
-                                  process.env.PLAYWRIGHT_MCP_ENABLED === 'true';
-      
-      let testResults;
-      
-      if (mcpParallelEnabled) {
-        log('Parallel execution enabled - running TestBot + Playwright MCP...');
-        
-        // Create Playwright MCP integration
-        const playwrightMCPIntegration = new PlaywrightMCPIntegration({
-          projectPath: config.projectPath,
-          baseURL: config.baseURL,
-        });
-        
-        // Run tests in parallel
-        const [directResults, mcpResults] = await Promise.all([
-          playwright.runTests(),                    // Fast direct execution
-          playwrightMCPIntegration.runTests()       // Full artifact capture
-        ]);
-        
-        log(`Direct execution: ${directResults.total} tests`);
-        log(`MCP execution: ${mcpResults.available !== false ? mcpResults.total : 'unavailable'} tests`);
-        
-        // Merge results from both sources
-        const merger = new ResultsMerger({ projectPath: config.projectPath });
-        testResults = merger.mergeResults(directResults, mcpResults);
-        
-        // Log merged artifacts
-        if (testResults.artifacts) {
-          const artifacts = testResults.artifacts;
-          log(`Collected artifacts: ${artifacts.screenshots?.length || 0} screenshots, ${artifacts.videos?.length || 0} videos, ${artifacts.traces?.length || 0} traces`);
-        }
-      } else {
-        // Standard single execution
-        testResults = await playwright.runTests();
-      }
-
-      log(`Tests completed: ${testResults.total} total, ${testResults.passed} passed, ${testResults.failed} failed`);
-
-      // 5. AI analysis on failures
-      let aiAnalysis = null;
-      if (testResults.failed > 0 && config.aiProvider !== 'none') {
-        log(`Analyzing ${testResults.failed} failures with ${config.aiProvider}...`);
-        const analyzer = AIAnalyzer.create(config.aiProvider, config.aiApiKey);
-        aiAnalysis = await analyzer.analyzeFailures(testResults.failures);
-        log(`AI analysis complete: ${aiAnalysis.length} failures analyzed`);
-      }
-
-      // 6. Generate report
-      log('Generating report...');
-      const reportGen = new ReportGenerator();
-
-      // Log dashboard sync intent (actual posting happens inside ReportGenerator)
-      const testbotApiKey = process.env.TESTBOT_API_KEY;
-      const testbotDashboardUrl =
-        process.env.TESTBOT_DASHBOARD_URL || 'https://testbot-mcp.vercel.app';
-      if (testbotApiKey) {
-        log(`Dashboard sync enabled — will post results to ${testbotDashboardUrl}`);
-      } else {
-        log('TESTBOT_API_KEY not set — skipping web dashboard sync');
-      }
-
-      const report = await reportGen.generate({
-        projectPath: config.projectPath,
-        projectName: config.projectName,
-        testResults,
-        aiAnalysis,
-        jiraData: jiraStories,
+    if (!showConfigUI) {
+      this.writeRunStatus(statusFile, {
+        runId,
+        phase: 'starting_pipeline',
+        message: 'Configuration UI disabled. Starting pipeline worker...',
+        project: baseConfig.projectName,
       });
 
-      // 7. Open dashboard
-      let dashboardUrl = null;
-      if (config.openDashboard) {
-        log('Opening dashboard...');
-        dashboardUrl = await DashboardLauncher.open(report.path);
-      }
+      Logger.info('Index', `Starting pipeline in background (runId: ${runId})...`);
+      this.runPipelineInBackground(baseConfig, runId);
 
-      // Return summary
-      const summary = {
-        success: true,
-        project: config.projectName,
-        summary: {
-          total: testResults.total,
-          passed: testResults.passed,
-          failed: testResults.failed,
-          skipped: testResults.skipped,
-          duration: `${testResults.duration}ms`,
-          passRate: testResults.total > 0
-            ? `${Math.round((testResults.passed / testResults.total) * 100)}%`
-            : '0%',
-        },
-        reportPath: report.path,
-        dashboardUrl,
-        aiAnalysis: aiAnalysis
-          ? {
-              analyzed: aiAnalysis.length,
-              highConfidence: aiAnalysis.filter((a) => a.confidence > 0.8).length,
-            }
-          : null,
-      };
+      this.writeRunStatus(statusFile, {
+        runId,
+        phase: 'started',
+        message: 'Pipeline worker started.',
+        project: baseConfig.projectName,
+      });
 
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify(summary, null, 2),
+            text: JSON.stringify({
+              success: true,
+              status: 'started',
+              runId,
+              project: baseConfig.projectName,
+              language: baseConfig.language,
+              message: `TestBot pipeline started for "${baseConfig.projectName}". Configuration UI is disabled for this run.`,
+              statusFile,
+              dashboardUrl,
+              nextSteps: [
+                `Monitor progress: check ${statusFile}`,
+                'Results will be posted to the webapp dashboard automatically when complete.',
+                `Dashboard URL: ${dashboardUrl}`,
+              ],
+            }, null, 2),
           },
         ],
       };
+    }
+
+    let configUrl;
+    let waitForConfig;
+    try {
+      const configUILauncher = this.createConfigUILauncher();
+      const launchResult = await configUILauncher.launchNonBlocking({
+        projectPath: baseConfig.projectPath,
+        projectName: baseConfig.projectName,
+        framework: this.detectFramework(context),
+        baseURL: baseConfig.baseURL,
+        port: String(baseConfig.port),
+        startCommand: baseConfig.startCommand,
+        testType: baseConfig.testType,
+        generateTests: String(baseConfig.generateTests),
+        openDashboard: String(baseConfig.openDashboard),
+      });
+      configUrl = launchResult.configUrl;
+      waitForConfig = launchResult.waitForConfig;
     } catch (error) {
-      log(`Error: ${error.message}`);
+      this.writeRunStatus(statusFile, {
+        runId,
+        phase: 'error',
+        message: `Failed to launch configuration UI: ${error.message}`,
+        error: error.message,
+        errorCode: 'CONFIG_UI_LAUNCH_FAILED',
+        project: baseConfig.projectName,
+      });
       throw error;
     }
+
+    this.writeRunStatus(statusFile, {
+      runId,
+      phase: 'awaiting_config_ui',
+      message: 'Waiting for configuration submission from UI.',
+      project: baseConfig.projectName,
+      configUrl,
+    });
+
+    this.continuePipelineAfterConfig({
+      waitForConfig,
+      runId,
+      statusFile,
+      statusDir,
+      baseConfig,
+    }).catch((error) => {
+      Logger.error('Index', 'Unexpected continuation error', error, { runId });
+    });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            status: 'awaiting_configuration',
+            runId,
+            project: baseConfig.projectName,
+            language: baseConfig.language,
+            message: `Configuration UI opened for "${baseConfig.projectName}". Submit the form to start the pipeline automatically.`,
+            statusFile,
+            configUrl,
+            dashboardUrl,
+            nextSteps: [
+              `Monitor progress: check ${statusFile}`,
+              `Open and submit configuration UI: ${configUrl}`,
+              'Pipeline starts automatically right after configuration submission.',
+              `Dashboard URL: ${dashboardUrl}`,
+            ],
+          }, null, 2),
+        },
+      ],
+    };
   }
 
   /**
    * Analyze existing test failures
    */
   async handleAnalyzeFailures(params) {
-    const log = (msg) => console.error(`[Testbot] ${msg}`);
+    Logger.mcp('Index', 'handleAnalyzeFailures called', { params });
 
     const projectPath = params.projectPath || process.cwd();
     const testResultsPath = params.testResultsPath || `${projectPath}/test-results.json`;
     const aiProvider = params.aiProvider || process.env.AI_PROVIDER || 'sarvam';
 
-    log(`Analyzing failures in ${testResultsPath}...`);
+    Logger.info('Index', `Analyzing failures in ${testResultsPath}...`);
 
     const playwright = new PlaywrightIntegration({ projectPath });
     const testResults = await playwright.loadTestResults(testResultsPath);
@@ -903,12 +1007,12 @@ Return the JSON structure above based on what you find in the codebase.
    * Generate report from existing test results
    */
   async handleGenerateReport(params) {
-    const log = (msg) => console.error(`[Testbot] ${msg}`);
+    Logger.mcp('Index', 'handleGenerateReport called', { params });
 
     const projectPath = params.projectPath || process.cwd();
     const testResultsPath = params.testResultsPath || `${projectPath}/test-results.json`;
 
-    log(`Generating report from ${testResultsPath}...`);
+    Logger.info('Index', `Generating report from ${testResultsPath}...`);
 
     const playwright = new PlaywrightIntegration({ projectPath });
     const testResults = await playwright.loadTestResults(testResultsPath);
@@ -920,6 +1024,8 @@ Return the JSON structure above based on what you find in the codebase.
       testResults,
       aiAnalysis: null,
       jiraData: null,
+      api_key: process.env.TESTBOT_API_KEY,
+      dashboard_url: process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000',
     });
 
     let dashboardUrl = null;
@@ -944,10 +1050,14 @@ Return the JSON structure above based on what you find in the codebase.
   async start() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('Testbot MCP server started');
+    Logger.info('Index', 'Testbot MCP server started');
   }
 }
 
 // Start the server
-const server = new TestbotMCPServer();
-server.start().catch(console.error);
+if (require.main === module) {
+  const server = new TestbotMCPServer();
+  server.start().catch(console.error);
+}
+
+module.exports = TestbotMCPServer;

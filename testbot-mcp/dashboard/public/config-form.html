@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TestBot Configuration</title>
+    <!-- Google Fonts for Neo-Brutalism -->
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        :root {
+            --bg-darkest: #000000;
+            --bg-card: #111111;
+            --bg-card-2: #1a1a1a;
+            --text-primary: #ffffff;
+            --text-secondary: #a0a0a0;
+            --font-body: 'Space Grotesk', sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-darkest);
+            color: var(--text-primary);
+            font-family: var(--font-body);
+            -webkit-font-smoothing: antialiased;
+            display: flex;
+            justify-content: center;
+        }
+
+        /* ── Core brutal card ── */
+        .brutal-card {
+            background: #111111;
+            border: 2px solid #333333;
+            border-radius: 8px; /* Slightly rounded for the inner forms matching screenshot */
+            transition: border-color 0.2s ease;
+        }
+        .brutal-card:hover { border-color: #555555; }
+
+        /* ── Input ── */
+        .input-glass {
+            background: #000000;
+            border: 1px solid #333333;
+            color: #ffffff;
+            border-radius: 6px;
+            font-family: inherit;
+            padding: 10px 14px;
+            width: 100%;
+            transition: border-color 0.12s ease;
+        }
+        .input-glass:focus {
+            outline: none;
+            border-color: #ffffff;
+        }
+
+        /* ── Neo-brutal CTA button ── */
+        .btn-gradient {
+            background: #ffffff;
+            color: #000000;
+            padding: 10px 24px;
+            border-radius: 6px;
+            font-weight: 700;
+            font-size: 14px;
+            transition: opacity 0.2s ease;
+            cursor: pointer;
+            border: none;
+        }
+        .btn-gradient:hover { opacity: 0.8; }
+
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.1);
+            color: #ffffff;
+            padding: 10px 24px;
+            border-radius: 6px;
+            font-weight: 500;
+            font-size: 14px;
+            transition: background 0.2s ease;
+            cursor: pointer;
+            border: none;
+        }
+        .btn-secondary:hover { background: rgba(255, 255, 255, 0.2); }
+
+        /* ── Selectors ── */
+        .toggle-group {
+            display: flex;
+            background: #0a0a0a;
+            border-radius: 8px;
+            border: 1px solid #333333;
+            overflow: hidden;
+            width: 100%;
+        }
+        .toggle-btn {
+            flex: 1;
+            text-align: center;
+            padding: 12px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: background 0.2s ease;
+            color: var(--text-secondary);
+        }
+        .toggle-btn.active {
+            background: #222222;
+            color: #ffffff;
+            border-radius: 6px;
+            margin: 2px;
+        }
+
+        .upload-zone {
+            border: 2px dashed #333333;
+            border-radius: 12px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.2s ease, background 0.2s ease;
+        }
+        .upload-zone:hover, .upload-zone.dragover {
+            border-color: #ffffff;
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        .max-w-3xl { max-width: 800px; width: 100%; }
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body class="min-h-screen py-10 px-4">
+    <div class="max-w-3xl">
+        <!-- Header -->
+        <div class="flex items-center gap-3 mb-10">
+            <!-- <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M2 17L12 22L22 17" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M2 12L12 17L22 12" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg> -->
+            <h1 class="text-2xl font-bold tracking-wide">TestBot MCP</h1>
+        </div>
+
+        <h2 class="text-3xl font-bold mb-8">Testing Configuration</h2>
+
+        <form id="configForm" class="space-y-10">
+            
+            <!-- Section 1 -->
+            <div>
+                <h3 class="text-lg font-bold mb-1">Testing Types <span class="text-red-500">*</span></h3>
+                <p class="text-sm text-[#a0a0a0] mb-4">Select your testing types.</p>
+                <div class="brutal-card p-6 space-y-6">
+                    <div class="flex items-center">
+                        <div class="w-1/4 text-sm font-medium">Mode</div>
+                        <div class="w-3/4">
+                            <div class="toggle-group" id="mode-group">
+                                <div class="toggle-btn" data-value="backend">Backend</div>
+                                <div class="toggle-btn active" data-value="frontend">Frontend</div>
+                                <div class="toggle-btn" data-value="both">Both</div>
+                            </div>
+                            <p class="text-xs text-[#a0a0a0] mt-2">Choose whether to test your backend service or frontend workflows.</p>
+                        </div>
+                    </div>
+                    <div class="flex items-center">
+                        <div class="w-1/4 text-sm font-medium">Scope</div>
+                        <div class="w-3/4">
+                            <div class="toggle-group" id="scope-group">
+                                <div class="toggle-btn active" data-value="codebase">Codebase</div>
+                                <div class="toggle-btn" data-value="diff">Code diff</div>
+                            </div>
+                            <p class="text-xs text-[#a0a0a0] mt-2">Select whether to test against the entire codebase or just recent changes.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Section 2 -->
+            <div>
+                <h3 class="text-lg font-bold mb-1">Execution Settings <span class="text-red-500">*</span></h3>
+                <p class="text-sm text-[#a0a0a0] mb-4">Choose test generation and run behavior before launching the pipeline.</p>
+                <div class="brutal-card p-6 space-y-6">
+                    <div class="flex items-start">
+                        <div class="w-1/4 text-sm font-medium mt-3">Start Command</div>
+                        <div class="w-3/4">
+                            <input type="text" id="startCommand" class="input-glass" placeholder="npm run dev">
+                            <p class="text-xs text-[#a0a0a0] mt-2">Command used by TestBot to start your app server if needed.</p>
+                        </div>
+                    </div>
+                    <div class="flex items-center">
+                        <div class="w-1/4 text-sm font-medium">Generate Tests</div>
+                        <div class="w-3/4">
+                            <div class="toggle-group" id="generate-group">
+                                <div class="toggle-btn active" data-value="true">Yes</div>
+                                <div class="toggle-btn" data-value="false">No</div>
+                            </div>
+                            <p class="text-xs text-[#a0a0a0] mt-2">When disabled, TestBot runs existing tests only.</p>
+                        </div>
+                    </div>
+                    <div class="flex items-center">
+                        <div class="w-1/4 text-sm font-medium">Open Dashboard</div>
+                        <div class="w-3/4">
+                            <div class="toggle-group" id="dashboard-group">
+                                <div class="toggle-btn active" data-value="true">Yes</div>
+                                <div class="toggle-btn" data-value="false">No</div>
+                            </div>
+                            <p class="text-xs text-[#a0a0a0] mt-2">Automatically open dashboard when tests finish.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Section 3 -->
+            <div>
+                <h3 class="text-lg font-bold mb-1">Test Account Info <span class="text-[#a0a0a0] font-normal">(Optional)</span></h3>
+                <p class="text-sm text-[#a0a0a0] mb-4">Provide the login credentials for a test account that can be used to access and test your application.</p>
+                <div class="brutal-card p-6 space-y-6">
+                    <div class="flex items-start">
+                        <div class="w-1/4 text-sm font-medium mt-3">Test Account<br>Username</div>
+                        <div class="w-3/4">
+                            <input type="text" id="username" class="input-glass" placeholder="">
+                            <p class="text-xs text-[#a0a0a0] mt-2">Provide a test account username, e.g., test@example.com.</p>
+                        </div>
+                    </div>
+                    <div class="flex items-start">
+                        <div class="w-1/4 text-sm font-medium mt-3">Test Account<br>Password</div>
+                        <div class="w-3/4">
+                            <input type="password" id="password" class="input-glass" placeholder="">
+                            <p class="text-xs text-[#a0a0a0] mt-2">Enter the corresponding password for the test account, e.g., 123456abc.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div>
+                <h3 class="text-lg font-bold mb-1">Local Server Port <span class="text-red-500">*</span></h3>
+                <p class="text-sm text-[#a0a0a0] mb-4">Port where your local server is running e.g. 3000 in localhost:3000. If there is a specific path that you want to test and not accessible from the root, enter it in the "Path" section. e.g. dashboard for localhost:3000/dashboard</p>
+                <div class="brutal-card p-6 space-y-6">
+                    <div class="flex items-center">
+                        <div class="w-1/4 text-sm font-medium">Host</div>
+                        <div class="w-3/4">
+                            <input type="text" id="host" value="localhost" class="input-glass">
+                        </div>
+                    </div>
+                    <div class="flex items-center">
+                        <div class="w-1/4 text-sm font-medium">Port</div>
+                        <div class="w-3/4">
+                            <input type="text" id="port" value="5173" class="input-glass">
+                        </div>
+                    </div>
+                    <div class="flex items-center">
+                        <div class="w-1/4 text-sm font-medium">Path</div>
+                        <div class="w-3/4">
+                            <input type="text" id="path" value="/" class="input-glass">
+                        </div>
+                    </div>
+                    <div class="bg-[#1a1a1a] border border-[#333333] p-4 rounded-lg mt-4">
+                        <div class="text-xs text-[#a0a0a0] uppercase tracking-wider mb-2">Computed Base URL</div>
+                        <div id="baseUrlPreview" class="font-mono text-sm text-white break-all">http://localhost:5173/</div>
+                    </div>
+                    <div class="bg-[#1a1a1a] border border-[#333333] p-4 rounded-lg mt-4 flex justify-between">
+                        <div class="text-[#a0a0a0] text-sm">Dev servers may crash under concurrent test load — frontend tests will be limited to 15.</div>
+                        <div class="text-[#a0a0a0]">▶</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Section 4 -->
+            <div>
+                <h3 class="text-lg font-bold mb-1">Product Specification Doc</h3>
+                <p class="text-sm text-[#a0a0a0] mb-4">Upload a document that explains your desired product's features, purpose, and how it should work.</p>
+                <div class="brutal-card p-6">
+                    <div class="upload-zone" id="dropzone">
+                        <svg class="mx-auto mb-4" width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M22 19C22 20.1046 21.1046 21 20 21H4C2.89543 21 2 20.1046 2 19V5C2 3.89543 2.89543 3 4 3H9.17157C9.70201 3 10.2107 3.21071 10.5858 3.58579L12.4142 5.41421C12.7893 5.78929 13.298 6 13.8284 6H20C21.1046 6 22 6.89543 22 8V19Z" stroke="#707070" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                        <p class="text-sm text-[#a0a0a0]">Select your product requirements document (.md, .txt, .json, .yaml, .yml)</p>
+                        <input type="file" id="fileInput" class="hidden" accept=".md,.txt,.json,.yaml,.yml,text/plain,application/json">
+                    </div>
+                    <p class="text-xs text-[#a0a0a0] mt-4 mb-3">Text-based docs only in this version. PDF parsing is intentionally disabled.</p>
+                    
+                    <div id="filePreview" class="hidden mt-4 bg-[#1a1a1a] border border-[#333333] p-3 rounded flex justify-between items-center">
+                        <div class="flex items-center gap-3">
+                            <span id="fileName" class="text-sm font-mono text-white"></span>
+                        </div>
+                        <button type="button" id="removeFile" class="text-[#a0a0a0] hover:text-white transition">×</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Footer Actions -->
+            <div id="formError" class="hidden text-sm text-red-400 bg-red-950/40 border border-red-500/40 rounded-md px-4 py-3"></div>
+            <div class="flex justify-end gap-3 mt-10 pb-20">
+                <button type="button" id="resetBtn" class="btn-secondary">Reset</button>
+                <button type="button" id="submitBtn" class="btn-gradient bg-[#10b981] !text-white hover:bg-[#059669]">Continue</button>
+            </div>
+            
+        </form>
+    </div>
+
+    <!-- Success Overlay -->
+    <div id="successOverlay" class="fixed inset-0 bg-black/90 hidden flex flex-col items-center justify-center z-50">
+        <h2 class="text-2xl font-bold font-mono text-white">Configuration Sent!</h2>
+        <p class="text-[#a0a0a0] mt-2">You can safely close this window.</p>
+    </div>
+
+    <script>
+        const urlParams = new URLSearchParams(window.location.search);
+        const SUPPORTED_EXTENSIONS = new Set(['.md', '.txt', '.json', '.yaml', '.yml']);
+        const SUPPORTED_MIME_TYPES = new Set(['text/plain', 'text/markdown', 'application/json', 'application/x-yaml', 'text/yaml']);
+        const MAX_PRD_BYTES = 1024 * 1024;
+
+        const defaults = {
+            mode: urlParams.get('testType') || 'both',
+            scope: 'codebase',
+            generateTests: urlParams.get('generateTests') !== 'false',
+            openDashboard: urlParams.get('openDashboard') !== 'false',
+            startCommand: urlParams.get('startCommand') || 'npm run dev',
+            baseURL: urlParams.get('baseURL') || 'http://localhost:3000',
+        };
+
+        const state = {
+            mode: defaults.mode,
+            scope: defaults.scope,
+            generateTests: defaults.generateTests,
+            openDashboard: defaults.openDashboard,
+            prdMeta: null,
+            prdContent: null,
+        };
+
+        const hostInput = document.getElementById('host');
+        const portInput = document.getElementById('port');
+        const pathInput = document.getElementById('path');
+        const startCommandInput = document.getElementById('startCommand');
+        const baseUrlPreview = document.getElementById('baseUrlPreview');
+        const formError = document.getElementById('formError');
+        const submitBtn = document.getElementById('submitBtn');
+        const successOverlay = document.getElementById('successOverlay');
+
+        const dropzone = document.getElementById('dropzone');
+        const fileInput = document.getElementById('fileInput');
+        const filePreview = document.getElementById('filePreview');
+        const fileName = document.getElementById('fileName');
+        const removeFile = document.getElementById('removeFile');
+
+        function showError(message) {
+            formError.textContent = message;
+            formError.classList.remove('hidden');
+        }
+
+        function clearError() {
+            formError.textContent = '';
+            formError.classList.add('hidden');
+        }
+
+        function parseBaseURL(rawBaseURL) {
+            try {
+                const parsed = new URL(rawBaseURL);
+                return {
+                    host: parsed.hostname || 'localhost',
+                    port: parsed.port || '3000',
+                    path: parsed.pathname && parsed.pathname !== '' ? parsed.pathname : '/',
+                };
+            } catch {
+                return { host: 'localhost', port: '3000', path: '/' };
+            }
+        }
+
+        function buildBaseURL() {
+            const host = (hostInput.value || '').trim();
+            const port = (portInput.value || '').trim();
+            let routePath = (pathInput.value || '').trim() || '/';
+
+            if (!host) {
+                throw new Error('Host is required.');
+            }
+            if (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
+                throw new Error('Port must be a number between 1 and 65535.');
+            }
+            if (!routePath.startsWith('/')) {
+                routePath = `/${routePath}`;
+            }
+            pathInput.value = routePath;
+            return `http://${host}:${port}${routePath}`;
+        }
+
+        function updateBaseURLPreview() {
+            try {
+                baseUrlPreview.textContent = buildBaseURL();
+                clearError();
+            } catch (error) {
+                baseUrlPreview.textContent = 'Invalid Base URL';
+            }
+        }
+
+        function setActiveToggle(groupId, selectedValue) {
+            const group = document.getElementById(groupId);
+            const buttons = group.querySelectorAll('.toggle-btn');
+            buttons.forEach((btn) => {
+                btn.classList.toggle('active', btn.dataset.value === String(selectedValue));
+            });
+        }
+
+        function setupToggle(groupId, stateKey, parseValue = (value) => value) {
+            const group = document.getElementById(groupId);
+            const buttons = group.querySelectorAll('.toggle-btn');
+            buttons.forEach((btn) => {
+                btn.addEventListener('click', () => {
+                    buttons.forEach((b) => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    state[stateKey] = parseValue(btn.dataset.value);
+                });
+            });
+        }
+
+        function resetPRDFile() {
+            fileInput.value = '';
+            state.prdMeta = null;
+            state.prdContent = null;
+            filePreview.classList.add('hidden');
+            fileName.textContent = '';
+        }
+
+        function getFileExtension(fileNameValue) {
+            const lastDot = fileNameValue.lastIndexOf('.');
+            return lastDot >= 0 ? fileNameValue.slice(lastDot).toLowerCase() : '';
+        }
+
+        function handlePRDFile(file) {
+            clearError();
+            const extension = getFileExtension(file.name);
+            const isValidExtension = SUPPORTED_EXTENSIONS.has(extension);
+            const isValidMime = !file.type || SUPPORTED_MIME_TYPES.has(file.type);
+
+            if (!isValidExtension || !isValidMime) {
+                showError('Unsupported PRD file type. Use .md, .txt, .json, .yaml, or .yml.');
+                resetPRDFile();
+                return;
+            }
+
+            if (file.size > MAX_PRD_BYTES) {
+                showError('PRD file is too large. Max size is 1MB.');
+                resetPRDFile();
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                state.prdContent = String(event.target.result || '');
+                state.prdMeta = {
+                    name: file.name,
+                    contentType: file.type || 'text/plain',
+                };
+                fileName.textContent = file.name;
+                filePreview.classList.remove('hidden');
+            };
+            reader.onerror = () => {
+                showError('Failed to read PRD file.');
+                resetPRDFile();
+            };
+            reader.readAsText(file);
+        }
+
+        function initDefaults() {
+            const parsedBaseURL = parseBaseURL(defaults.baseURL);
+            hostInput.value = parsedBaseURL.host;
+            portInput.value = parsedBaseURL.port;
+            pathInput.value = parsedBaseURL.path;
+            startCommandInput.value = defaults.startCommand;
+
+            setActiveToggle('mode-group', defaults.mode);
+            setActiveToggle('scope-group', defaults.scope);
+            setActiveToggle('generate-group', String(defaults.generateTests));
+            setActiveToggle('dashboard-group', String(defaults.openDashboard));
+
+            state.mode = defaults.mode;
+            state.scope = defaults.scope;
+            state.generateTests = defaults.generateTests;
+            state.openDashboard = defaults.openDashboard;
+            resetPRDFile();
+            updateBaseURLPreview();
+        }
+
+        setupToggle('mode-group', 'mode');
+        setupToggle('scope-group', 'scope');
+        setupToggle('generate-group', 'generateTests', (value) => value === 'true');
+        setupToggle('dashboard-group', 'openDashboard', (value) => value === 'true');
+
+        hostInput.addEventListener('input', updateBaseURLPreview);
+        portInput.addEventListener('input', updateBaseURLPreview);
+        pathInput.addEventListener('input', updateBaseURLPreview);
+
+        dropzone.addEventListener('click', () => fileInput.click());
+        dropzone.addEventListener('dragover', (event) => {
+            event.preventDefault();
+            dropzone.classList.add('dragover');
+        });
+        dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+        dropzone.addEventListener('drop', (event) => {
+            event.preventDefault();
+            dropzone.classList.remove('dragover');
+            if (event.dataTransfer.files.length > 0) {
+                handlePRDFile(event.dataTransfer.files[0]);
+            }
+        });
+
+        fileInput.addEventListener('change', (event) => {
+            if (event.target.files.length > 0) {
+                handlePRDFile(event.target.files[0]);
+            }
+        });
+
+        removeFile.addEventListener('click', () => {
+            resetPRDFile();
+            clearError();
+        });
+
+        document.getElementById('submitBtn').addEventListener('click', async () => {
+            clearError();
+
+            let baseURL;
+            try {
+                baseURL = buildBaseURL();
+            } catch (error) {
+                showError(error.message);
+                return;
+            }
+
+            const startCommand = (startCommandInput.value || '').trim();
+            if (!startCommand) {
+                showError('Start command is required.');
+                return;
+            }
+
+            const username = (document.getElementById('username').value || '').trim();
+            const password = (document.getElementById('password').value || '').trim();
+            const credentials = (username || password) ? { username, password } : undefined;
+
+            const payload = {
+                testType: state.mode,
+                scope: state.scope,
+                baseURL,
+                startCommand,
+                generateTests: state.generateTests,
+                openDashboard: state.openDashboard,
+                ...(credentials ? { credentials } : {}),
+                prd: state.prdContent ? {
+                    name: state.prdMeta?.name || 'uploaded-prd.md',
+                    contentType: state.prdMeta?.contentType || 'text/plain',
+                    textContent: state.prdContent,
+                } : null,
+            };
+
+            const serverPort = urlParams.get('serverPort') || '54321';
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Sending...';
+
+            try {
+                const response = await fetch(`http://localhost:${serverPort}/api/config`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+
+                if (!response.ok) {
+                    const body = await response.json().catch(() => ({}));
+                    throw new Error(body.message || 'Failed to submit configuration.');
+                }
+
+                successOverlay.classList.remove('hidden');
+            } catch (error) {
+                showError(error.message || 'Could not send configuration to TestBot server.');
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Continue';
+            }
+        });
+
+        document.getElementById('resetBtn').addEventListener('click', () => {
+            document.getElementById('configForm').reset();
+            initDefaults();
+            clearError();
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Continue';
+        });
+
+        initDefaults();
+    </script>
+</body>
+</html>

@@ -1,33 +1,624 @@
 ================================================================================
-dev_documentation.txt - Development log
+TESTBOT MCP dev_documentation.txt - Development log
 ================================================================================
 
-2025-03-02 (Codebase Understanding and Cleanup Plan implementation)
---------------------------------------------------------------------------------
-- .gitignore: Removed merge conflict markers. Uncommented and added ignores for
-  test-results/, playwright-report/, testbot-reports/. Added .claude/ to IDE
-  section. Kept node_modules, .env*, .idea, .vscode, OS/log patterns.
+================================================================================
+Update: 2026-01-30 (commit and push to TestBot_MCP)
+================================================================================
 
-- Removed generated artifacts from repo: Stopped tracking and deleted from
-  working tree: testbot-reports/ (root), examples/ (entire directory including
-  sample-project playwright-report, test-results, testbot-reports). These paths
-  are now in .gitignore so they are not re-committed.
+SUMMARY:
+--------
+Committed all local changes and pushed to origin (https://github.com/krishsharma1008/TestBot_MCP.git).
 
-- testbot-mcp/src/report-generator.js: In copyPlaywrightHTMLReport(), removed
-  the candidate paths for examples/sample-project and sample-project; only
-  projectPath/playwright-report is used now (examples/ was removed).
+ACTIONS TAKEN:
+--------------
+1. Staged all changes: git add -A
+2. Committed with message: "Cleanup: remove deprecated docs, ai-agent, jira-integration, custom-report; update .env.example, .gitignore; add DASHBOARD_REFRESH_GUIDE"
+3. Pushed to origin main: a1f44311..df777fc7 main -> main
 
-- README.md: Rewrote to describe MCP + webapp layout. Removed references to
-  deleted docs (AI_AGENT_QUICKSTART.md, AI_AGENT_README.md, etc.) and broken
-  image paths (website/public/asset/). Added Quick start for dashboard, MCP,
-  and Playwright. Kept project context/criteria section without images.
-
-- package.json: Set description to "QA testing POC with Testbot MCP and
-  dashboard webapp" (replaced invalid markdown image syntax and missing path).
-
-Target structure: root config (.env.example, .gitignore, .mcp.json,
-docker-compose.yml, package.json, playwright.config.js, README.md), testbot-mcp/,
-tests/, webapp/. No testbot-reports, playwright-report, test-results, or
-examples/ in the repo.
+CHANGES IN COMMIT:
+------------------
+- Removed: deprecated markdown docs (AI_AGENT_*, JIRA_*, DASHBOARD_*, WORKFLOW_*, etc.), ai-agent/, jira-integration/, custom-report/, custom-reporter/, scripts/, tests/, playwright configs, test-results, Conception & DB assets, and related artifacts
+- Modified: .env.example, .gitignore, package.json, package-lock.json, dev_documentation.txt
+- Added: .cursor/worktrees.json, DASHBOARD_REFRESH_GUIDE.md
 
 ================================================================================
+Update: 2026-01-28 - OpenAI Test Generation Feature
+================================================================================
+
+SUMMARY:
+--------
+Implemented AI-powered automatic test generation using OpenAI GPT when TestBot
+detects no existing E2E tests in a project. This enhancement transforms TestBot
+from a test runner into a complete testing solution.
+
+NEW FEATURES:
+-------------
+1. OpenAI Test Generation
+   - Automatically generates Playwright tests when no tests exist
+   - Uses GPT-4o (configurable) for intelligent test creation
+   - Generates smoke, frontend, backend, and workflow tests
+   - Supports Product Requirements Document (PRD) input for better tests
+
+2. Browser Configuration UI
+   - Launches a web form when no tests exist
+   - Collects PRD, test preferences, and project settings
+   - Modern UI matching the dashboard aesthetic
+   - Auto-saves form data to prevent loss
+
+3. Enhanced Context Gathering
+   - Extracts richer codebase details (file contents, component structure)
+   - Parses API schemas (Zod, Yup validation)
+   - Identifies form fields and validation rules
+   - Detects authentication patterns (NextAuth, JWT, OAuth, etc.)
+
+4. Agent Context Requester
+   - Generates prompts for Cursor/Windsurf agents to analyze codebase
+   - Merges auto-gathered context with agent insights
+   - Provides richer context for OpenAI test generation
+
+FILES CREATED:
+--------------
+1. testbot-mcp/src/ai-providers/openai.js
+   - OpenAI client following existing provider pattern
+   - Supports both test generation and failure analysis
+   - Handles API errors gracefully with clear messages
+
+2. testbot-mcp/src/config-ui-launcher.js
+   - Launches browser-based configuration form
+   - Creates local HTTP server to handle form submission
+   - Returns collected configuration to MCP
+
+3. testbot-mcp/src/agent-context-requester.js
+   - Generates detailed prompts for AI agent analysis
+   - Waits for agent response with timeout
+   - Merges contexts from multiple sources
+
+4. testbot-mcp/src/test-generator-openai.js
+   - Orchestrates intelligent test generation
+   - Implements prompt engineering for Playwright tests
+   - Handles chunked generation by test type
+   - Writes test files with proper imports
+
+5. dashboard/public/config-form.html
+   - Multi-step configuration wizard
+   - PRD input with markdown preview
+   - Test type and coverage options
+
+6. dashboard/public/config-form.css
+   - Styles matching dashboard aesthetic
+   - Responsive design
+   - Progress steps indicator
+
+7. dashboard/public/config-form.js
+   - Form handling and validation
+   - LocalStorage auto-save
+   - Template loading for quick PRD setup
+
+FILES MODIFIED:
+---------------
+1. testbot-mcp/src/index.js
+   - Added OpenAI test generation flow
+   - Integrated config UI launcher
+   - Added agent context requester
+   - Updated tool schema with openai provider
+
+2. testbot-mcp/src/context-gatherer.js
+   - Enhanced with gatherRichContext() method
+   - Added form detection and validation parsing
+   - Added data model extraction (TypeScript, Prisma)
+   - Added authentication pattern detection
+   - Enhanced workflow inference
+
+3. testbot-mcp/src/ai-providers/index.js
+   - Added OpenAI to provider factory
+   - Added createOpenAI() helper method
+   - Added hasOpenAIKey() check method
+
+4. testbot-mcp/package.json
+   - Updated version to 1.1.0
+   - Added openai as optional dependency
+
+5. .env.example
+   - Added OpenAI configuration section
+   - Added OPENAI_API_KEY, OPENAI_MODEL, OPENAI_MAX_TOKENS
+
+6. .env
+   - Added OPENAI_API_KEY with user's key
+   - Set AI_PROVIDER to openai
+
+CONFIGURATION:
+--------------
+Add to .env:
+  OPENAI_API_KEY=sk-proj-...
+  OPENAI_MODEL=gpt-4o (optional, defaults to gpt-4o)
+  OPENAI_MAX_TOKENS=4000 (optional)
+
+USAGE FLOW:
+-----------
+1. User runs "test my app using testbot mcp" on a project with no tests
+2. TestBot detects no existing tests
+3. Checks for OPENAI_API_KEY (fails clearly if missing)
+4. Gathers rich codebase context automatically
+5. Launches config UI in browser (if no PRD provided)
+6. User fills out PRD and test preferences
+7. TestBot calls OpenAI to generate tests
+8. Tests are written to tests/generated/
+9. Playwright runs the generated tests
+10. Dashboard displays results with AI analysis
+
+ERROR HANDLING:
+---------------
+- Missing API key: Clear error message with setup instructions
+- Generation failures: Logs full error, preserves partial results
+- Config UI timeout: Falls back to template-based generation
+- OpenAI API errors: Retries with exponential backoff
+
+TESTING:
+--------
+To verify the implementation:
+1. Go to a project without tests
+2. Ensure OPENAI_API_KEY is set in .env
+3. Run testbot_test_my_app via MCP
+4. Observe test generation and execution
+
+================================================================================
+
+================================================================================
+Update: 2026-01-28 (Later) - Dashboard Refresh and Caching Fixes
+================================================================================
+
+SUMMARY:
+--------
+Fixed dashboard refresh issues and clarified config UI behavior.
+
+ISSUES IDENTIFIED:
+------------------
+1. Browser Caching
+   - Browser caches dashboard HTML/CSS/JS files
+   - Old data persists even when report.json is updated
+
+2. Config UI Behavior
+   - Config UI ONLY shows when NO tests exist
+   - User's project had tests in tests/generated/
+   - This is by design, not a bug
+
+3. Playwright MCP Integration
+   - TestBot MCP and Playwright MCP are separate
+   - TestBot uses Playwright directly (npm package)
+
+FIXES APPLIED:
+--------------
+1. Enhanced Dashboard Cache Busting
+   - Added cache-control meta tags to index.html
+   - Versioned CSS/JS references
+   - Added auto-reload notification
+   - Improved dashboard-launcher.js
+
+2. Created Tools
+   - refresh-dashboard.sh for manual refresh
+   - DASHBOARD_REFRESH_GUIDE.md with complete docs
+
+WHEN CONFIG UI SHOWS:
+---------------------
+Conditions (ALL must be true):
+1. Project has NO existing test files
+2. OPENAI_API_KEY is set in .env
+3. generateTests parameter is true
+
+To Force: Delete tests/generated/ directory
+
+HOW TO REFRESH DASHBOARD:
+-------------------------
+1. Press Cmd+Shift+R (Mac) or Ctrl+Shift+R (Windows)
+2. Run ./refresh-dashboard.sh
+3. Close browser completely and rerun TestBot
+
+CURRENT STATUS:
+---------------
+✅ All modules loading correctly
+✅ OpenAI integration implemented
+✅ Dashboard refresh mechanism improved
+✅ Documentation created (DASHBOARD_REFRESH_GUIDE.md)
+⚠️  Config UI only triggers when no tests exist (by design)
+
+================================================================================
+Update: 2026-01-28 16:55 - Dashboard Refresh Debug & Fix Implementation
+================================================================================
+
+SUMMARY:
+--------
+Fixed the root cause of dashboard not updating after test runs. The issue was
+that Playwright's JSON reporter was not configured to output to a file,
+causing TestBot to receive 0 tests.
+
+ROOT CAUSE IDENTIFIED:
+----------------------
+The Playwright configuration had:
+  reporter: 'json'
+
+This outputs JSON to stdout only. TestBot was looking for test-results.json
+file which didn't exist, causing parseTestResults() to return 0 tests.
+
+FIX APPLIED:
+------------
+Changed to:
+  reporter: [['json', { outputFile: 'test-results.json' }]]
+
+This creates the test-results.json file that TestBot can read.
+
+FILES MODIFIED:
+---------------
+1. examples/sample-project/playwright.config.js
+   - Changed reporter config to output to file
+   
+2. testbot-mcp/src/playwright-integration.js
+   - Added comprehensive logging to parseTestResults()
+   - Added warnings when test-results.json is missing
+   - Added diagnostic hints in error messages
+   - Improved extractResultsFromJson() with structure validation
+   
+3. dashboard/src/data-parser.js
+   - Enhanced loadData() with detailed console logging
+   - Added staleness detection for reports
+   - Added empty report (0 tests) warnings
+   - Improved error messages with troubleshooting steps
+
+4. DASHBOARD_REFRESH_GUIDE.md
+   - Added "0 Tests" troubleshooting section
+   - Added Playwright config fix instructions
+   - Added diagnostic tool usage
+   - Updated Summary section with new tools
+
+FILES CREATED:
+--------------
+1. scripts/debug-dashboard.js (executable)
+   - Complete diagnostic tool for dashboard issues
+   - Checks dashboard files exist and are valid
+   - Compares timestamps between project and dashboard
+   - Validates Playwright configuration
+   - Checks for test-results.json
+   - Provides actionable recommendations
+
+2. scripts/fix-dashboard-now.sh (executable)
+   - Quick fix utility for dashboard refresh
+   - Copies latest report to dashboard
+   - Updates metadata
+   - Opens dashboard with aggressive cache-busting
+   - Provides troubleshooting steps if issues persist
+
+VERIFICATION:
+-------------
+1. Ran Playwright tests in sample-project
+2. Verified test-results.json created (39KB, 28 tests)
+3. Debug tool confirms: "JSON reporter configured with outputFile"
+4. Debug tool confirms: "test-results.json exists (38.4 KB), Contains 28 tests"
+
+HOW TO USE NEW TOOLS:
+---------------------
+# Diagnose dashboard issues
+node scripts/debug-dashboard.js [project-path]
+
+# Force fix dashboard
+./scripts/fix-dashboard-now.sh [project-path]
+
+# Standard refresh
+./refresh-dashboard.sh
+
+PLAYWRIGHT CONFIG REQUIREMENT:
+------------------------------
+All projects using TestBot MUST have:
+  reporter: [['json', { outputFile: 'test-results.json' }]]
+
+Without this, the dashboard will show 0 tests even when tests pass.
+
+================================================================================
+Update: 2026-01-28 17:00 - CORS Fix for file:// Protocol
+================================================================================
+
+SUMMARY:
+--------
+Fixed CORS errors that prevented the dashboard from loading report data when
+opened via file:// protocol. Browsers block fetch() requests from file:// URLs.
+
+ROOT CAUSE:
+-----------
+When dashboard is opened via file:// protocol:
+  - Browser blocks fetch('report.json') due to CORS policy
+  - Dashboard falls back to mock data (21 tests, 100% pass rate)
+  - Users see demo data instead of real test results
+
+SOLUTION:
+---------
+Embed report data directly into HTML via a JavaScript file that sets a
+global variable. This bypasses fetch() entirely for file:// protocol.
+
+FILES MODIFIED:
+---------------
+1. testbot-mcp/src/dashboard-launcher.js
+   - Now creates embedded-report.js with report data
+   - Report data stored in window.__TESTBOT_EMBEDDED_REPORT__
+   
+2. dashboard/public/index.html
+   - Added script tag to load embedded-report.js
+   - Falls back gracefully if file doesn't exist
+   
+3. dashboard/src/data-parser.js
+   - Checks for embedded data (window.__TESTBOT_EMBEDDED_REPORT__) first
+   - Falls back to fetch() if no embedded data (for HTTP server mode)
+   - Better CORS-specific error messages
+   
+4. scripts/fix-dashboard-now.sh
+   - Now generates embedded-report.js automatically
+
+FILES CREATED:
+--------------
+1. dashboard/public/embedded-report.js (auto-generated)
+   - Contains the report data as a JavaScript variable
+   - Regenerated each time TestBot runs or fix script is used
+   - Bypasses CORS restrictions for file:// protocol
+
+HOW IT WORKS:
+-------------
+1. TestBot generates report.json (for HTTP servers)
+2. TestBot creates embedded-report.js with same data
+3. Dashboard loads embedded-report.js first (works with file://)
+4. If embedded data exists, uses it directly
+5. If no embedded data, tries fetch() (works with http://)
+6. Falls back to mock data only if both fail
+
+VERIFICATION:
+-------------
+- Dashboard now shows real data (63 tests, 84% pass rate)
+- No more CORS errors in browser console
+- Works with both file:// and http:// protocols
+
+================================================================================
+Update: 2026-01-28 - Playwright MCP Integration for Parallel Test Execution
+================================================================================
+
+SUMMARY:
+--------
+Implemented comprehensive integration with the official Microsoft Playwright MCP
+server (@playwright/mcp) to enable parallel test execution with full artifact
+capture including traces, videos, and screenshots.
+
+NEW FEATURES:
+-------------
+1. Playwright MCP Server Configuration
+   - Added Playwright MCP to Cursor's MCP settings (~/.cursor/mcp.json)
+   - Configured with --save-trace, --save-video, --output-dir options
+   - Headless mode enabled for CI/CD compatibility
+
+2. Parallel Test Execution
+   - TestBot now runs tests via two parallel execution paths:
+     a) Direct Playwright execution (fast, minimal artifacts)
+     b) Playwright MCP execution (comprehensive artifact capture)
+   - Results automatically merged from both sources
+   - Fallback to single execution if MCP unavailable
+
+3. Enhanced Artifact Collection
+   - Traces: Full Playwright trace files with step-by-step debugging
+   - Videos: WebM recordings of test execution
+   - Screenshots: Captured at every test step
+   - All artifacts consolidated in testbot-reports/artifacts/
+
+4. Dashboard Trace Viewer Integration
+   - "View Trace" button opens Playwright's online trace viewer
+   - Instructions for local trace viewing via command line
+   - Download buttons for offline analysis
+
+FILES CREATED:
+--------------
+1. testbot-mcp/src/playwright-mcp-integration.js
+   - Main integration module for Playwright MCP server
+   - Handles availability checking, test execution, artifact collection
+   - Supports both direct and MCP-based execution
+
+2. testbot-mcp/src/mcp-client-utils.js
+   - Helper utilities for MCP operations
+   - Retry with exponential backoff
+   - Directory scanning, file copying, artifact collection
+   - Session management and cleanup
+
+3. testbot-mcp/src/results-merger.js
+   - Merges test results from multiple sources
+   - Deduplicates tests by file+title
+   - Combines artifacts with configurable priority
+   - Creates unified test report structure
+
+FILES MODIFIED:
+---------------
+1. ~/.cursor/mcp.json
+   - Added "playwright" MCP server configuration
+
+2. testbot-mcp/src/index.js
+   - Added imports for new modules
+   - Modified handleTestMyApp() for parallel execution
+   - Integrated ResultsMerger for combining results
+
+3. testbot-mcp/src/report-generator.js
+   - Enhanced copyArtifacts() to handle MCP output
+   - Added scanAndCopyMCPArtifacts() method
+   - Added scanAndCopyTestResultsArtifacts() method
+   - Better artifact path handling and deduplication
+
+4. dashboard/src/reporter.js
+   - Added viewTraceInViewer() function
+   - Enhanced trace artifact display with View Trace button
+   - Added getArtifactStats() helper
+
+5. dashboard/src/styles/dashboard.css
+   - Added trace viewer modal styles
+   - Enhanced artifact display styles
+   - Added trace-specific button styles
+
+6. examples/sample-project/playwright.config.js
+   - Set trace: 'on' (always capture)
+   - Set screenshot: 'on' (always capture)
+   - Set video: 'on' (always capture)
+   - Added outputDir configuration
+
+7. .env.example
+   - Added PLAYWRIGHT_MCP_ENABLED environment variable
+   - Added PLAYWRIGHT_MCP_OUTPUT_DIR setting
+   - Added PLAYWRIGHT_MCP_PARALLEL option
+
+ENVIRONMENT VARIABLES:
+----------------------
+# Playwright MCP Configuration
+PLAYWRIGHT_MCP_ENABLED=true         # Enable/disable MCP integration
+PLAYWRIGHT_MCP_OUTPUT_DIR=playwright-mcp-output  # Artifact output directory
+PLAYWRIGHT_MCP_PARALLEL=true        # Run TestBot + MCP in parallel
+
+ARCHITECTURE:
+-------------
+```
+Test Request
+    │
+    ├──► TestBot Direct Execution (fast)
+    │         │
+    │         └──► test-results.json
+    │         └──► test-results/ (minimal artifacts)
+    │
+    └──► Playwright MCP Execution (parallel)
+              │
+              └──► playwright-mcp-output/
+                    ├── traces/
+                    ├── videos/
+                    └── screenshots/
+                              │
+                              ▼
+                    Results Merger
+                              │
+                              ▼
+                    Unified Report
+                              │
+                              ▼
+                    Dashboard with all artifacts
+```
+
+USAGE:
+------
+1. Enable parallel MCP execution:
+   - Set PLAYWRIGHT_MCP_ENABLED=true in .env
+   - Or set PLAYWRIGHT_MCP_PARALLEL=true
+
+2. Run tests via TestBot:
+   - Tests execute in parallel (direct + MCP)
+   - All artifacts automatically collected
+   - Dashboard displays comprehensive results
+
+3. View trace files:
+   - Click "View Trace" in artifact section
+   - Opens trace.playwright.dev or shows instructions
+   - Download trace for offline analysis
+
+TESTING STATUS:
+---------------
+- All new modules created and lint-checked
+- Integration with existing TestBot flow complete
+- Dashboard enhanced for trace/video display
+- Ready for end-to-end testing
+
+TROUBLESHOOTING:
+----------------
+Issue: Playwright MCP server fails to start with "Cannot find module 'playwright/lib/mcp/program'"
+
+Solution:
+1. Install @playwright/mcp locally:
+   npm install --save-dev @playwright/mcp
+
+2. Update ~/.cursor/mcp.json to use local installation:
+   {
+     "playwright": {
+       "command": "node",
+       "args": [
+         "/Users/krishsharma/Desktop/QA_Final/node_modules/@playwright/mcp/cli.js",
+         "--save-trace",
+         "--save-video=1280x720",
+         "--output-dir=playwright-mcp-output",
+         "--output-mode=file",
+         "--headless"
+       ],
+       "env": {},
+       "cwd": "/Users/krishsharma/Desktop/QA_Final"
+     }
+   }
+
+3. Restart Cursor for MCP changes to take effect
+
+The issue occurred because npx creates an isolated environment where
+the playwright peer dependency isn't available. Using the local
+installation resolves this.
+
+PLAYWRIGHT HTML REPORT INTEGRATION:
+------------------------------------
+Date: 2026-01-30 11:25:00
+
+CHANGES:
+1. playwright.config.js - Added HTML reporter
+   - Generates interactive HTML report at playwright-report/
+   - Configured to never auto-open ('open: never')
+   - Provides detailed test visualization with artifacts
+
+2. report-generator.js - Added HTML report copying
+   - New method: copyPlaywrightHTMLReport()
+   - Searches common locations for playwright-report/
+   - Copies entire report directory to testbot-reports/playwright-report/
+   - Makes report accessible from TestBot dashboard
+
+3. dashboard/public/index.html - Updated report link
+   - Link now points to ../../testbot-reports/playwright-report/index.html
+   - Added JavaScript to check report availability
+   - Disables link gracefully if report doesn't exist yet
+   - Shows helpful message when report is not available
+
+WORKFLOW:
+1. Tests run with Playwright (direct or MCP)
+2. Playwright generates HTML report in playwright-report/
+3. ReportGenerator copies report to testbot-reports/playwright-report/
+4. Dashboard "View Full Playwright Report" button opens the report
+5. Users can see detailed test execution with timeline, artifacts, etc.
+
+BENEFITS:
+- Full Playwright HTML report accessible from TestBot dashboard
+- Interactive trace viewer, video playback, screenshot gallery
+- Test timeline showing execution order and parallelization
+- Network logs, console output, and detailed assertions
+- Easy navigation between TestBot summary and Playwright details
+
+VERIFICATION:
+All configuration verified successfully with verify-playwright-report.sh:
+- Playwright config has HTML reporter ✓
+- ReportGenerator has copy methods ✓
+- Dashboard button links to correct path ✓
+- Directory structure is correct ✓
+- JavaScript checker implemented ✓
+
+FULL INTEGRATION TEST COMPLETED (2026-01-30 11:35:00):
+-----------------------------------------------------------
+✓ Tests executed: 28 tests, all passed (100% pass rate)
+✓ Playwright HTML report generated at playwright-report/index.html
+✓ Artifacts captured:
+  - Trace files (.zip): 28 tests
+  - Video files (.webm): Frontend/UI tests
+  - Screenshots (.png): UI tests at key moments
+✓ Reports copied to testbot-reports/playwright-report/
+✓ Test artifacts copied to testbot-reports/artifacts/
+✓ TestBot JSON report generated (latest.json)
+✓ HTTP server started on port 8888 (PID: 35719)
+✓ Dashboard accessible at http://localhost:8888/dashboard/public/index.html
+✓ "View Full Playwright Report" button working correctly
+
+ACCESS URLS:
+- Dashboard: http://localhost:8888/dashboard/public/index.html
+- Playwright Report: http://localhost:8888/testbot-reports/playwright-report/index.html
+
+IMPORTANT NOTE:
+Use HTTP server to avoid CORS issues. The file:// protocol will cause
+"Access to fetch has been blocked by CORS policy" errors. Always use
+the start-dashboard-server.sh script or manually start python3 HTTP server.
+
+See DASHBOARD_ACCESS.md for complete usage instructions.
+
