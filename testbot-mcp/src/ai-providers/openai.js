@@ -19,7 +19,7 @@ class OpenAIClient {
     this.config = {
       ...config,
       apiKey,
-      model: config.model || process.env.OPENAI_MODEL || process.env.OPENAI_CODEX_MODEL || 'gpt-5-codex',
+      model: config.model || process.env.OPENAI_MODEL || process.env.OPENAI_CODEX_MODEL || 'gpt-4o',
       chatFallbackModel: config.chatFallbackModel || process.env.OPENAI_CHAT_FALLBACK_MODEL || 'gpt-4o',
       latestGPTModel: config.latestGPTModel || process.env.OPENAI_LATEST_GPT_MODEL || 'gpt-5',
       modelFallbacks: Array.isArray(config.modelFallbacks)
