@@ -1,8 +1,8 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import Link from 'next/link';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion } from 'framer-motion';
 import McpSetupModal from '@/components/dashboard/McpSetupModal';
 import type { TestRun } from '@/lib/types/database';
 
@@ -29,6 +29,31 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 const PAGE_SIZE = 25;
+const ACTIVE_REFRESH_INTERVAL_MS = 10000;
+const IDLE_REFRESH_INTERVAL_MS = 45000;
+
+function hasActivePipelineRuns(runs: TestRun[]): boolean {
+  return runs.some((run) => {
+    const status = String(run.status || '').toLowerCase();
+    const phase = String(run.current_phase || '').toLowerCase();
+    if (run.is_live) return true;
+    if (status === 'running') return true;
+    return [
+      'queued',
+      'awaiting_configuration',
+      'awaiting_config_ui',
+      'config_received',
+      'starting_pipeline',
+      'started',
+      'context',
+      'context_enrichment',
+      'generating',
+      'running',
+      'reporting',
+      'tests_complete',
+    ].includes(phase);
+  });
+}
 
 export default function McpTestsPage() {
   const [modalOpen, setModalOpen] = useState(false);
@@ -37,26 +62,48 @@ export default function McpTestsPage() {
   const [page, setPage] = useState(1);
   const [tests, setTests] = useState<TestRun[]>([]);
   const [loading, setLoading] = useState(true);
+  const [activeRunsPresent, setActiveRunsPresent] = useState(false);
+  const payloadSignatureRef = useRef<string | null>(null);
+
+  const fetchTests = useCallback(async (isInitial = false) => {
+    if (isInitial) setLoading(true);
+    try {
+      const res = await fetch('/api/test-runs?limit=100&sort_by=created_at&order=desc&include_live=true', { cache: 'no-store' });
+      if (res.ok) {
+        const json = await res.json();
+        const allRuns: TestRun[] = json.data ?? [];
+        // Filter to MCP source only
+        const mcpRuns = allRuns.filter(t => t.source === 'mcp');
+        const signature = JSON.stringify(
+          mcpRuns.map((item) => [item.id, item.status, item.updated_at, item.current_phase, item.error_code])
+        );
+        if (signature !== payloadSignatureRef.current) {
+          payloadSignatureRef.current = signature;
+          setTests(mcpRuns);
+        }
+        setActiveRunsPresent(hasActivePipelineRuns(mcpRuns));
+      }
+    } catch {
+      // silently fail
+    } finally {
+      if (isInitial) setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    async function fetchTests() {
-      setLoading(true);
-      try {
-        const res = await fetch('/api/test-runs?limit=100&sort_by=created_at&order=desc');
-        if (res.ok) {
-          const json = await res.json();
-          const allRuns: TestRun[] = json.data ?? [];
-          // Filter to MCP source only
-          setTests(allRuns.filter(t => t.source === 'mcp'));
-        }
-      } catch {
-        // silently fail
-      } finally {
-        setLoading(false);
+    fetchTests(true);
+  }, [fetchTests]);
+
+  useEffect(() => {
+    const intervalMs = activeRunsPresent ? ACTIVE_REFRESH_INTERVAL_MS : IDLE_REFRESH_INTERVAL_MS;
+    const timer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) {
+        return;
       }
-    }
-    fetchTests();
-  }, []);
+      fetchTests(false);
+    }, intervalMs);
+    return () => clearInterval(timer);
+  }, [fetchTests, activeRunsPresent]);
 
   const filtered = tests
     .filter(t => t.creation_name.toLowerCase().includes(search.toLowerCase()))
@@ -91,7 +138,7 @@ export default function McpTestsPage() {
           <div className="flex gap-3">
             <button
               onClick={() => setModalOpen(true)}
-              className="btn-gradient flex items-center gap-2 text-white font-semibold px-5 py-2.5 rounded-xl text-sm"
+              className="btn-gradient flex items-center gap-2 text-black font-semibold px-5 py-2.5 rounded-xl text-sm"
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 11-7.778 7.778 5.5 5.5 0 017.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
@@ -166,7 +213,7 @@ export default function McpTestsPage() {
             <table className="w-full">
               <thead>
                 <tr className="border-b border-white/5">
-                  <th className="text-left px-6 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Creation Name</th>
+                  <th className="text-left px-6 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Name</th>
                   <th className="text-left px-4 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Status</th>
                   <th className="text-left px-4 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Tests</th>
                   <th className="text-left px-4 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Backend</th>
@@ -184,6 +231,11 @@ export default function McpTestsPage() {
                       <Link href={`/test-run/${test.id}`} className="text-[#F0F6FF] text-sm font-medium hover:text-[#60A5FA] transition-colors">
                         {test.creation_name}
                       </Link>
+                      {(test.current_phase || test.error_code || test.is_live) && (
+                        <div className="text-[11px] text-[#60A5FA] mt-1 font-mono">
+                          {test.is_live ? 'live' : 'run'}{test.current_phase ? ` · ${test.current_phase}` : ''}{test.error_code ? ` · ${test.error_code}` : ''}
+                        </div>
+                      )}
                     </td>
                     <td className="px-4 py-4"><StatusBadge status={test.status} /></td>
                     <td className="px-4 py-4">
@@ -215,7 +267,7 @@ export default function McpTestsPage() {
               <div className="text-[#F0F6FF] font-semibold mb-1">No MCP test runs yet</div>
               <div className="text-[#4A6280] text-sm">Set up the MCP server in your IDE to start seeing test results here.</div>
             </div>
-            <button onClick={() => setModalOpen(true)} className="btn-gradient text-white font-semibold px-5 py-2.5 rounded-xl text-sm">
+            <button onClick={() => setModalOpen(true)} className="btn-gradient text-black font-semibold px-5 py-2.5 rounded-xl text-sm">
               Quick Install
             </button>
           </div>

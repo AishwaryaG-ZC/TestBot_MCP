@@ -5,72 +5,6 @@ import Link from 'next/link';
 import { motion } from 'framer-motion';
 import type { TestRun, TestList, Profile } from '@/lib/types/database';
 
-// Sample data used as fallback / demo when no real data exists
-const DEMO_TESTS: TestRun[] = [
-  {
-    id: 'demo-1',
-    user_id: '',
-    creation_name: 'Homepage & Auth Flow Tests',
-    status: 'passed',
-    total_tests: 35,
-    passed_tests: 32,
-    failed_tests: 3,
-    skipped_tests: 0,
-    backend_pass_rate: 90,
-    frontend_pass_rate: 93,
-    duration_ms: null,
-    report_json: null,
-    ai_analysis: null,
-    framework: null,
-    source: 'mcp',
-    created_at: '2026-02-26T10:30:00Z',
-    updated_at: '2026-02-26T10:30:00Z',
-  },
-  {
-    id: 'demo-2',
-    user_id: '',
-    creation_name: 'API Endpoint Coverage',
-    status: 'passed',
-    total_tests: 35,
-    passed_tests: 32,
-    failed_tests: 3,
-    skipped_tests: 0,
-    backend_pass_rate: 91,
-    frontend_pass_rate: null,
-    duration_ms: null,
-    report_json: null,
-    ai_analysis: null,
-    framework: null,
-    source: 'mcp',
-    created_at: '2026-02-25T16:45:00Z',
-    updated_at: '2026-02-25T16:45:00Z',
-  },
-  {
-    id: 'demo-3',
-    user_id: '',
-    creation_name: 'E2E Checkout & Payment',
-    status: 'failed',
-    total_tests: 22,
-    passed_tests: 14,
-    failed_tests: 8,
-    skipped_tests: 0,
-    backend_pass_rate: 67,
-    frontend_pass_rate: 60,
-    duration_ms: null,
-    report_json: null,
-    ai_analysis: null,
-    framework: null,
-    source: 'mcp',
-    created_at: '2026-02-25T09:00:00Z',
-    updated_at: '2026-02-25T09:00:00Z',
-  },
-];
-
-const DEMO_LISTS: TestList[] = [
-  { id: 'demo-1', user_id: '', name: 'Smoke Tests', description: null, test_count: 12, last_run_at: null, created_at: '', updated_at: '' },
-  { id: 'demo-2', user_id: '', name: 'Regression Suite', description: null, test_count: 47, last_run_at: null, created_at: '', updated_at: '' },
-  { id: 'demo-3', user_id: '', name: 'Auth & Security', description: null, test_count: 8, last_run_at: null, created_at: '', updated_at: '' },
-];
 
 function formatDate(iso: string) {
   const d = new Date(iso);
@@ -137,7 +71,6 @@ export default function HomePage() {
   const [recentTests, setRecentTests] = useState<TestRun[]>([]);
   const [testLists, setTestLists] = useState<TestList[]>([]);
   const [profile, setProfile] = useState<Profile | null>(null);
-  const [isDemo, setIsDemo] = useState(false);
 
   useEffect(() => {
     async function fetchData() {
@@ -153,32 +86,14 @@ export default function HomePage() {
         const listsJson = await listsRes.json();
         const profileJson = await profileRes.json();
 
-        if (!profileRes.ok) {
-          setIsDemo(true);
-          setRecentTests(DEMO_TESTS);
-          setTestLists(DEMO_LISTS);
-          setLoading(false);
-          return;
-        }
-
         const runs: TestRun[] = runsJson.data ?? [];
         const lists: TestList[] = listsJson.data ?? [];
 
-        if (runs.length === 0) {
-          setIsDemo(true);
-          setRecentTests(DEMO_TESTS);
-        } else {
-          setIsDemo(false);
-          setRecentTests(runs);
-        }
-
-        setTestLists(lists.length > 0 ? lists.slice(0, 5) : DEMO_LISTS);
+        setRecentTests(runs);
+        setTestLists(lists.slice(0, 5));
         setProfile(profileJson.data ?? null);
       } catch (err) {
         console.error('Failed to fetch home data:', err);
-        setIsDemo(true);
-        setRecentTests(DEMO_TESTS);
-        setTestLists(DEMO_LISTS);
       } finally {
         setLoading(false);
       }
@@ -227,7 +142,7 @@ export default function HomePage() {
           <div className="flex flex-wrap gap-3">
             <Link
               href="/mcp-tests"
-              className="btn-gradient flex items-center gap-2 text-white font-semibold px-5 py-2.5 rounded-xl text-sm"
+              className="btn-gradient flex items-center gap-2 text-black font-semibold px-5 py-2.5 rounded-xl text-sm"
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <rect x="2" y="2" width="20" height="8" rx="2" /><rect x="2" y="14" width="20" height="8" rx="2" />
@@ -259,14 +174,7 @@ export default function HomePage() {
         {/* Recent Tests Table — left, 2 cols */}
         <motion.div variants={itemVariants} className="lg:col-span-2 glass-card rounded-2xl overflow-hidden">
           <div className="flex items-center justify-between px-6 py-4 border-b border-white/8">
-            <div className="flex items-center gap-2">
-              <h3 className="text-[#F0F6FF] font-semibold text-base">Recent Created Tests</h3>
-              {isDemo && !loading && (
-                <span className="px-2 py-0.5 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-400 text-[10px] font-semibold uppercase tracking-wider">
-                  Demo Data
-                </span>
-              )}
-            </div>
+            <h3 className="text-[#F0F6FF] font-semibold text-base">Recent Created Tests</h3>
             <div className="flex items-center gap-3">
               <Link href="/all-tests" className="text-[#60A5FA] text-xs hover:text-[#93C5FD] transition-colors font-medium">
                 View All →
@@ -287,7 +195,7 @@ export default function HomePage() {
             <table className="w-full">
               <thead>
                 <tr className="border-b border-white/5">
-                  <th className="text-left px-6 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Creation Name</th>
+                  <th className="text-left px-6 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider"> Name</th>
                   <th className="text-left px-4 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Passed</th>
                   <th className="text-left px-4 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Status</th>
                   <th className="text-left px-4 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Created</th>
@@ -306,7 +214,6 @@ export default function HomePage() {
                     const passRate = test.total_tests > 0
                       ? Math.round((test.passed_tests / test.total_tests) * 100)
                       : null;
-                    const isDemo_ = test.id.startsWith('demo-');
                     return (
                       <motion.tr
                         key={test.id}
@@ -316,18 +223,12 @@ export default function HomePage() {
                         className="border-b border-white/5 last:border-0 hover:bg-white/[0.02] hover:shadow-[inset_0_0_20px_rgba(59,130,246,0.05)] transition-all cursor-pointer group"
                       >
                         <td className="px-6 py-4">
-                          {isDemo_ ? (
-                            <span className="text-[#F0F6FF] text-sm font-medium">
-                              {test.creation_name}
-                            </span>
-                          ) : (
-                            <Link
-                              href={`/test-run/${test.id}`}
-                              className="text-[#F0F6FF] text-sm font-medium group-hover:text-[#60A5FA] transition-colors"
-                            >
-                              {test.creation_name}
-                            </Link>
-                          )}
+                          <Link
+                            href={`/test-run/${test.id}`}
+                            className="text-[#F0F6FF] text-sm font-medium group-hover:text-[#60A5FA] transition-colors"
+                          >
+                            {test.creation_name}
+                          </Link>
                         </td>
                         <td className="px-4 py-4">
                           {test.total_tests > 0 ? (
@@ -477,7 +378,7 @@ export default function HomePage() {
 
                   <Link
                     href="/plan-billing"
-                    className="mt-4 block w-full py-2.5 rounded-xl btn-gradient text-white font-semibold text-sm text-center"
+                    className="mt-4 block w-full py-2.5 rounded-xl btn-gradient text-black font-semibold text-sm text-center"
                   >
                     Upgrade to Pro
                   </Link>

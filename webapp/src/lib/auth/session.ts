@@ -1,19 +1,13 @@
-import { cookies } from 'next/headers'
-import { verifySession } from './index'
+import { createSupabaseServerClient } from '../supabase/server'
 import { db } from '../db'
-import { users, profiles } from '../db/schema'
+import { profiles } from '../db/schema'
 import { eq } from 'drizzle-orm'
 
 export async function getCurrentUser() {
-  const cookieStore = await cookies()
-  const token = cookieStore.get('testbot-session')?.value
-  if (!token) return null
-
-  const payload = await verifySession(token)
-  if (!payload) return null
-
-  const [user] = await db.select().from(users).where(eq(users.id, payload.userId)).limit(1)
-  return user ?? null
+  const supabase = await createSupabaseServerClient()
+  const { data: { user }, error } = await supabase.auth.getUser()
+  if (error || !user) return null
+  return user
 }
 
 export async function getCurrentProfile() {

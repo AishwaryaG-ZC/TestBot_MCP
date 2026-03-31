@@ -1,8 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { db } from '@/lib/db'
-import { users } from '@/lib/db/schema'
-import { eq } from 'drizzle-orm'
-import { verifyPassword, createSession, setSessionCookie } from '@/lib/auth'
+import { createSupabaseServerClient } from '@/lib/supabase/server'
 
 export async function POST(request: NextRequest) {
   try {
@@ -13,26 +10,17 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Email and password are required' }, { status: 400 })
     }
 
-    const [user] = await db
-      .select()
-      .from(users)
-      .where(eq(users.email, email.toLowerCase()))
-      .limit(1)
+    const supabase = await createSupabaseServerClient()
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: email.toLowerCase(),
+      password,
+    })
 
-    if (!user) {
+    if (error) {
       return NextResponse.json({ error: 'Invalid credentials' }, { status: 401 })
     }
 
-    const passwordValid = await verifyPassword(password, user.passwordHash)
-    if (!passwordValid) {
-      return NextResponse.json({ error: 'Invalid credentials' }, { status: 401 })
-    }
-
-    const token = await createSession(user.id)
-    const response = NextResponse.json({ success: true, userId: user.id })
-    setSessionCookie(response, token)
-
-    return response
+    return NextResponse.json({ success: true, userId: data.user.id })
   } catch (error) {
     console.error('Login error:', error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

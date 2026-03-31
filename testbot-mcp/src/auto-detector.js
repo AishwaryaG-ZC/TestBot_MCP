@@ -9,6 +9,48 @@ const path = require('path');
 const Logger = require('./logger');
 
 class AutoDetector {
+  findFileRelative(projectPath, filename, maxDepth = 3) {
+    const skipDirs = new Set([
+      '.git',
+      'node_modules',
+      '.venv',
+      'venv',
+      '__pycache__',
+      '.pytest_cache',
+      '.mypy_cache',
+      '.next',
+      'dist',
+      'build',
+    ]);
+
+    const walk = (currentDir, depth) => {
+      if (depth > maxDepth) return null;
+
+      let entries = [];
+      try {
+        entries = fs.readdirSync(currentDir, { withFileTypes: true });
+      } catch {
+        return null;
+      }
+
+      for (const entry of entries) {
+        if (entry.isFile() && entry.name === filename) {
+          return path.relative(projectPath, path.join(currentDir, entry.name));
+        }
+      }
+
+      for (const entry of entries) {
+        if (!entry.isDirectory() || skipDirs.has(entry.name)) continue;
+        const result = walk(path.join(currentDir, entry.name), depth + 1);
+        if (result) return result;
+      }
+
+      return null;
+    };
+
+    return walk(projectPath, 0);
+  }
+
   /**
    * Detect project settings from the given path
    * @param {string} projectPath - Path to the project root
@@ -29,7 +71,7 @@ class AutoDetector {
     const projectName = this.detectProjectName(resolvedPath, packageJson, langInfo);
     const port = this.detectPort(packageJson, envFile, playwrightConfig, langInfo);
     const baseURL = this.detectBaseURL(packageJson, envFile, playwrightConfig, port);
-    const startCommand = this.detectStartCommand(packageJson, langInfo, resolvedPath);
+    const startCommand = this.detectStartCommand(packageJson, langInfo, resolvedPath, port);
     const testDirs = this.scanTestDirs(resolvedPath);
 
     const settings = {
@@ -290,6 +332,10 @@ class AutoDetector {
       }
     }
 
+    if (this.isExpoProject(packageJson)) {
+      return 8081;
+    }
+
     // Node.js framework defaults
     if (packageJson?.dependencies) {
       if (packageJson.dependencies.vite) return 5173;
@@ -331,16 +377,43 @@ class AutoDetector {
       return playwrightConfig.baseURL;
     }
 
+    if (this.isExpoProject(packageJson)) {
+      return `http://localhost:${port || 8081}`;
+    }
+
     return `http://localhost:${port}`;
+  }
+
+  isExpoProject(packageJson) {
+    if (!packageJson || typeof packageJson !== 'object') return false;
+    const dependencies = {
+      ...(packageJson.dependencies || {}),
+      ...(packageJson.devDependencies || {}),
+    };
+    if (dependencies.expo || dependencies['expo-router']) {
+      return true;
+    }
+
+    const scripts = packageJson.scripts || {};
+    return Object.values(scripts).some((value) => /expo\s+start/i.test(String(value || '')));
   }
 
   /**
    * Detect start command (language-aware)
    */
-  detectStartCommand(packageJson, langInfo, projectPath) {
+  detectStartCommand(packageJson, langInfo, projectPath, port = 8000) {
     // Node.js: check package.json scripts
     if (packageJson?.scripts) {
       const scripts = packageJson.scripts;
+      if (this.isExpoProject(packageJson)) {
+        const resolvedPort = Number(port) || 8081;
+        if (scripts.web) {
+          return `npm run web -- --port ${resolvedPort}`;
+        }
+        if (scripts.start && /expo\s+start/i.test(String(scripts.start))) {
+          return `npm run start -- --web --port ${resolvedPort}`;
+        }
+      }
       const startScripts = ['dev', 'start', 'serve', 'start:dev', 'develop'];
       for (const script of startScripts) {
         if (scripts[script]) {
@@ -351,9 +424,18 @@ class AutoDetector {
 
     // Language-specific start commands
     if (langInfo?.language === 'python') {
-      if (langInfo.ecosystem === 'django' || fs.existsSync(path.join(projectPath, 'manage.py'))) {
-        return 'python manage.py runserver';
+      const rootManagePy = fs.existsSync(path.join(projectPath, 'manage.py'));
+      const nestedManagePy = rootManagePy ? 'manage.py' : this.findFileRelative(projectPath, 'manage.py', 4);
+
+      if (langInfo.ecosystem === 'django' || nestedManagePy) {
+        const manageDir = path.dirname(nestedManagePy);
+        if (!manageDir || manageDir === '.') {
+          return 'python manage.py runserver';
+        }
+        const normalizedDir = manageDir.replace(/\\/g, '/');
+        return `cd ${normalizedDir} && python manage.py runserver`;
       }
+
       // Check for FastAPI / Uvicorn
       try {
         const req = fs.readFileSync(path.join(projectPath, 'requirements.txt'), 'utf-8');

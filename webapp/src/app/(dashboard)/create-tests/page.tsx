@@ -58,7 +58,7 @@ export default function CreateTestsPage() {
             <div className="flex flex-wrap gap-3 justify-center lg:justify-start">
               <Link
                 href="/mcp-tests"
-                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-blue-500 via-cyan-400 to-blue-500 bg-[length:200%] text-white font-medium text-sm hover:bg-right transition-all duration-500 hover:shadow-[0_0_20px_rgba(59,130,246,0.3)]"
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-blue-500 via-cyan-400 to-blue-500 bg-[length:200%] text-black font-medium text-sm hover:bg-right transition-all duration-500 hover:shadow-[0_0_20px_rgba(59,130,246,0.3)]"
               >
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
                   <rect x="2" y="3" width="20" height="14" rx="2" />
@@ -67,7 +67,7 @@ export default function CreateTestsPage() {
                 View MCP Setup
               </Link>
               <a
-                href="https://github.com/krishsharma1008/TestBot_MCP"
+                href="#"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl backdrop-blur-md bg-white/[0.05] border border-white/10 text-[#F0F6FF] font-medium text-sm hover:bg-white/[0.08] transition-all duration-300"

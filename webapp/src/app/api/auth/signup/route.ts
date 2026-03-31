@@ -1,8 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { db } from '@/lib/db'
-import { users, profiles } from '@/lib/db/schema'
-import { eq } from 'drizzle-orm'
-import { hashPassword, createSession, setSessionCookie } from '@/lib/auth'
+import { createSupabaseServerClient } from '@/lib/supabase/server'
 
 export async function POST(request: NextRequest) {
   try {
@@ -20,40 +17,23 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const [existingUser] = await db
-      .select({ id: users.id })
-      .from(users)
-      .where(eq(users.email, email.toLowerCase()))
-      .limit(1)
-
-    if (existingUser) {
-      return NextResponse.json({ error: 'User already exists' }, { status: 409 })
-    }
-
-    const passwordHash = await hashPassword(password)
-
-    const [newUser] = await db
-      .insert(users)
-      .values({
-        email: email.toLowerCase(),
-        passwordHash,
-      })
-      .returning()
-
-    await db.insert(profiles).values({
-      id: newUser.id,
-      email: newUser.email,
-      fullName: full_name ?? null,
-      plan: 'starter',
-      creditsRemaining: 100,
-      creditsTotal: 100,
+    const supabase = await createSupabaseServerClient()
+    const { data, error } = await supabase.auth.signUp({
+      email: email.toLowerCase(),
+      password,
+      options: {
+        data: { full_name: full_name ?? null },
+      },
     })
 
-    const token = await createSession(newUser.id)
-    const response = NextResponse.json({ success: true, userId: newUser.id }, { status: 201 })
-    setSessionCookie(response, token)
+    if (error) {
+      if (error.message?.toLowerCase().includes('already registered')) {
+        return NextResponse.json({ error: 'User already exists' }, { status: 409 })
+      }
+      return NextResponse.json({ error: error.message }, { status: 400 })
+    }
 
-    return response
+    return NextResponse.json({ success: true, userId: data.user?.id }, { status: 201 })
   } catch (error) {
     console.error('Signup error:', error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

@@ -4,21 +4,34 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TestBot Configuration</title>
-    <!-- Google Fonts for Neo-Brutalism -->
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <!-- Google Fonts: Space Grotesk + Space Mono -->
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         :root {
             --bg-darkest: #000000;
-            --bg-card: #111111;
-            --bg-card-2: #1a1a1a;
-            --text-primary: #ffffff;
+            --bg-dark:    #0a0a0a;
+            --bg-card:    #111111;
+            --bg-card-2:  #1a1a1a;
+            --bg-border:  #333333;
+            --text-primary:   #ffffff;
             --text-secondary: #a0a0a0;
+            --text-muted:     #505050;
+            --shadow-brutal:    4px 4px 0px #ffffff;
+            --shadow-brutal-sm: 2px 2px 0px #ffffff;
+            --shadow-brutal-lg: 6px 6px 0px #ffffff;
             --font-body: 'Space Grotesk', sans-serif;
+            --font-mono: 'Space Mono', monospace;
         }
+
+        *, *::before, *::after { box-sizing: border-box; }
 
         body {
             background-color: var(--bg-darkest);
+            background-image:
+                linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px);
+            background-size: 20px 20px;
             color: var(--text-primary);
             font-family: var(--font-body);
             -webkit-font-smoothing: antialiased;
@@ -26,141 +39,298 @@
             justify-content: center;
         }
 
+        /* ── Scrollbar ── */
+        ::-webkit-scrollbar        { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track  { background: #000; border-left: 1px solid #333; }
+        ::-webkit-scrollbar-thumb  { background: #fff; border: 1px solid #000; }
+        ::-webkit-scrollbar-thumb:hover { background: #d0d0d0; }
+
         /* ── Core brutal card ── */
         .brutal-card {
-            background: #111111;
-            border: 2px solid #333333;
-            border-radius: 8px; /* Slightly rounded for the inner forms matching screenshot */
-            transition: border-color 0.2s ease;
+            background: var(--bg-card);
+            border: 2px solid #ffffff;
+            box-shadow: var(--shadow-brutal);
+            border-radius: 0;
+            transition: box-shadow 0.08s ease, transform 0.08s ease;
         }
-        .brutal-card:hover { border-color: #555555; }
+        .brutal-card:hover {
+            box-shadow: var(--shadow-brutal-lg);
+            transform: translate(-1px, -1px);
+        }
 
         /* ── Input ── */
         .input-glass {
             background: #000000;
-            border: 1px solid #333333;
+            border: 2px solid #333333;
             color: #ffffff;
-            border-radius: 6px;
-            font-family: inherit;
+            border-radius: 0;
+            font-family: var(--font-mono);
+            font-size: 13px;
             padding: 10px 14px;
             width: 100%;
-            transition: border-color 0.12s ease;
-        }
-        .input-glass:focus {
+            transition: border-color 0.12s ease, box-shadow 0.12s ease;
             outline: none;
+        }
+        .input-glass::placeholder { color: #505050; }
+        .input-glass:focus {
             border-color: #ffffff;
+            box-shadow: 3px 3px 0px #ffffff;
         }
 
-        /* ── Neo-brutal CTA button ── */
+        /* ── Primary button ── */
         .btn-gradient {
             background: #ffffff;
             color: #000000;
-            padding: 10px 24px;
-            border-radius: 6px;
+            padding: 11px 28px;
+            border-radius: 0;
             font-weight: 700;
-            font-size: 14px;
-            transition: opacity 0.2s ease;
+            font-size: 13px;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            font-family: var(--font-mono);
             cursor: pointer;
-            border: none;
+            border: 2px solid #000000;
+            box-shadow: 3px 3px 0px #707070;
+            transition: box-shadow 0.08s ease, transform 0.08s ease;
         }
-        .btn-gradient:hover { opacity: 0.8; }
+        .btn-gradient:hover {
+            box-shadow: 5px 5px 0px #707070;
+            transform: translate(-1px, -1px);
+        }
+        .btn-gradient:active {
+            box-shadow: 1px 1px 0px #707070;
+            transform: translate(1px, 1px);
+        }
+        .btn-gradient:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
 
+        /* ── Secondary button ── */
         .btn-secondary {
-            background: rgba(255, 255, 255, 0.1);
+            background: transparent;
             color: #ffffff;
-            padding: 10px 24px;
-            border-radius: 6px;
-            font-weight: 500;
-            font-size: 14px;
-            transition: background 0.2s ease;
+            padding: 11px 28px;
+            border-radius: 0;
+            font-weight: 700;
+            font-size: 13px;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            font-family: var(--font-mono);
             cursor: pointer;
-            border: none;
+            border: 2px solid #333333;
+            box-shadow: 3px 3px 0px #333333;
+            transition: box-shadow 0.08s ease, transform 0.08s ease, border-color 0.12s ease;
         }
-        .btn-secondary:hover { background: rgba(255, 255, 255, 0.2); }
+        .btn-secondary:hover {
+            border-color: #ffffff;
+            box-shadow: 5px 5px 0px #ffffff;
+            transform: translate(-1px, -1px);
+        }
+        .btn-secondary:active {
+            box-shadow: 1px 1px 0px #ffffff;
+            transform: translate(1px, 1px);
+        }
 
-        /* ── Selectors ── */
+        /* ── Toggle selectors ── */
         .toggle-group {
             display: flex;
-            background: #0a0a0a;
-            border-radius: 8px;
-            border: 1px solid #333333;
+            background: #000000;
+            border: 2px solid #333333;
             overflow: hidden;
             width: 100%;
         }
         .toggle-btn {
             flex: 1;
             text-align: center;
-            padding: 12px;
+            padding: 10px 8px;
             cursor: pointer;
-            font-size: 14px;
-            font-weight: 500;
-            transition: background 0.2s ease;
-            color: var(--text-secondary);
+            font-size: 11px;
+            font-weight: 700;
+            font-family: var(--font-mono);
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            transition: background 0.1s ease, color 0.1s ease;
+            color: #505050;
+            border-right: 1px solid #333333;
         }
+        .toggle-btn:last-child { border-right: none; }
         .toggle-btn.active {
-            background: #222222;
-            color: #ffffff;
-            border-radius: 6px;
-            margin: 2px;
+            background: #ffffff;
+            color: #000000;
         }
+        .toggle-btn:hover:not(.active) { background: #1a1a1a; color: #a0a0a0; }
 
+        /* ── Upload zone ── */
         .upload-zone {
             border: 2px dashed #333333;
-            border-radius: 12px;
             padding: 40px;
             text-align: center;
             cursor: pointer;
-            transition: border-color 0.2s ease, background 0.2s ease;
+            transition: border-color 0.15s ease, background 0.15s ease;
+            background: #0a0a0a;
         }
         .upload-zone:hover, .upload-zone.dragover {
             border-color: #ffffff;
-            background: rgba(255, 255, 255, 0.02);
+            background: #111111;
         }
+
+        /* ── Section badge (y2k-badge style) ── */
+        .section-badge {
+            display: inline-flex;
+            align-items: center;
+            background: #000000;
+            border: 2px solid #ffffff;
+            color: #ffffff;
+            font-family: var(--font-mono);
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            padding: 2px 10px;
+            margin-bottom: 8px;
+        }
+
+        /* ── URL preview block ── */
+        .url-preview {
+            background: #1a1a1a;
+            border: 2px solid #333333;
+            padding: 12px 16px;
+            margin-top: 10px;
+        }
+        .url-preview-label {
+            font-family: var(--font-mono);
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            color: #505050;
+            margin-bottom: 6px;
+        }
+        #baseUrlPreview {
+            font-family: var(--font-mono);
+            font-size: 13px;
+            color: #ffffff;
+            word-break: break-all;
+        }
+
+        /* ── Info banner ── */
+        .info-banner {
+            background: #111111;
+            border: 2px solid #333333;
+            padding: 12px 16px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 8px;
+        }
+
+        /* ── Field label ── */
+        .field-label {
+            width: 140px;
+            flex-shrink: 0;
+            font-family: var(--font-mono);
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--text-secondary);
+        }
+
+        /* ── Dividers inside card ── */
+        .brutal-card .field-row + .field-row {
+            border-top: 1px solid #1f1f1f;
+            padding-top: 20px;
+        }
+        .field-row { padding-bottom: 4px; }
+
+        /* ── Error banner ── */
+        #formError {
+            background: #1a0000;
+            color: #ff6b6b;
+            border: 2px solid #ff4444;
+            font-family: var(--font-mono);
+            font-size: 12px;
+            font-weight: 700;
+            padding: 12px 16px;
+        }
+
+        /* ── File preview ── */
+        #filePreview {
+            background: #1a1a1a;
+            border: 2px solid #ffffff;
+            box-shadow: 3px 3px 0px #ffffff;
+            padding: 10px 14px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 12px;
+        }
+        #fileName {
+            font-family: var(--font-mono);
+            font-size: 12px;
+            color: #ffffff;
+        }
+        #removeFile {
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 18px;
+            font-weight: 700;
+            color: #a0a0a0;
+            line-height: 1;
+            padding: 0 4px;
+            transition: color 0.1s ease;
+        }
+        #removeFile:hover { color: #ffffff; }
+
+        /* ── Success overlay ── */
+        #successOverlay { background: #000000; }
 
         .max-w-3xl { max-width: 800px; width: 100%; }
         .hidden { display: none !important; }
     </style>
 </head>
-<body class="min-h-screen py-10 px-4">
+<body class="min-h-screen py-12 px-4">
     <div class="max-w-3xl">
         <!-- Header -->
-        <div class="flex items-center gap-3 mb-10">
-            <!-- <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                <path d="M2 17L12 22L22 17" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                <path d="M2 12L12 17L22 12" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg> -->
-            <h1 class="text-2xl font-bold tracking-wide">TestBot MCP</h1>
+        <div class="flex items-center gap-4 mb-2">
+            <div style="display:inline-flex;align-items:center;background:#000000;border:2px solid #ffffff;color:#ffffff;font-family:'Space Mono',monospace;font-size:11px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;padding:4px 12px;box-shadow:3px 3px 0 #ffffff;">
+                &#x2713; TESTBOT_MCP
+            </div>
         </div>
 
-        <h2 class="text-3xl font-bold mb-8">Testing Configuration</h2>
+        <h2 style="font-size:2.4rem;font-weight:900;line-height:1.1;letter-spacing:-0.02em;margin:24px 0 6px;color:#ffffff;">Testing Configuration</h2>
+        <div style="width:48px;height:3px;background:#ffffff;margin-bottom:36px;"></div>
 
         <form id="configForm" class="space-y-10">
             
             <!-- Section 1 -->
             <div>
-                <h3 class="text-lg font-bold mb-1">Testing Types <span class="text-red-500">*</span></h3>
-                <p class="text-sm text-[#a0a0a0] mb-4">Select your testing types.</p>
-                <div class="brutal-card p-6 space-y-6">
-                    <div class="flex items-center">
-                        <div class="w-1/4 text-sm font-medium">Mode</div>
-                        <div class="w-3/4">
+                <span class="section-badge">01 — Required</span>
+                <h3 style="font-size:1.1rem;font-weight:700;margin:4px 0 4px;color:#ffffff;">Testing Types</h3>
+                <p style="font-size:13px;color:#a0a0a0;margin-bottom:14px;">Select your testing types.</p>
+                <div class="brutal-card p-6">
+                    <div class="field-row flex items-center gap-4">
+                        <div class="field-label" style="padding-top:2px;">Mode</div>
+                        <div style="flex:1;">
                             <div class="toggle-group" id="mode-group">
                                 <div class="toggle-btn" data-value="backend">Backend</div>
                                 <div class="toggle-btn active" data-value="frontend">Frontend</div>
                                 <div class="toggle-btn" data-value="both">Both</div>
                             </div>
-                            <p class="text-xs text-[#a0a0a0] mt-2">Choose whether to test your backend service or frontend workflows.</p>
+                            <p style="font-size:12px;color:#505050;margin-top:8px;">Choose whether to test your backend service or frontend workflows.</p>
                         </div>
                     </div>
-                    <div class="flex items-center">
-                        <div class="w-1/4 text-sm font-medium">Scope</div>
-                        <div class="w-3/4">
+                    <div class="field-row flex items-center gap-4" style="margin-top:20px;">
+                        <div class="field-label" style="padding-top:2px;">Scope</div>
+                        <div style="flex:1;">
                             <div class="toggle-group" id="scope-group">
                                 <div class="toggle-btn active" data-value="codebase">Codebase</div>
                                 <div class="toggle-btn" data-value="diff">Code diff</div>
                             </div>
-                            <p class="text-xs text-[#a0a0a0] mt-2">Select whether to test against the entire codebase or just recent changes.</p>
+                            <p style="font-size:12px;color:#505050;margin-top:8px;">Select whether to test against the entire codebase or just recent changes.</p>
                         </div>
                     </div>
                 </div>
@@ -168,34 +338,35 @@
 
             <!-- Section 2 -->
             <div>
-                <h3 class="text-lg font-bold mb-1">Execution Settings <span class="text-red-500">*</span></h3>
-                <p class="text-sm text-[#a0a0a0] mb-4">Choose test generation and run behavior before launching the pipeline.</p>
-                <div class="brutal-card p-6 space-y-6">
-                    <div class="flex items-start">
-                        <div class="w-1/4 text-sm font-medium mt-3">Start Command</div>
-                        <div class="w-3/4">
+                <span class="section-badge">02 — Required</span>
+                <h3 style="font-size:1.1rem;font-weight:700;margin:4px 0 4px;color:#ffffff;">Execution Settings</h3>
+                <p style="font-size:13px;color:#a0a0a0;margin-bottom:14px;">Choose test generation and run behavior before launching the pipeline.</p>
+                <div class="brutal-card p-6">
+                    <div class="field-row flex items-start gap-4">
+                        <div class="field-label" style="padding-top:11px;">Start Command</div>
+                        <div style="flex:1;">
                             <input type="text" id="startCommand" class="input-glass" placeholder="npm run dev">
-                            <p class="text-xs text-[#a0a0a0] mt-2">Command used by TestBot to start your app server if needed.</p>
+                            <p style="font-size:12px;color:#505050;margin-top:8px;">Command used by TestBot to start your app server if needed.</p>
                         </div>
                     </div>
-                    <div class="flex items-center">
-                        <div class="w-1/4 text-sm font-medium">Generate Tests</div>
-                        <div class="w-3/4">
+                    <div class="field-row flex items-center gap-4" style="margin-top:20px;">
+                        <div class="field-label" style="padding-top:2px;">Generate Tests</div>
+                        <div style="flex:1;">
                             <div class="toggle-group" id="generate-group">
                                 <div class="toggle-btn active" data-value="true">Yes</div>
                                 <div class="toggle-btn" data-value="false">No</div>
                             </div>
-                            <p class="text-xs text-[#a0a0a0] mt-2">When disabled, TestBot runs existing tests only.</p>
+                            <p style="font-size:12px;color:#505050;margin-top:8px;">When disabled, TestBot runs existing tests only.</p>
                         </div>
                     </div>
-                    <div class="flex items-center">
-                        <div class="w-1/4 text-sm font-medium">Open Dashboard</div>
-                        <div class="w-3/4">
+                    <div class="field-row flex items-center gap-4" style="margin-top:20px;">
+                        <div class="field-label" style="padding-top:2px;">Open Dashboard</div>
+                        <div style="flex:1;">
                             <div class="toggle-group" id="dashboard-group">
                                 <div class="toggle-btn active" data-value="true">Yes</div>
                                 <div class="toggle-btn" data-value="false">No</div>
                             </div>
-                            <p class="text-xs text-[#a0a0a0] mt-2">Automatically open dashboard when tests finish.</p>
+                            <p style="font-size:12px;color:#505050;margin-top:8px;">Automatically open dashboard when tests finish.</p>
                         </div>
                     </div>
                 </div>
@@ -203,96 +374,97 @@
 
             <!-- Section 3 -->
             <div>
-                <h3 class="text-lg font-bold mb-1">Test Account Info <span class="text-[#a0a0a0] font-normal">(Optional)</span></h3>
-                <p class="text-sm text-[#a0a0a0] mb-4">Provide the login credentials for a test account that can be used to access and test your application.</p>
-                <div class="brutal-card p-6 space-y-6">
-                    <div class="flex items-start">
-                        <div class="w-1/4 text-sm font-medium mt-3">Test Account<br>Username</div>
-                        <div class="w-3/4">
-                            <input type="text" id="username" class="input-glass" placeholder="">
-                            <p class="text-xs text-[#a0a0a0] mt-2">Provide a test account username, e.g., test@example.com.</p>
+                <span class="section-badge">03 — Optional</span>
+                <h3 style="font-size:1.1rem;font-weight:700;margin:4px 0 4px;color:#ffffff;">Test Account Info</h3>
+                <p style="font-size:13px;color:#a0a0a0;margin-bottom:14px;">Provide the login credentials for a test account that can be used to access and test your application.</p>
+                <div class="brutal-card p-6">
+                    <div class="field-row flex items-start gap-4">
+                        <div class="field-label" style="padding-top:11px;">Username</div>
+                        <div style="flex:1;">
+                            <input type="text" id="username" class="input-glass" placeholder="test@example.com">
+                            <p style="font-size:12px;color:#505050;margin-top:8px;">Provide a test account username, e.g., test@example.com.</p>
                         </div>
                     </div>
-                    <div class="flex items-start">
-                        <div class="w-1/4 text-sm font-medium mt-3">Test Account<br>Password</div>
-                        <div class="w-3/4">
-                            <input type="password" id="password" class="input-glass" placeholder="">
-                            <p class="text-xs text-[#a0a0a0] mt-2">Enter the corresponding password for the test account, e.g., 123456abc.</p>
+                    <div class="field-row flex items-start gap-4" style="margin-top:20px;">
+                        <div class="field-label" style="padding-top:11px;">Password</div>
+                        <div style="flex:1;">
+                            <input type="password" id="password" class="input-glass" placeholder="••••••••">
+                            <p style="font-size:12px;color:#505050;margin-top:8px;">Enter the corresponding password for the test account, e.g., 123456abc.</p>
                         </div>
                     </div>
                 </div>
             </div>
 
             <div>
-                <h3 class="text-lg font-bold mb-1">Local Server Port <span class="text-red-500">*</span></h3>
-                <p class="text-sm text-[#a0a0a0] mb-4">Port where your local server is running e.g. 3000 in localhost:3000. If there is a specific path that you want to test and not accessible from the root, enter it in the "Path" section. e.g. dashboard for localhost:3000/dashboard</p>
-                <div class="brutal-card p-6 space-y-6">
-                    <div class="flex items-center">
-                        <div class="w-1/4 text-sm font-medium">Host</div>
-                        <div class="w-3/4">
-                            <input type="text" id="host" value="localhost" class="input-glass">
-                        </div>
+                <span class="section-badge">04 — Required</span>
+                <h3 style="font-size:1.1rem;font-weight:700;margin:4px 0 4px;color:#ffffff;">Local Server Port</h3>
+                <p style="font-size:13px;color:#a0a0a0;margin-bottom:14px;">Port where your local server is running e.g. 3000 in localhost:3000. If there is a specific path you want to test, enter it in the Path field.</p>
+                <div class="brutal-card p-6">
+                    <div class="field-row flex items-center gap-4">
+                        <div class="field-label">Host</div>
+                        <div style="flex:1;"><input type="text" id="host" value="localhost" class="input-glass"></div>
                     </div>
-                    <div class="flex items-center">
-                        <div class="w-1/4 text-sm font-medium">Port</div>
-                        <div class="w-3/4">
-                            <input type="text" id="port" value="5173" class="input-glass">
-                        </div>
+                    <div class="field-row flex items-center gap-4" style="margin-top:20px;">
+                        <div class="field-label">Port</div>
+                        <div style="flex:1;"><input type="text" id="port" value="5173" class="input-glass"></div>
                     </div>
-                    <div class="flex items-center">
-                        <div class="w-1/4 text-sm font-medium">Path</div>
-                        <div class="w-3/4">
-                            <input type="text" id="path" value="/" class="input-glass">
-                        </div>
+                    <div class="field-row flex items-center gap-4" style="margin-top:20px;">
+                        <div class="field-label">Path</div>
+                        <div style="flex:1;"><input type="text" id="path" value="/" class="input-glass"></div>
                     </div>
-                    <div class="bg-[#1a1a1a] border border-[#333333] p-4 rounded-lg mt-4">
-                        <div class="text-xs text-[#a0a0a0] uppercase tracking-wider mb-2">Computed Base URL</div>
-                        <div id="baseUrlPreview" class="font-mono text-sm text-white break-all">http://localhost:5173/</div>
+                    <div class="url-preview" style="margin-top:16px;">
+                        <div class="url-preview-label">Computed Base URL</div>
+                        <div id="baseUrlPreview">http://localhost:5173/</div>
                     </div>
-                    <div class="bg-[#1a1a1a] border border-[#333333] p-4 rounded-lg mt-4 flex justify-between">
-                        <div class="text-[#a0a0a0] text-sm">Dev servers may crash under concurrent test load — frontend tests will be limited to 15.</div>
-                        <div class="text-[#a0a0a0]">▶</div>
+                    <div class="info-banner" style="margin-top:10px;">
+                        <div style="font-size:12px;font-family:'Space Mono',monospace;color:#a0a0a0;">// dev servers may crash under concurrent load &mdash; frontend tests capped at 15</div>
                     </div>
                 </div>
             </div>
 
             <!-- Section 4 -->
             <div>
-                <h3 class="text-lg font-bold mb-1">Product Specification Doc</h3>
-                <p class="text-sm text-[#a0a0a0] mb-4">Upload a document that explains your desired product's features, purpose, and how it should work.</p>
+                <span class="section-badge">05 — Optional</span>
+                <h3 style="font-size:1.1rem;font-weight:700;margin:4px 0 4px;color:#ffffff;">Product Specification Doc</h3>
+                <p style="font-size:13px;color:#a0a0a0;margin-bottom:14px;">Upload a document that explains your desired product's features, purpose, and how it should work.</p>
                 <div class="brutal-card p-6">
                     <div class="upload-zone" id="dropzone">
-                        <svg class="mx-auto mb-4" width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                            <path d="M22 19C22 20.1046 21.1046 21 20 21H4C2.89543 21 2 20.1046 2 19V5C2 3.89543 2.89543 3 4 3H9.17157C9.70201 3 10.2107 3.21071 10.5858 3.58579L12.4142 5.41421C12.7893 5.78929 13.298 6 13.8284 6H20C21.1046 6 22 6.89543 22 8V19Z" stroke="#707070" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                        <svg class="mx-auto mb-4" width="44" height="44" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M22 19C22 20.1046 21.1046 21 20 21H4C2.89543 21 2 20.1046 2 19V5C2 3.89543 2.89543 3 4 3H9.17157C9.70201 3 10.2107 3.21071 10.5858 3.58579L12.4142 5.41421C12.7893 5.78929 13.298 6 13.8284 6H20C21.1046 6 22 6.89543 22 8V19Z" stroke="#505050" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
                         </svg>
-                        <p class="text-sm text-[#a0a0a0]">Select your product requirements document (.md, .txt, .json, .yaml, .yml)</p>
+                        <p style="font-size:13px;font-weight:700;color:#a0a0a0;font-family:'Space Mono',monospace;">Drop file or click to browse</p>
+                        <p style="font-size:11px;color:#505050;margin-top:6px;font-family:'Space Mono',monospace;letter-spacing:0.06em;">.md &nbsp;&middot;&nbsp; .txt &nbsp;&middot;&nbsp; .json &nbsp;&middot;&nbsp; .yaml &nbsp;&middot;&nbsp; .yml</p>
                         <input type="file" id="fileInput" class="hidden" accept=".md,.txt,.json,.yaml,.yml,text/plain,application/json">
                     </div>
-                    <p class="text-xs text-[#a0a0a0] mt-4 mb-3">Text-based docs only in this version. PDF parsing is intentionally disabled.</p>
-                    
-                    <div id="filePreview" class="hidden mt-4 bg-[#1a1a1a] border border-[#333333] p-3 rounded flex justify-between items-center">
-                        <div class="flex items-center gap-3">
-                            <span id="fileName" class="text-sm font-mono text-white"></span>
+                    <p style="font-size:12px;color:#505050;font-family:'Space Mono',monospace;margin-top:12px;">Text-based docs only. PDF parsing is intentionally disabled.</p>
+
+                    <div id="filePreview" class="hidden">
+                        <div style="display:flex;align-items:center;gap:10px;">
+                            <span style="font-family:'Space Mono',monospace;font-size:12px;color:#505050;">[doc]</span>
+                            <span id="fileName"></span>
                         </div>
-                        <button type="button" id="removeFile" class="text-[#a0a0a0] hover:text-white transition">×</button>
+                        <button type="button" id="removeFile">&times;</button>
                     </div>
                 </div>
             </div>
 
             <!-- Footer Actions -->
-            <div id="formError" class="hidden text-sm text-red-400 bg-red-950/40 border border-red-500/40 rounded-md px-4 py-3"></div>
-            <div class="flex justify-end gap-3 mt-10 pb-20">
+            <div id="formError" class="hidden" style="font-size:13px;font-weight:700;"></div>
+            <div class="flex justify-end gap-4" style="margin-top:32px;padding-bottom:80px;">
                 <button type="button" id="resetBtn" class="btn-secondary">Reset</button>
-                <button type="button" id="submitBtn" class="btn-gradient bg-[#10b981] !text-white hover:bg-[#059669]">Continue</button>
+                <button type="button" id="submitBtn" class="btn-gradient">Run Tests →</button>
             </div>
             
         </form>
     </div>
 
     <!-- Success Overlay -->
-    <div id="successOverlay" class="fixed inset-0 bg-black/90 hidden flex flex-col items-center justify-center z-50">
-        <h2 class="text-2xl font-bold font-mono text-white">Configuration Sent!</h2>
-        <p class="text-[#a0a0a0] mt-2">You can safely close this window.</p>
+    <div id="successOverlay" class="fixed inset-0 hidden flex flex-col items-center justify-center z-50" style="background:#000000;">
+        <div style="border:2px solid #ffffff;background:#111111;padding:48px 56px;box-shadow:6px 6px 0 #ffffff;text-align:center;">
+            <div style="font-family:'Space Mono',monospace;font-size:36px;font-weight:700;color:#ffffff;margin-bottom:16px;">[&#x2713;]</div>
+            <h2 style="font-size:1.6rem;font-weight:900;letter-spacing:-0.02em;color:#ffffff;font-family:'Space Grotesk',sans-serif;">Configuration Sent!</h2>
+            <p style="color:#a0a0a0;margin-top:8px;font-size:13px;font-family:'Space Mono',monospace;">You can safely close this window.</p>
+        </div>
     </div>
 
     <script>
@@ -455,7 +627,7 @@
         function initDefaults() {
             const parsedBaseURL = parseBaseURL(defaults.baseURL);
             hostInput.value = parsedBaseURL.host;
-            portInput.value = parsedBaseURL.port;
+            portInput.value = parsedBaseURL.port || urlParams.get('port') || '3000';
             pathInput.value = parsedBaseURL.path;
             startCommandInput.value = defaults.startCommand;
 
@@ -544,7 +716,7 @@
 
             const serverPort = urlParams.get('serverPort') || '54321';
             submitBtn.disabled = true;
-            submitBtn.textContent = 'Sending...';
+            submitBtn.textContent = 'Sending…';
 
             try {
                 const response = await fetch(`http://localhost:${serverPort}/api/config`, {
@@ -562,7 +734,7 @@
             } catch (error) {
                 showError(error.message || 'Could not send configuration to TestBot server.');
                 submitBtn.disabled = false;
-                submitBtn.textContent = 'Continue';
+                submitBtn.textContent = 'Run Tests →';
             }
         });
 
@@ -571,7 +743,7 @@
             initDefaults();
             clearError();
             submitBtn.disabled = false;
-            submitBtn.textContent = 'Continue';
+            submitBtn.textContent = 'Run Tests →';
         });
 
         initDefaults();

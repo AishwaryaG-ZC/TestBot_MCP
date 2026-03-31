@@ -17,9 +17,27 @@ export default function ForgotPasswordPage() {
     setError(null)
     setLoading(true)
 
-    // Password reset is not available in local auth mode
-    setError('Password reset is not available in local mode. Please contact your administrator.')
-    setLoading(false)
+    try {
+      const res = await fetch('/api/auth/reset-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      })
+
+      const data = await res.json()
+
+      if (!res.ok) {
+        setError(data.error || 'Failed to send reset email')
+        setLoading(false)
+        return
+      }
+
+      setSuccess(true)
+    } catch {
+      setError('An unexpected error occurred')
+    } finally {
+      setLoading(false)
+    }
   }
 
   return (

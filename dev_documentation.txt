@@ -3,6 +3,39 @@ TESTBOT MCP dev_documentation.txt - Development log
 ================================================================================
 
 ================================================================================
+Update: 2026-03-05 - Dashboard CTA text colour (Test Locally, Upgrade to Pro, New Test)
+================================================================================
+
+SUMMARY:
+--------
+Changed primary gradient CTA text from white to black across the dashboard for
+consistent styling: "Test Locally (MCP)", "Upgrade to Pro", "New Tests",
+"New Test List", "Quick Install", and "View MCP Setup".
+
+ACTIONS TAKEN:
+--------------
+- webapp/src/app/(dashboard)/home/page.tsx:
+  - Get Started CTA: text-black for "Test Locally (MCP)".
+  - Credits card CTA: text-black for "Upgrade to Pro".
+- webapp/src/app/(dashboard)/all-tests/page.tsx:
+  - Header CTA link: text-black for "New Tests".
+- webapp/src/app/(dashboard)/test-lists/page.tsx:
+  - Header button: text-black for "New Test List".
+- webapp/src/app/(dashboard)/mcp-tests/page.tsx:
+  - Header "Quick Install" button and empty-state "Quick Install" button: text-black.
+- webapp/src/app/(dashboard)/create-tests/page.tsx:
+  - "View MCP Setup" link: text-white -> text-black (gradient button retained).
+  All retain gradient/btn-gradient background.
+
+FILES MODIFIED:
+---------------
+- webapp/src/app/(dashboard)/home/page.tsx
+- webapp/src/app/(dashboard)/all-tests/page.tsx
+- webapp/src/app/(dashboard)/test-lists/page.tsx
+- webapp/src/app/(dashboard)/mcp-tests/page.tsx
+- webapp/src/app/(dashboard)/create-tests/page.tsx
+
+================================================================================
 Update: 2026-01-30 (commit and push to TestBot_MCP)
 ================================================================================
 

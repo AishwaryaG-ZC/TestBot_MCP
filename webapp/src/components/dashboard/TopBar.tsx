@@ -50,7 +50,7 @@ export default function TopBar({ userEmail = 'user@example.com', userInitials = 
       <div className="flex items-center gap-3 flex-shrink-0">
         {/* Share Feedback */}
         <a
-          href="https://github.com/krishsharma1008/TestBot_MCP/issues"
+          href="#"
           target="_blank"
           rel="noopener noreferrer"
           className="hidden sm:flex items-center gap-1.5 text-[#505050] hover:text-white text-xs font-mono font-bold uppercase tracking-widest transition-colors px-3 py-1.5 border border-transparent hover:border-white"

@@ -204,7 +204,7 @@ Please provide as much detail as you can discover from analyzing the codebase.`;
    * Request context from the agent and wait for response
    * This is the main entry point
    */
-  async requestContext(autoContext = {}) {
+  async requestContext(autoContext = {}, timeoutMs = 10000) {
     const { promptPath, responsePath } = await this.savePromptFile(autoContext);
     
     Logger.info('AgentContextRequester', 'Context request saved. Waiting for AI agent to respond...');
@@ -212,7 +212,7 @@ Please provide as much detail as you can discover from analyzing the codebase.`;
     Logger.debug('AgentContextRequester', `Agent write path`, { responsePath });
     
     // Wait for response (with shorter timeout since this may not be used)
-    const response = await this.waitForResponse(responsePath, 10000); // 10 second quick check
+    const response = await this.waitForResponse(responsePath, timeoutMs);
     
     return response;
   }

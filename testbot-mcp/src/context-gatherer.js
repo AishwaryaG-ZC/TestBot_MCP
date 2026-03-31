@@ -190,6 +190,18 @@ class ContextGatherer {
       richContext.apiEndpoints,
       richContext.forms
     );
+    richContext.extractionConfidence = {
+      selectorHints: richContext.selectorHints.length > 0 ? 0.9 : 0.5,
+      navigationGraph: (richContext.navigationGraph.edges || []).length > 0 ? 0.85 : 0.4,
+      forms: (richContext.forms || []).length > 0 ? 0.9 : 0.5,
+      apiContracts: (richContext.mockableApiContracts || []).length > 0 ? 0.9 : 0.5,
+    };
+    richContext.extractionSources = {
+      selectorHints: 'pages+forms',
+      navigationGraph: 'page-link-analysis',
+      forms: 'jsx-tsx-form-parsing',
+      apiContracts: 'endpoint-handler-parsing',
+    };
     
     return richContext;
   }

@@ -1,0 +1,6 @@
+test/
+.env
+.env.*
+*.test.js
+testbot-reports/
+node_modules/

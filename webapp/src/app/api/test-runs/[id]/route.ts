@@ -3,6 +3,7 @@ import { getCurrentUser } from '@/lib/auth/session'
 import { db } from '@/lib/db'
 import { testRuns } from '@/lib/db/schema'
 import { eq, and } from 'drizzle-orm'
+import { extractRunIdFromReport, getLiveRunsForUser } from '@/lib/mcp-live-runs'
 
 export async function GET(
   _request: NextRequest,
@@ -14,6 +15,20 @@ export async function GET(
   const { id } = await params
 
   try {
+    if (id.startsWith('live-')) {
+      const runId = id.slice('live-'.length).trim()
+      if (!runId) {
+        return NextResponse.json({ error: 'Invalid live run id' }, { status: 400 })
+      }
+
+      const [liveRun] = await getLiveRunsForUser(user.id, { runId, windowHours: 72, limit: 1500 })
+      if (!liveRun) {
+        return NextResponse.json({ error: 'Test run not found' }, { status: 404 })
+      }
+
+      return NextResponse.json({ data: liveRun })
+    }
+
     const [row] = await db
       .select()
       .from(testRuns)
@@ -42,6 +57,10 @@ export async function GET(
       source: row.source,
       created_at: row.createdAt?.toISOString() ?? null,
       updated_at: row.updatedAt?.toISOString() ?? null,
+      run_id: extractRunIdFromReport(row.reportJson),
+      current_phase: null,
+      error_code: null,
+      is_live: false,
     }
 
     return NextResponse.json({ data })

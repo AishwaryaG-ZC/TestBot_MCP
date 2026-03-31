@@ -76,6 +76,7 @@ export default function McpSetupModal({ isOpen, onClose }: McpSetupModalProps) {
   const [activeTab, setActiveTab] = useState<IDETab>('cursor');
   const [apiKey, setApiKey] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [keyName, setKeyName] = useState('MCP Setup Key');
 
   const handleCreateKey = async () => {
     setCreating(true);
@@ -83,7 +84,7 @@ export default function McpSetupModal({ isOpen, onClose }: McpSetupModalProps) {
       const res = await fetch('/api/api-keys', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: 'MCP Setup Key' }),
+        body: JSON.stringify({ name: keyName.trim() || 'MCP Setup Key' }),
       });
       const json = await res.json();
       if (res.ok && json.data?.key) {
@@ -104,6 +105,7 @@ export default function McpSetupModal({ isOpen, onClose }: McpSetupModalProps) {
     setTimeout(() => {
       setStep(1);
       setApiKey(null);
+      setKeyName('MCP Setup Key');
     }, 300);
   };
 
@@ -179,11 +181,25 @@ export default function McpSetupModal({ isOpen, onClose }: McpSetupModalProps) {
                     </p>
 
                     {!apiKey ? (
-                      <button
-                        onClick={handleCreateKey}
-                        disabled={creating}
-                        className="btn-gradient text-white font-semibold px-6 py-3 rounded-xl text-sm disabled:opacity-60 flex items-center gap-2"
-                      >
+                      <div className="space-y-4">
+                        <div>
+                          <label htmlFor="keyName" className="block text-[#8BA4C8] text-xs font-semibold mb-2">
+                            Key Name
+                          </label>
+                          <input
+                            id="keyName"
+                            type="text"
+                            value={keyName}
+                            onChange={(e) => setKeyName(e.target.value)}
+                            placeholder="e.g., MCP Setup Key"
+                            className="input-glass w-full px-4 py-2.5 text-sm"
+                          />
+                        </div>
+                        <button
+                          onClick={handleCreateKey}
+                          disabled={creating}
+                          className="btn-gradient text-black font-semibold px-6 py-3 rounded-xl text-sm disabled:opacity-60 flex items-center gap-2"
+                        >
                         {creating ? (
                           <>
                             <svg className="animate-spin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -199,7 +215,8 @@ export default function McpSetupModal({ isOpen, onClose }: McpSetupModalProps) {
                             Create a Key
                           </>
                         )}
-                      </button>
+                        </button>
+                      </div>
                     ) : (
                       <motion.div
                         initial={{ opacity: 0, y: 8 }}
@@ -219,7 +236,7 @@ export default function McpSetupModal({ isOpen, onClose }: McpSetupModalProps) {
                         </p>
                         <button
                           onClick={() => setStep(2)}
-                          className="btn-gradient text-white font-semibold px-6 py-2.5 rounded-xl text-sm"
+                          className="btn-gradient font-semibold px-6 py-2.5 rounded-xl text-sm"
                         >
                           Next: Install MCP →
                         </button>
@@ -296,7 +313,7 @@ export default function McpSetupModal({ isOpen, onClose }: McpSetupModalProps) {
                       </button>
                       <button
                         onClick={() => setStep(3)}
-                        className="btn-gradient text-white font-semibold px-6 py-2.5 rounded-xl text-sm"
+                        className="btn-gradient font-semibold px-6 py-2.5 rounded-xl text-sm"
                       >
                         Next: Start Testing →
                       </button>
@@ -340,7 +357,7 @@ export default function McpSetupModal({ isOpen, onClose }: McpSetupModalProps) {
                       </button>
                       <button
                         onClick={handleClose}
-                        className="btn-gradient text-white font-semibold px-6 py-2.5 rounded-xl text-sm"
+                        className="btn-gradient font-semibold px-6 py-2.5 rounded-xl text-sm"
                       >
                         Got it!
                       </button>

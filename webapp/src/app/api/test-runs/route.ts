@@ -3,6 +3,30 @@ import { getCurrentUser } from '@/lib/auth/session'
 import { db } from '@/lib/db'
 import { testRuns } from '@/lib/db/schema'
 import { eq, and, desc, asc, count } from 'drizzle-orm'
+import { extractRunIdFromReport, getLiveRunsForUser } from '@/lib/mcp-live-runs'
+
+function compareRows(
+  a: Record<string, unknown>,
+  b: Record<string, unknown>,
+  sortBy: string,
+  order: 'asc' | 'desc'
+) {
+  const direction = order === 'asc' ? 1 : -1
+  if (sortBy === 'status') {
+    return direction * String(a.status || '').localeCompare(String(b.status || ''))
+  }
+  if (sortBy === 'total_tests') {
+    return direction * (Number(a.total_tests || 0) - Number(b.total_tests || 0))
+  }
+  if (sortBy === 'duration_ms') {
+    return direction * (Number(a.duration_ms || 0) - Number(b.duration_ms || 0))
+  }
+  const aRawTime = new Date(String(a.created_at || '')).getTime()
+  const bRawTime = new Date(String(b.created_at || '')).getTime()
+  const aTime = Number.isFinite(aRawTime) ? aRawTime : 0
+  const bTime = Number.isFinite(bRawTime) ? bRawTime : 0
+  return direction * (aTime - bTime)
+}
 
 export async function GET(request: NextRequest) {
   const user = await getCurrentUser()
@@ -14,15 +38,16 @@ export async function GET(request: NextRequest) {
   const sort_by = searchParams.get('sort_by') ?? 'created_at'
   const order = searchParams.get('order') === 'asc' ? 'asc' : 'desc'
   const status = searchParams.get('status')
+  const includeLive = searchParams.get('include_live') !== 'false'
 
-  const sortFieldMap: Record<string, any> = {
+  const sortColumns = {
     created_at: testRuns.createdAt,
     updated_at: testRuns.updatedAt,
     status: testRuns.status,
     total_tests: testRuns.totalTests,
     duration_ms: testRuns.durationMs,
-  }
-  const sortField = sortFieldMap[sort_by] ?? testRuns.createdAt
+  } as const
+  const sortField = (sortColumns[sort_by as keyof typeof sortColumns] ?? testRuns.createdAt) as typeof testRuns.createdAt
   const orderFn = order === 'asc' ? asc : desc
 
   try {
@@ -65,15 +90,42 @@ export async function GET(request: NextRequest) {
       source: row.source,
       created_at: row.createdAt?.toISOString() ?? null,
       updated_at: row.updatedAt?.toISOString() ?? null,
+      run_id: extractRunIdFromReport(row.reportJson),
+      current_phase: null,
+      error_code: null,
+      is_live: false,
     }))
 
+    let mergedData: typeof mappedData = mappedData
+    let mergedTotal = total ?? 0
+
+    if (includeLive && page === 1) {
+      const liveRuns = await getLiveRunsForUser(user.id, { windowHours: 24, limit: 1500 })
+      const existingRunIds = new Set(
+        mappedData
+          .map((row) => String(row.run_id || '').trim())
+          .filter(Boolean)
+      )
+
+      const filteredLiveRuns = liveRuns
+        .filter((row) => !existingRunIds.has(String(row.run_id || '')))
+        .filter((row) => (status ? row.status === status : true))
+
+      if (filteredLiveRuns.length > 0) {
+        mergedTotal += filteredLiveRuns.length
+        mergedData = ([...filteredLiveRuns, ...mappedData] as typeof mappedData)
+          .sort((a, b) => compareRows(a as Record<string, unknown>, b as Record<string, unknown>, sort_by, order))
+          .slice(0, limit)
+      }
+    }
+
     return NextResponse.json({
-      data: mappedData,
+      data: mergedData,
       pagination: {
         page,
         limit,
-        total: total ?? 0,
-        totalPages: Math.ceil((total ?? 0) / limit),
+        total: mergedTotal,
+        totalPages: Math.ceil(mergedTotal / limit),
       },
     })
   } catch (error) {

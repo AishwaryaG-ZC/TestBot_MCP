@@ -66,10 +66,19 @@ class Logger {
     }
   }
 
+  // Max bytes for metadata in a single stderr write (Windows named-pipe buffer is 4KB;
+  // synchronous stderr writes on Windows block the event loop if the buffer fills).
+  static MAX_METADATA_CHARS = 1200;
+
   static _formatMetadata(metadata) {
     if (!metadata) return '';
     if (typeof metadata === 'object') {
-      return Object.keys(metadata).length > 0 ? '\n' + util.inspect(metadata, { depth: 4, colors: true }) : '';
+      if (Object.keys(metadata).length === 0) return '';
+      const formatted = util.inspect(metadata, { depth: 3, colors: false });
+      if (formatted.length > this.MAX_METADATA_CHARS) {
+        return `\n[metadata truncated ${formatted.length} chars — see logs/mcp.log for full output]`;
+      }
+      return '\n' + formatted;
     }
     return ` | ${metadata}`;
   }
@@ -93,7 +102,16 @@ class Logger {
     const formattedMeta = this._formatMetadata(safeMetadata);
     
     // For MCP, we MUST use stderr. stdout breaks the JSON-RPC pipe.
-    const consoleOutput = `[${timestamp}] [${level}] [${moduleName}] ${safeMessage}${formattedMeta}\n`;
+    // IMPORTANT: On Windows, stderr connected to a pipe is SYNCHRONOUS. The Windows
+    // named-pipe buffer is ~4 KB. Writing more than that in one call blocks the
+    // Node.js event loop until Windsurf drains the pipe, causing tool-call hangs.
+    // Cap each stderr write to stay safely under that limit.
+    const MAX_STDERR_WRITE = 2048;
+    let consoleOutput = `[${timestamp}] [${level}] [${moduleName}] ${safeMessage}${formattedMeta}\n`;
+    if (consoleOutput.length > MAX_STDERR_WRITE) {
+      const header = `[${timestamp}] [${level}] [${moduleName}] ${safeMessage}`;
+      consoleOutput = header.slice(0, MAX_STDERR_WRITE - 32) + ' [+truncated]\n';
+    }
     process.stderr.write(consoleOutput);
 
     // File logging

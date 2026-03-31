@@ -9,6 +9,12 @@ const Logger = require('../logger');
 class OpenAIClient {
   constructor(config = {}) {
     const apiKey = config.apiKey || process.env.OPENAI_API_KEY;
+    const envTimeout = Number(process.env.OPENAI_TIMEOUT_MS);
+    const timeoutMs = Number.isFinite(Number(config.timeout)) && Number(config.timeout) > 0
+      ? Number(config.timeout)
+      : Number.isFinite(envTimeout) && envTimeout > 0
+        ? envTimeout
+        : 90000;
 
     this.config = {
       ...config,
@@ -24,7 +30,7 @@ class OpenAIClient {
           .filter(Boolean),
       maxTokens: config.maxTokens || parseInt(process.env.OPENAI_MAX_TOKENS) || 4000,
       temperature: config.temperature || 0.2,
-      timeout: config.timeout || 180000, // 3 minutes for longer generations
+      timeout: timeoutMs,
     };
 
     if (!this.config.apiKey) {
@@ -534,7 +540,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`;
       return text;
     } catch (error) {
       if (error.name === 'AbortError') {
-        throw new Error('OpenAI responses API request timeout (3 minutes)');
+        throw new Error(`OpenAI responses API request timeout (${Math.ceil(this.config.timeout / 1000)}s)`);
       }
       throw error;
     } finally {
@@ -578,7 +584,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`;
       return text;
     } catch (error) {
       if (error.name === 'AbortError') {
-        throw new Error('OpenAI chat API request timeout (3 minutes)');
+        throw new Error(`OpenAI chat API request timeout (${Math.ceil(this.config.timeout / 1000)}s)`);
       }
       throw error;
     } finally {
@@ -654,10 +660,15 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`;
         Logger.error('OpenAIClient', `Analysis failed`, error);
         results.push({
           failure,
+          testName: failure.testName || null,
+          file: failure.file || null,
           analysis: `Analysis failed: ${error.message}`,
+          rootCause: `AI analysis unavailable: ${error.message}`,
           suggestedFix: null,
           confidence: 0,
           error: error.message,
+          affectedFiles: failure.file ? [failure.file] : [],
+          testingRecommendations: 'Verify API key/provider configuration and retry AI analysis.',
         });
       }
     }

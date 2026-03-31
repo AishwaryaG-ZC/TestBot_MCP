@@ -10,17 +10,8 @@ import {
   index,
 } from 'drizzle-orm/pg-core'
 
-export const users = pgTable('users', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  email: text('email').unique().notNull(),
-  passwordHash: text('password_hash').notNull(),
-  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
-})
-
 export const profiles = pgTable('profiles', {
-  id: uuid('id')
-    .primaryKey()
-    .references(() => users.id, { onDelete: 'cascade' }),
+  id: uuid('id').primaryKey(),
   email: text('email').notNull(),
   fullName: text('full_name'),
   avatarUrl: text('avatar_url'),
@@ -72,12 +63,46 @@ export const testRuns = pgTable(
     aiAnalysis: jsonb('ai_analysis'),
     framework: text('framework'),
     source: text('source').default('mcp'),
+    projectPath: text('project_path'), // Local project path for artifact fallback
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
   },
   (table) => [
     index('test_runs_user_id_idx').on(table.userId),
     index('test_runs_created_at_idx').on(table.createdAt),
+  ]
+)
+
+export const mcpTelemetryEvents = pgTable(
+  'mcp_telemetry_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => profiles.id, { onDelete: 'cascade' }),
+    apiKeyId: uuid('api_key_id').references(() => apiKeys.id, { onDelete: 'set null' }),
+    source: text('source').notNull().default('testbot-mcp'),
+    toolName: text('tool_name').notNull(),
+    eventType: text('event_type').notNull(),
+    runId: text('run_id'),
+    phase: text('phase'),
+    status: text('status'),
+    success: boolean('success').default(false),
+    errorCode: text('error_code'),
+    reason: text('reason'),
+    message: text('message'),
+    durationMs: integer('duration_ms'),
+    metadata: jsonb('metadata'),
+    occurredAt: timestamp('occurred_at', { withTimezone: true }).defaultNow(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => [
+    index('mcp_telemetry_user_id_idx').on(table.userId),
+    index('mcp_telemetry_api_key_id_idx').on(table.apiKeyId),
+    index('mcp_telemetry_occurred_at_idx').on(table.occurredAt),
+    index('mcp_telemetry_run_id_idx').on(table.runId),
+    index('mcp_telemetry_event_type_idx').on(table.eventType),
+    index('mcp_telemetry_status_idx').on(table.status),
   ]
 )
 
@@ -106,3 +131,26 @@ export const testListItems = pgTable('test_list_items', {
   testConfig: jsonb('test_config'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 })
+
+export const testArtifacts = pgTable(
+  'test_artifacts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    testRunId: uuid('test_run_id')
+      .notNull()
+      .references(() => testRuns.id, { onDelete: 'cascade' }),
+    testName: text('test_name').notNull(),
+    artifactType: text('artifact_type').notNull(), // 'screenshot', 'video', 'trace'
+    storageUrl: text('storage_url'), // Supabase Storage public URL (nullable for fallback)
+    storagePath: text('storage_path'), // Path in bucket: test-artifacts/{runId}/{testName}/{type}/{filename}
+    fileName: text('file_name').notNull(),
+    fileSize: integer('file_size'), // bytes
+    contentType: text('content_type'),
+    metadata: jsonb('metadata'), // Additional info like timestamp, browser, viewport
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => [
+    index('test_artifacts_test_run_id_idx').on(table.testRunId),
+    index('test_artifacts_artifact_type_idx').on(table.artifactType),
+  ]
+)

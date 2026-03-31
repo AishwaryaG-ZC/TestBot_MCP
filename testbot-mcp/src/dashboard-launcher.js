@@ -9,13 +9,33 @@ const fs = require('fs');
 const path = require('path');
 const Logger = require('./logger');
 
+function resolveBoolean(value, fallback) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  }
+  return fallback;
+}
+
 class DashboardLauncher {
+  static shouldOpenBrowser(options = {}) {
+    const headless = resolveBoolean(options.headless, resolveBoolean(process.env.TESTBOT_HEADLESS, true));
+    if (headless) {
+      return false;
+    }
+    return resolveBoolean(options.openBrowser, resolveBoolean(process.env.TESTBOT_AUTO_OPEN_BROWSER, false));
+  }
+
   /**
    * Open the dashboard with the given report
    * @param {string} reportPath - Path to the report JSON file
+   * @param {Object} options - Launch options
    * @returns {string} Dashboard URL
    */
-  static async open(reportPath) {
+  static async open(reportPath, options = {}) {
     // Find dashboard directory (relative to this module or in project)
     const dashboardPaths = [
       path.join(__dirname, '../../dashboard/public'),
@@ -94,6 +114,11 @@ console.error('📊 Embedded report data loaded:', {
 
     // Generate dashboard URL with cache-busting timestamp
     const dashboardUrl = `file://${path.join(dashboardDir, 'index.html')}?t=${timestamp}`;
+
+    if (!this.shouldOpenBrowser(options)) {
+      Logger.info('DashboardLauncher', 'Headless mode active; not auto-opening dashboard browser window', { url: dashboardUrl });
+      return dashboardUrl;
+    }
 
     // Try to open in browser
     try {

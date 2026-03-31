@@ -55,7 +55,7 @@ const TIERS = [
       { text: 'Audit logs', included: true },
     ],
     cta: 'Contact Sales',
-    ctaHref: 'mailto:hello@testbotmcp.com',
+    ctaHref: 'mailto:zapminds@zapcg.com',
     popular: false,
   },
 ];
