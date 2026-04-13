@@ -1055,42 +1055,123 @@ class ContextGatherer {
       /Route\s+path=["'`]([^"'`]+)["'`]/g,
       /<Route[^>]+path=["'`]([^"'`]+)["'`]/g,
     ];
-    
+    // Pattern to extract component name from element={<ComponentName />} or element={<ComponentName>}
+    const elementPatterns = [
+      /element=\{?\s*<(\w+)\s*\/?\s*>/g,
+    ];
+
     const srcDir = path.join(projectPath, 'src');
     const files = this.findFiles(fs.existsSync(srcDir) ? srcDir : projectPath, ['.js', '.jsx', '.ts', '.tsx']);
-    
+
     for (const file of files.slice(0, this.config.maxFiles)) {
       try {
         const content = this.readFileCached(file);
         if (!content) continue;
-        
+
+        // Build a map of imported component names to their resolved file paths
+        const importMap = this._buildImportMap(content, file);
+
         for (const pattern of routePatterns) {
           let match;
           while ((match = pattern.exec(content)) !== null) {
-            const routePath = match[1];
-            if (routePath && !routePath.includes('*') && !pages.some(p => p.path === routePath)) {
-              const uiHints = this.extractPageUIHints(file);
-              pages.push({
-                path: routePath,
-                description: this.formatPageName(routePath),
-                components: uiHints.components,
-                interactions: uiHints.interactions,
-                buttons: uiHints.buttons,
-                links: uiHints.links,
-                testIds: uiHints.testIds,
-                ariaRoles: uiHints.ariaRoles,
-                navigationTargets: uiHints.navigationTargets,
-                selectorHints: uiHints.selectorHints,
-              });
+            const rawRoutePath = match[1];
+            if (!rawRoutePath || rawRoutePath.includes('*')) continue;
+            // Normalize: ensure leading slash for relative nested routes (e.g., "projects" → "/projects")
+            const routePath = rawRoutePath.startsWith('/') ? rawRoutePath : '/' + rawRoutePath;
+            if (pages.some(p => p.path === routePath)) continue;
+
+            // Try to find the component file for this route's element prop
+            // Look at the surrounding text near this match to find element={<Component />}
+            const surroundingStart = Math.max(0, match.index - 200);
+            const surroundingEnd = Math.min(content.length, match.index + match[0].length + 200);
+            const surroundingText = content.slice(surroundingStart, surroundingEnd);
+
+            let hintsFile = file; // Default: extract hints from the route file itself
+            for (const elemPattern of elementPatterns) {
+              elemPattern.lastIndex = 0;
+              const elemMatch = elemPattern.exec(surroundingText);
+              if (elemMatch) {
+                const componentName = elemMatch[1];
+                const resolvedPath = importMap[componentName];
+                if (resolvedPath && fs.existsSync(resolvedPath)) {
+                  hintsFile = resolvedPath;
+                }
+                break;
+              }
             }
+
+            const uiHints = this.extractPageUIHints(hintsFile);
+            pages.push({
+              path: routePath,
+              description: this.formatPageName(routePath),
+              components: uiHints.components,
+              interactions: uiHints.interactions,
+              buttons: uiHints.buttons,
+              links: uiHints.links,
+              testIds: uiHints.testIds,
+              ariaRoles: uiHints.ariaRoles,
+              navigationTargets: uiHints.navigationTargets,
+              selectorHints: uiHints.selectorHints,
+            });
           }
         }
       } catch (error) {
         // Ignore read errors
       }
     }
-    
+
     return pages;
+  }
+
+  /**
+   * Build a map from imported component names to their resolved file paths.
+   * Handles: import { Foo } from './pages/Foo'
+   *          import Foo from './pages/Foo'
+   *          import { Foo as Bar } from './pages/Foo'
+   */
+  _buildImportMap(fileContent, filePath) {
+    const importMap = {};
+    const fileDir = path.dirname(filePath);
+    const extensions = ['.tsx', '.ts', '.jsx', '.js', '/index.tsx', '/index.ts', '/index.jsx', '/index.js'];
+
+    // Match: import { Name } from '...' and import Name from '...'
+    const importPatterns = [
+      /import\s+\{([^}]+)\}\s+from\s+["'`]([^"'`]+)["'`]/g,
+      /import\s+(\w+)\s+from\s+["'`]([^"'`]+)["'`]/g,
+    ];
+
+    for (const pattern of importPatterns) {
+      let match;
+      while ((match = pattern.exec(fileContent)) !== null) {
+        const importSource = match[2];
+        // Only resolve relative imports
+        if (!importSource.startsWith('.')) continue;
+
+        const names = match[1].split(',').map(n => {
+          // Handle "Foo as Bar" — use the local name (Bar)
+          const parts = n.trim().split(/\s+as\s+/);
+          return (parts[parts.length - 1] || '').trim();
+        }).filter(Boolean);
+
+        for (const name of names) {
+          // Try resolving the import path with various extensions
+          const basePath = path.resolve(fileDir, importSource);
+          for (const ext of extensions) {
+            const candidate = basePath + ext;
+            if (fs.existsSync(candidate)) {
+              importMap[name] = candidate;
+              break;
+            }
+          }
+          // Also check if basePath itself exists (e.g., import from './Foo.tsx')
+          if (!importMap[name] && fs.existsSync(basePath)) {
+            importMap[name] = basePath;
+          }
+        }
+      }
+    }
+
+    return importMap;
   }
 
   /**

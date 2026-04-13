@@ -15,7 +15,7 @@ const GENERATED_TEST_FILE_SCHEMA = z.object({
   content: z.string().min(1).max(200000),
 });
 
-const GENERATED_TEST_ARRAY_SCHEMA = z.array(GENERATED_TEST_FILE_SCHEMA).min(1).max(20);
+const GENERATED_TEST_ARRAY_SCHEMA = z.array(GENERATED_TEST_FILE_SCHEMA).min(1).max(50);
 
 const FORBIDDEN_PATTERN_RULES = [
   { pattern: /xpath\s*=/i, reason: 'Avoid XPath selectors for deterministic and secure locators' },
@@ -226,7 +226,26 @@ class OpenAITestGenerator {
     if (!fs.existsSync(outputDir)) {
       fs.mkdirSync(outputDir, { recursive: true });
     }
-    
+
+    // Clean up old generated test files from prior runs to prevent stale tests
+    // from mixing with freshly generated ones. Preserve fixture and tsconfig files.
+    try {
+      const existingFiles = fs.readdirSync(outputDir);
+      const preservePatterns = /^(__healix-fixture|__testbot-fixture|tsconfig)\./i;
+      let cleaned = 0;
+      for (const file of existingFiles) {
+        if (/\.spec\.(ts|js)$/i.test(file) && !preservePatterns.test(file)) {
+          fs.unlinkSync(path.join(outputDir, file));
+          cleaned++;
+        }
+      }
+      if (cleaned > 0) {
+        Logger.info('OpenAITestGenerator', `Cleaned ${cleaned} stale test file(s) from prior run`, { outputDir });
+      }
+    } catch (cleanupError) {
+      Logger.warn('OpenAITestGenerator', 'Could not clean old test files (non-fatal)', { error: cleanupError.message });
+    }
+
     // Generate playwright.config.ts if not exists
     await this.ensurePlaywrightConfig(projectInfo);
     
@@ -624,6 +643,11 @@ Rules:
 ## waitForStableUI Helper (include in generated tests)
 ${GENERATED_UI_HELPER_SOURCE}
 
+## Route Path Rules (CRITICAL)
+- Use route paths EXACTLY as they appear in CONTEXT_JSON pages[].path
+- Do NOT infer route paths from component names (e.g., use "/projects" not "/Projects")
+- Use page.buttons[] and page.selectorHints[] from CONTEXT_JSON for element selectors — do NOT guess selectors
+
 ## Output Format
 Return a JSON array of test files:
 [
@@ -648,7 +672,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks or explanations.`;
     });
 
     return this.buildStructuredUserPrompt({
-      task: 'Generate deterministic smoke tests for core application health.',
+      task: 'Generate at least 8-10 deterministic smoke tests for core application health. Generate one test per page/route at minimum.',
       requirements: [
         'Cover application load, main route navigation, and key UI landmarks.',
         'Include console error assertions and one mobile viewport check.',
@@ -692,6 +716,11 @@ ${GENERATED_UI_HELPER_SOURCE}
 ## Framework: ${projectInfo.framework || 'React/Next.js'}
 ## Base URL: ${projectInfo.baseURL || 'http://localhost:3000'}
 
+## Route Path Rules (CRITICAL)
+- Use route paths EXACTLY as they appear in CONTEXT_JSON pages[].path
+- Do NOT infer route paths from component names (e.g., use "/projects" not "/Projects")
+- Use page.buttons[] and page.selectorHints[] from CONTEXT_JSON for element selectors — do NOT guess selectors
+
 ## Output Format
 Return a JSON array of test files:
 [
@@ -716,7 +745,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`;
     });
 
     return this.buildStructuredUserPrompt({
-      task: 'Generate interaction-heavy frontend Playwright tests for critical routes and forms.',
+      task: 'Generate at least 10-15 interaction-heavy frontend Playwright tests for critical routes and forms. Generate at least 2-3 tests per route/page covering load state, interactions, and edge cases.',
       requirements: [
         'Validate page load state, navigation transitions, and user input behavior.',
         'Include at least one form validation scenario where forms are available.',
@@ -789,7 +818,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`;
     });
 
     return this.buildStructuredUserPrompt({
-      task: 'Generate backend API tests with grounded status assertions, auth coverage, negative cases, and burst/stress checks.',
+      task: 'Generate at least 8-12 backend API tests with grounded status assertions, auth coverage, negative cases, and burst/stress checks. Generate at least one test per API endpoint.',
       requirements: [
         'Use only statuses/fields that are present in CONTEXT_JSON endpoint contracts or schemas.',
         'For auth-protected endpoints include unauthenticated checks. For authenticated checks: if authPatterns in CONTEXT_JSON shows Cookie or Session type, use a shared request.newContext() that carries session cookies — never extract body.token. If JWT only, use Bearer token.',
@@ -830,6 +859,10 @@ ${GENERATED_UI_HELPER_SOURCE}
 
 ## Base URL: ${projectInfo.baseURL || 'http://localhost:3000'}
 
+## Route Path Rules (CRITICAL)
+- Use route paths EXACTLY as they appear in CONTEXT_JSON pages[].path
+- Do NOT infer route paths from component names (e.g., use "/projects" not "/Projects")
+
 ## Output Format
 Return a JSON array of test files:
 [
@@ -854,7 +887,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`;
     });
 
     return this.buildStructuredUserPrompt({
-      task: 'Generate end-to-end workflow tests with real user actions and end-state assertions.',
+      task: 'Generate at least 6-8 end-to-end workflow tests with real user actions and end-state assertions. Cover each major user workflow (CRUD, navigation flows, multi-step processes).',
       requirements: [
         'Convert workflow steps into executable actions (navigate, fill, click, assert).',
         'Avoid placeholders and fixed waits.',
@@ -904,7 +937,7 @@ IMPORTANT: Return ONLY valid JSON.`;
     });
 
     return this.buildStructuredUserPrompt({
-      task: 'Generate deterministic error-path tests.',
+      task: 'Generate at least 4-6 deterministic error-path tests covering 404 routes, network failures, and invalid user inputs.',
       requirements: [
         'Cover not-found routes and meaningful user-facing error states.',
         'Prefer explicit status/content assertions over generic body checks.',
@@ -923,15 +956,16 @@ IMPORTANT: Return ONLY valid JSON.`;
   }
 
   buildPrioritizedContextPayload({ context = {}, prd, projectInfo = {}, testKind }) {
-    const pages = (context.pages || []).slice(0, 20).map((page) => ({
+    const pages = (context.pages || []).slice(0, 50).map((page) => ({
       path: page.path,
       description: page.description,
-      components: (page.components || []).slice(0, 8),
-      interactions: (page.interactions || []).slice(0, 8),
-      selectorHints: (page.selectorHints || []).slice(0, 8),
+      components: (page.components || []).slice(0, 12),
+      interactions: (page.interactions || []).slice(0, 12),
+      buttons: (page.buttons || []).slice(0, 12),
+      selectorHints: (page.selectorHints || []).slice(0, 12),
     }));
 
-    const endpoints = (context.apiEndpoints || []).slice(0, 25).map((endpoint) => ({
+    const endpoints = (context.apiEndpoints || []).slice(0, 60).map((endpoint) => ({
       method: endpoint.method,
       path: endpoint.path,
       requiresAuth: !!endpoint.requiresAuth,
@@ -943,14 +977,14 @@ IMPORTANT: Return ONLY valid JSON.`;
       status: endpoint.status || null,
     }));
 
-    const apiContracts = (context.mockableApiContracts || []).slice(0, 25).map((contract) => ({
+    const apiContracts = (context.mockableApiContracts || []).slice(0, 40).map((contract) => ({
       method: contract.method,
       path: contract.path,
       requestFields: (contract.request?.fields || []).slice(0, 12),
       responses: (contract.responses || []).slice(0, 10),
     }));
 
-    const workflows = (context.workflows || []).slice(0, 12).map((workflow) => {
+    const workflows = (context.workflows || []).slice(0, 25).map((workflow) => {
       if (typeof workflow === 'string') {
         return { name: workflow, steps: [] };
       }
@@ -962,7 +996,7 @@ IMPORTANT: Return ONLY valid JSON.`;
       };
     });
 
-    const forms = (context.forms || []).slice(0, 10).map((form) => ({
+    const forms = (context.forms || []).slice(0, 25).map((form) => ({
       file: form.file,
       action: form.action || null,
       method: form.method || null,
@@ -979,7 +1013,7 @@ IMPORTANT: Return ONLY valid JSON.`;
       selectorHints: (form.selectorHints || []).slice(0, 8),
     }));
 
-    const componentDetails = (context.componentDetails || []).slice(0, 12).map((component) => ({
+    const componentDetails = (context.componentDetails || []).slice(0, 25).map((component) => ({
       name: component.name,
       props: (component.props || []).slice(0, 10),
       eventHandlers: (component.eventHandlers || []).slice(0, 10),
@@ -1024,6 +1058,26 @@ IMPORTANT: Return ONLY valid JSON.`;
     if (payload?.prd && String(payload.prd).trim()) {
       promptRequirements.push('Include requirement trace tags in each test title/comment using format [REQ:<id-or-slug>].');
     }
+
+    // Add route grounding instruction to prevent AI from guessing route paths
+    promptRequirements.push(
+      'CRITICAL: Use route paths EXACTLY as they appear in CONTEXT_JSON pages[].path. Do NOT infer route paths from component names. If a page has path "/projects", navigate to "/projects" not "/Projects".'
+    );
+
+    // Add dropped context warning if any data was truncated
+    const dropped = payload?.droppedCounts || {};
+    const droppedParts = [];
+    if (dropped.pages > 0) droppedParts.push(`${dropped.pages} pages`);
+    if (dropped.endpoints > 0) droppedParts.push(`${dropped.endpoints} endpoints`);
+    if (dropped.forms > 0) droppedParts.push(`${dropped.forms} forms`);
+    if (dropped.workflows > 0) droppedParts.push(`${dropped.workflows} workflows`);
+    if (dropped.components > 0) droppedParts.push(`${dropped.components} components`);
+    if (droppedParts.length > 0) {
+      promptRequirements.push(
+        `Note: Context was truncated — ${droppedParts.join(', ')} were omitted. Prioritize testing the routes and endpoints included in the context. Do not guess or invent routes/selectors not present in the context.`
+      );
+    }
+
     const requirementLines = promptRequirements.map((requirement) => `- ${requirement}`).join('\n');
     const payloadJson = this.sanitizePromptText(JSON.stringify(payload, null, 2));
 

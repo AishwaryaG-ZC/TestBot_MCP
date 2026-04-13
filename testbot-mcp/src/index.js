@@ -5,17 +5,23 @@
  * Usage: User says "test my app using healix mcp" in Cursor/Windsurf
  */
 
-// Load environment variables - try multiple paths since CWD varies when launched from IDE
+// Load environment variables - try multiple paths since CWD varies when launched from IDE.
+// When published as npm, env vars come from the IDE's MCP config (e.g., Cursor mcp.json).
+// For local dev, fall back to .env or the webapp's .env.local for shared secrets.
 const path = require('path');
 const dotenvPaths = [
-  path.join(__dirname, '.env'),
-  path.join(__dirname, '..', '.env'),
-  path.join(__dirname, '..', '..', '.env'),
-  path.join(process.cwd(), '.env'),
+  path.join(__dirname, '.env'),                          // src/.env
+  path.join(__dirname, '..', '.env'),                    // testbot-mcp/.env
+  path.join(__dirname, '..', '..', '.env'),              // TestBot_MCP/.env
+  path.join(process.cwd(), '.env'),                      // cwd/.env
+  path.join(__dirname, '..', '.env.local'),              // testbot-mcp/.env.local
+  path.join(__dirname, '..', '..', 'webapp', '.env.local'), // webapp/.env.local (shared secrets)
+  path.join(process.cwd(), '.env.local'),                // cwd/.env.local
 ];
 for (const envPath of dotenvPaths) {
-  const { error } = require('dotenv').config({ path: envPath });
-  if (!error) { break; } // stop at first working .env
+  // Use override: false so IDE-provided env vars (from mcp.json) take precedence
+  const { error } = require('dotenv').config({ path: envPath, override: false });
+  if (!error) { break; }
 }
 
 const { fork } = require('child_process');
@@ -721,7 +727,7 @@ class HealixMCPServer {
     this.server.registerTool(
       'healix_test_my_app',
       {
-        description: 'Test your application end-to-end with AI-powered analysis. Opens a configuration UI by default, then generates tests, runs them, analyzes failures with AI, and opens a dashboard with results. Strict AI-only generation is enabled by default. Returns immediately with a run ID and config URL while awaiting configuration.',
+        description: 'Test your application end-to-end with AI-powered analysis. This tool opens a configuration form in the user\'s browser automatically — do NOT call this tool again after it returns. Tell the user the config form is open and they should review settings and click "Start Testing". Then use healix_check_run_status to poll for pipeline progress and results. Do NOT attempt to open the config URL yourself or re-invoke this tool. Strict AI-only generation is enabled by default.',
         inputSchema: z.object({
           projectPath: z.string().optional().describe('Path to the project to test (defaults to current workspace)'),
           testType: z.enum(['frontend', 'backend', 'both']).optional().describe('Type of tests to run'),
@@ -846,6 +852,83 @@ class HealixMCPServer {
                 text: `Error: ${error.message}\n${error.stack}`,
               },
             ],
+            isError: true,
+          };
+        }
+      }
+    );
+
+    this.server.registerTool(
+      'healix_check_run_status',
+      {
+        description: 'Check the status of a Healix test pipeline run. Call this after healix_test_my_app returns a runId to monitor progress. Returns the current phase (awaiting_config_ui, started, context_gathering, test_generation, test_execution, ai_triage, reporting, completed, error) and results when complete. Poll every 10-15 seconds until phase is "completed" or "error".',
+        inputSchema: z.object({
+          projectPath: z.string().optional().describe('Path to the project (defaults to current workspace)'),
+          runId: z.string().describe('The runId returned by healix_test_my_app'),
+        }),
+      },
+      async (args, extra) => {
+        const telemetryStartedAt = this.trackToolInvocation('healix_check_run_status', args);
+        Logger.mcp('Index', `Tool called: healix_check_run_status`, { runId: args?.runId });
+        try {
+          const projectPath = args.projectPath || process.cwd();
+          const runId = args.runId;
+
+          if (!runId) {
+            return {
+              content: [{ type: 'text', text: JSON.stringify({ phase: 'error', message: 'runId is required' }) }],
+              isError: true,
+            };
+          }
+
+          const statusFile = path.join(projectPath, 'testbot-reports', '.runs', runId, 'status.json');
+
+          if (!fs.existsSync(statusFile)) {
+            this.trackToolResult('healix_check_run_status', telemetryStartedAt);
+            return {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  runId,
+                  phase: 'not_found',
+                  message: `No status file found for runId "${runId}". The run may not have started yet or the projectPath may be incorrect.`,
+                }, null, 2),
+              }],
+            };
+          }
+
+          const status = JSON.parse(fs.readFileSync(statusFile, 'utf-8'));
+          const TERMINAL_PHASES = new Set(['completed', 'error', 'error_reported', 'failed']);
+          const isTerminal = TERMINAL_PHASES.has(status.phase);
+
+          const response = {
+            runId,
+            ...status,
+            isTerminal,
+          };
+
+          if (!isTerminal) {
+            response.nextAction = 'Pipeline is still running. Call healix_check_run_status again in 10-15 seconds to check progress.';
+          } else if (status.phase === 'completed') {
+            response.nextAction = 'Pipeline completed. Share the results with the user.';
+          } else {
+            response.nextAction = 'Pipeline encountered an error. Share the error details with the user.';
+          }
+
+          this.trackToolResult('healix_check_run_status', telemetryStartedAt);
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify(response, null, 2),
+            }],
+          };
+        } catch (error) {
+          this.trackToolResult('healix_check_run_status', telemetryStartedAt, error);
+          return {
+            content: [{
+              type: 'text',
+              text: `Error checking run status: ${error.message}`,
+            }],
             isError: true,
           };
         }
@@ -1407,7 +1490,9 @@ Return the JSON structure above based on what you find in the codebase.
               phase: 'awaiting_config_ui',
               configUrl,
               statusFile,
-              message: `Configuration UI is ready!\n\nOpen this URL in your browser, review the settings, and click "Start Testing":\n\n${configUrl}\n\nOnce you submit, the test pipeline will start automatically. You can monitor progress at:\n${statusFile}`,
+              message: `Configuration form has been opened in the user's browser automatically. Do NOT open the URL yourself or call this tool again. Ask the user to review the settings and click "Start Testing" in the browser form. Once they submit, the test pipeline starts automatically. Use the healix_check_run_status tool with runId "${runId}" to monitor progress.`,
+              nextAction: 'Tell the user to fill out the configuration form in their browser, then use healix_check_run_status to poll for results.',
+              doNotRetry: true,
             }, null, 2),
           },
         ],

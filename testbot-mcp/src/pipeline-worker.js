@@ -8,14 +8,18 @@ const path = require('path');
 const fs = require('fs');
 const { spawn, execSync } = require('child_process');
 
-// Load environment variables from multiple paths
+// Load environment variables from multiple paths.
+// For local dev, also check webapp/.env.local for shared secrets (OpenAI key, etc.).
+// When published as npm, env vars come from the IDE's MCP config instead.
 const dotenvPaths = [
-  path.join(__dirname, '.env'),
-  path.join(__dirname, '..', '.env'),
-  path.join(__dirname, '..', '..', '.env'),
+  path.join(__dirname, '.env'),                              // src/.env
+  path.join(__dirname, '..', '.env'),                        // testbot-mcp/.env
+  path.join(__dirname, '..', '..', '.env'),                  // TestBot_MCP/.env
+  path.join(__dirname, '..', '.env.local'),                  // testbot-mcp/.env.local
+  path.join(__dirname, '..', '..', 'webapp', '.env.local'),  // webapp/.env.local (shared secrets)
 ];
 for (const envPath of dotenvPaths) {
-  const { error } = require('dotenv').config({ path: envPath });
+  const { error } = require('dotenv').config({ path: envPath, override: false });
   if (!error) break;
 }
 
@@ -833,6 +837,16 @@ function ensureCursorFixtureFiles(generatedDir) {
   fs.writeFileSync(fixtureTs, ts, 'utf-8');
   fs.writeFileSync(fixtureJs, js, 'utf-8');
 
+  // Clean up legacy fixture files from before the rename (testbot → healix)
+  const legacyNames = ['__testbot-fixture.ts', '__testbot-fixture.js'];
+  for (const legacyName of legacyNames) {
+    const legacyPath = path.join(generatedDir, legacyName);
+    if (fs.existsSync(legacyPath)) {
+      try { fs.unlinkSync(legacyPath); } catch { /* non-fatal */ }
+      Logger.debug('PipelineWorker', `Removed legacy fixture: ${legacyName}`);
+    }
+  }
+
   return [fixtureTs, fixtureJs];
 }
 
@@ -843,6 +857,12 @@ function rewritePlaywrightImportForCursor(content, fixtureImportPath) {
 
   rewritten = rewritten.replace(importPattern, (_match, quote) => `from ${quote}${fixtureImportPath}${quote}`);
   rewritten = rewritten.replace(requirePattern, (_match, quote) => `require(${quote}${fixtureImportPath}${quote})`);
+
+  // Also fix legacy __testbot-fixture references from before the rename
+  const legacyImportPattern = /from\s+(['"])\.\/__testbot-fixture\1/g;
+  const legacyRequirePattern = /require\((['"])\.\/__testbot-fixture\1\)/g;
+  rewritten = rewritten.replace(legacyImportPattern, (_match, quote) => `from ${quote}${fixtureImportPath}${quote}`);
+  rewritten = rewritten.replace(legacyRequirePattern, (_match, quote) => `require(${quote}${fixtureImportPath}${quote})`);
 
   return rewritten;
 }
@@ -871,7 +891,8 @@ function applyMouseCursorOverlayToGeneratedTests({ projectPath, enabled }) {
 
   for (const testFile of testFiles) {
     const raw = fs.readFileSync(testFile, 'utf-8');
-    if (!raw.includes('@playwright/test')) {
+    // Process files that import @playwright/test OR have legacy __testbot-fixture references
+    if (!raw.includes('@playwright/test') && !raw.includes('__testbot-fixture')) {
       skippedFiles += 1;
       continue;
     }
@@ -977,19 +998,33 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}) {
     'playwright.config.cjs',
   ];
 
-  // Check if config already exists
+  // Always overwrite the config to ensure baseURL is correct for this run.
+  // Previous runs may have created a config with a stale baseURL.
+  // Remove any existing config files first to avoid conflicts.
   for (const name of candidates) {
     const candidate = path.join(projectPath, name);
-    if (fs.existsSync(candidate)) {
-      Logger.debug('PipelineWorker', 'Playwright config already exists', { path: candidate });
-      return;
+    if (fs.existsSync(candidate) && name !== 'playwright.config.ts') {
+      // Remove non-.ts configs to avoid Playwright picking the wrong one
+      try { fs.unlinkSync(candidate); } catch { /* non-fatal */ }
     }
   }
 
-  // Generate playwright.config.ts
+  // Generate playwright.config.ts with current baseURL and webServer config.
+  // The webServer block tells Playwright to start the dev server automatically
+  // and wait for it to be ready before running any tests. This prevents
+  // ERR_CONNECTION_REFUSED failures when the server isn't running.
   const baseURL = projectInfo.baseURL || 'http://localhost:3000';
   const startCommand = projectInfo.startCommand || '';
-  
+  const serverStartTimeoutMs = projectInfo.serverStartTimeoutMs || 120000;
+
+  const webServerBlock = startCommand ? `
+  webServer: {
+    command: '${startCommand.replace(/'/g, "\\'")}',
+    url: '${baseURL}',
+    reuseExistingServer: true,
+    timeout: ${serverStartTimeoutMs},
+  },` : '';
+
   const config = `import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
@@ -1002,7 +1037,7 @@ export default defineConfig({
     ['list'],
     ['json', { outputFile: 'test-results/results.json' }],
     ['html', { open: 'never' }],
-  ],
+  ],${webServerBlock}
   use: {
     baseURL: '${baseURL}',
     trace: 'retain-on-failure',
@@ -1017,6 +1052,33 @@ export default defineConfig({
   ],
 });
 `;
+
+  // Also generate a tsconfig.json for the test directory to avoid conflicts
+  // with project-level tsconfig (e.g., Vite's verbatimModuleSyntax, bundler moduleResolution)
+  // which can break Playwright's module resolution and cause "does not provide an export named" errors.
+  const testDir = path.join(projectPath, 'tests', 'generated');
+  const testTsConfigPath = path.join(testDir, 'tsconfig.json');
+  if (!fs.existsSync(testTsConfigPath)) {
+    try {
+      fs.mkdirSync(testDir, { recursive: true });
+      fs.writeFileSync(testTsConfigPath, JSON.stringify({
+        compilerOptions: {
+          target: 'ES2022',
+          module: 'ESNext',
+          moduleResolution: 'node',
+          strict: true,
+          esModuleInterop: true,
+          allowImportingTsExtensions: true,
+          noEmit: true,
+          skipLibCheck: true,
+        },
+        include: ['./**/*.ts'],
+      }, null, 2), 'utf-8');
+      Logger.info('PipelineWorker', 'Created tests/generated/tsconfig.json for Playwright compatibility');
+    } catch (err) {
+      Logger.warn('PipelineWorker', 'Could not create test tsconfig.json', { error: err.message });
+    }
+  }
 
   const configPath = path.join(projectPath, 'playwright.config.ts');
   fs.writeFileSync(configPath, config, 'utf-8');
@@ -1933,6 +1995,7 @@ async function runPipeline(config, runId) {
       baseURL: config.baseURL,
       startCommand: config.startCommand,
       testCredentials: config.testCredentials,
+      serverStartTimeoutMs: config.serverStartTimeoutMs,
     };
 
     // -------------------------------------------------------
@@ -2040,6 +2103,26 @@ async function runPipeline(config, runId) {
           });
         });
       }
+    }
+
+    // -------------------------------------------------------
+    // 4b. Pre-execution setup (runs for BOTH fresh generation and reuse-existing flows)
+    // -------------------------------------------------------
+    // Always ensure playwright.config.ts has the correct baseURL and webServer.
+    // This is critical when reusing existing tests from a prior run — the old config
+    // may have a stale baseURL or be missing entirely.
+    ensurePlaywrightConfig(config.projectPath, projectInfo);
+
+    // Always apply fixture and import rewrites to existing test files.
+    // This handles: legacy __testbot-fixture → __healix-fixture migration,
+    // @playwright/test → fixture imports, and ensures the fixture file exists.
+    try {
+      applyMouseCursorOverlayToGeneratedTests({
+        projectPath: config.projectPath,
+        enabled: isVideoCursorEnabled(config),
+      });
+    } catch (overlayError) {
+      Logger.warn('PipelineWorker', 'Pre-execution fixture setup failed (non-fatal)', { error: overlayError.message });
     }
 
     // -------------------------------------------------------

@@ -429,11 +429,24 @@ class ArtifactUploader {
       // IMPORTANT: Don't set Content-Type header - let FormData set it with boundary
       const headers = form.getHeaders ? form.getHeaders() : undefined;
       
-      const response = await fetchFn(`${this.config.dashboardUrl}/api/upload-artifacts`, {
-        method: 'POST',
-        body: form,
-        ...(headers && { headers }), // Only include headers for node-fetch with form-data
-      });
+      // Retry loop for rate limits (429) — up to 3 attempts with backoff
+      let response;
+      const MAX_RETRIES = 3;
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        response = await fetchFn(`${this.config.dashboardUrl}/api/upload-artifacts`, {
+          method: 'POST',
+          body: form,
+          ...(headers && { headers }),
+        });
+
+        if (response.status === 429 && attempt < MAX_RETRIES) {
+          const retryAfter = parseInt(response.headers.get('retry-after') || '2', 10);
+          Logger.warn('ArtifactUploader', `Rate limited (429), retrying in ${retryAfter}s (attempt ${attempt}/${MAX_RETRIES})`);
+          await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
+          continue;
+        }
+        break;
+      }
 
       if (!response.ok) {
         const text = await response.text().catch(() => '');

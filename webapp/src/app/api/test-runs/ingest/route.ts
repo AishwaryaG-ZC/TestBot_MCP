@@ -233,8 +233,8 @@ export async function POST(request: NextRequest) {
 
     const userId = apiKeyRecord.userId
 
-    // 3. Rate limit check
-    const rateResult = await checkRateLimit({ keyHash, userId, endpoint: ENDPOINT })
+    // 3. Rate limit check — MCP pipeline endpoints need generous limits
+    const rateResult = await checkRateLimit({ keyHash, userId, endpoint: ENDPOINT, limitPerSecond: 30, limitPerMinute: 600 })
     if (!rateResult.allowed) {
       return NextResponse.json(
         { error: 'RATE_LIMIT_EXCEEDED' },
