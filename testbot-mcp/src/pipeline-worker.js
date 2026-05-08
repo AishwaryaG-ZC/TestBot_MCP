@@ -34,7 +34,7 @@ const AIAnalyzer = require('./ai-providers/index');
 const WebappClient = require('./webapp-client');
 const { startSecondaryServices, stopSecondaryServices, probeHttpReady, waitForServiceReady } = require('./multi-service-starter');
 const { runExplorationPhase, EMPTY_ARTIFACT } = require('./exploration-phase');
-const { injectCredentials } = require('./credentials-injector');
+const { injectCredentials, normalizeRoleLabel } = require('./credentials-injector');
 const Logger = require('./logger');
 const MCPTelemetryReporter = require('./mcp-telemetry');
 
@@ -215,7 +215,7 @@ function createRunBudget(config = {}) {
     Boolean(process.env.HEALIX_STAGE_GENERATION_MS) ||
     Boolean(process.env.HEALIX_GEN_BUDGET_MS);
   if (strictAI && !hasExplicitGenerationCap) {
-    const requestedMinTests = toFiniteNumber(config.minGeneratedTests, 50);
+    const requestedMinTests = toFiniteNumber(config.minGeneratedTests, 20);
     const adaptiveGenerationCap = coverageProfile === 'exhaustive' || requestedMinTests >= 75
       ? 600000
       : requestedMinTests >= 50
@@ -285,14 +285,14 @@ function countParsedAcceptanceCriteria(parsedPRD = {}) {
   return count;
 }
 
-function estimateGenerationComplexity({ context = {}, parsedPRD = {}, projectInfo = {}, minGeneratedTests = 50 } = {}) {
+function estimateGenerationComplexity({ context = {}, parsedPRD = {}, projectInfo = {}, minGeneratedTests = 20 } = {}) {
   const pages = (context.pages || []).length + (context.routes || []).length;
   const forms = (context.forms || []).length;
   const workflows = (context.workflows || []).length + (context.keyFlows || []).length;
   const endpoints = effectiveApiEndpoints(context).length;
   const acceptanceCriteria = countParsedAcceptanceCriteria(parsedPRD);
   const services = Array.isArray(projectInfo.services) ? projectInfo.services.length : 0;
-  const requestedTests = toFiniteNumber(minGeneratedTests, 50);
+  const requestedTests = toFiniteNumber(minGeneratedTests, 20);
   const score =
     (pages * 3) +
     (forms * 4) +
@@ -318,7 +318,7 @@ function maybeExpandGenerationStageBudget({ runBudget, config = {}, context = {}
     return null;
   }
 
-  const minGeneratedTests = toFiniteNumber(config.minGeneratedTests, 50);
+  const minGeneratedTests = toFiniteNumber(config.minGeneratedTests, 20);
   const complexity = estimateGenerationComplexity({ context, parsedPRD, projectInfo, minGeneratedTests });
   const desiredByTier = {
     small: DEFAULT_STAGE_CAPS_MS.generation,
@@ -1363,7 +1363,9 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
   const minHits = minimumCategoryHitsByProfile(profile);
   const missingCategories = requiredCategories.filter((category) => (quality.categories[category] || 0) < minHits);
 
-  const minGeneratedTests = toFiniteNumber(config.minGeneratedTests, 50);
+  const configMin = toFiniteNumber(config.minGeneratedTests, 20);
+  const profileMin = profile === 'qa-max' ? 30 : 0;
+  const minGeneratedTests = profileMin > 0 ? profileMin : configMin;
   const minSelectorQuality = profile === 'balanced' ? 0.35 : (profile === 'exhaustive' ? 0.6 : 0.5);
   const minRunnableRatio = profile === 'balanced' ? 0.25 : 0.5;
 
@@ -2081,7 +2083,7 @@ function getCursorFixtureContent(serializedInitScript, moduleType = 'commonjs', 
   let authBlock = '';
   if (verifiedRoles.length > 0) {
     const stateMapEntries = verifiedRoles
-      .map((r) => `  ${JSON.stringify(String(r.role))}: ${JSON.stringify(r.storageStatePath)}`)
+      .map((r) => `  ${JSON.stringify(normalizeRoleLabel(r.role || r.name || 'user'))}: ${JSON.stringify(r.storageStatePath)}`)
       .join(',\n');
     // ESM/TS: top-level import + named reference in helper
     authPreamble =
@@ -2096,10 +2098,15 @@ function getCursorFixtureContent(serializedInitScript, moduleType = 'commonjs', 
       `function _healixLoadState(p) {\n` +
       `  try { return JSON.parse(require('fs').readFileSync(p, 'utf-8')); } catch { return null; }\n` +
       `}\n\n`;
+    const defaultRole = normalizeRoleLabel(verifiedRoles[0].role || verifiedRoles[0].name || 'user');
     authBlock =
       `    const _roleMatch = testInfo.project.name.match(/^tierB-auth-(.+)$/);\n` +
-      `    if (_roleMatch) {\n` +
-      `      const _statePath = _HEALIX_ROLE_STATES[_roleMatch[1]];\n` +
+      `    // Also inject storageState for @auth/@tierB tagged tests running outside tier-aware projects\n` +
+      `    // (e.g. when the user has their own playwright.config that doesn't define tierB projects).\n` +
+      `    const _isAuthTagged = !_roleMatch && (testInfo.title.includes('@auth') || testInfo.title.includes('@tierB'));\n` +
+      `    const _effectiveRole = _roleMatch ? _roleMatch[1] : (_isAuthTagged ? ${JSON.stringify(defaultRole)} : null);\n` +
+      `    if (_effectiveRole) {\n` +
+      `      const _statePath = _HEALIX_ROLE_STATES[_effectiveRole];\n` +
       `      if (_statePath) {\n` +
       `        const _state = _healixLoadState(_statePath);\n` +
       `        if (_state && Array.isArray(_state.cookies) && _state.cookies.length > 0) {\n` +
@@ -2385,7 +2392,7 @@ function safeWriteGeneratedTest(testsDir, test, index, fallbackPrefix, usedFilen
 function writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles) {
   if (!verifiedRoles || verifiedRoles.length === 0) return null;
   const tierBProjects = verifiedRoles.map((r) => `    {
-      name: 'tierB-auth-${String(r.role || 'user').replace(/[^a-zA-Z0-9_-]/g, '_')}',
+      name: 'tierB-auth-${normalizeRoleLabel(r.role || r.name || 'user')}',
       grep: /@auth|@tierB/,
       retries: 2,
       use: {
@@ -2452,7 +2459,7 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
   // log can tell the user exactly what tier-aware config they're missing.
   const verifiedRolesSummary = (roles || [])
     .filter((r) => r && r.loginVerified && r.storageStatePath)
-    .map((r) => r.role || 'user');
+    .map((r) => normalizeRoleLabel(r.role || r.name || 'user'));
 
   // Check if config already exists
   for (const name of candidates) {
@@ -2511,7 +2518,7 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
   // as hard failures and so tierC (backend) doesn't waste budget on retryable HTTP
   // assertion bugs that are genuinely deterministic.
   const tierBProjects = verifiedRoles.map((r) => `    {
-      name: 'tierB-auth-${String(r.role || 'user').replace(/[^a-zA-Z0-9_-]/g, '_')}',
+      name: 'tierB-auth-${normalizeRoleLabel(r.role || r.name || 'user')}',
       grep: /@auth|@tierB/,
       retries: 2,
       use: {
@@ -3644,7 +3651,7 @@ async function maybeGenerateViaSaaS({
       allowSyntheticErrorScenarios: false,
       strictAIGeneration: strictAI,
       coverageProfile: config.coverageProfile || 'qa-max',
-      minGeneratedTests: toFiniteNumber(config.minGeneratedTests, 50),
+      minGeneratedTests: toFiniteNumber(config.minGeneratedTests, 20),
       maxExpansionAttempts: Number.isFinite(Number(config.maxExpansionAttempts))
         ? Math.max(0, Math.floor(Number(config.maxExpansionAttempts)))
         : 0,
@@ -3898,10 +3905,13 @@ async function runPhase1FanOut({
       },
     });
   }
-  const globalMinGeneratedTests = toFiniteNumber(sharedPayload?.options?.minGeneratedTests, 50);
+  const globalMinGeneratedTests = toFiniteNumber(sharedPayload?.options?.minGeneratedTests, 40);
+  // Each agent's floor must be high enough that all agents together can reach
+  // the global minimum. Cap at 20 to avoid making individual agent prompts
+  // demand unreasonably large suites; floor at 5 as a sanity minimum.
   const perAgentMinGeneratedTests = Math.max(
     5,
-    Math.min(12, Math.ceil(globalMinGeneratedTests / Math.max(1, agents.length))),
+    Math.min(20, Math.ceil(globalMinGeneratedTests / Math.max(1, agents.length))),
   );
 
   async function runAgent(agent) {
@@ -3916,10 +3926,14 @@ async function runPhase1FanOut({
           // The aggregate MCP quality gate enforces the full run minimum after
           // every agent has landed. Per-agent calls should target their slice,
           // not each attempt to generate the entire suite by itself.
+          // Allow up to 2 expansion rounds per agent so each slice can reach
+          // its perAgentFloor — without this, agents that generate too few
+          // tests on their initial pass never recover and the aggregate total
+          // falls short of minGeneratedTests even after all agents complete.
           minGeneratedTests: perAgentMinGeneratedTests,
           maxExpansionAttempts: Number.isFinite(Number(sharedPayload.options?.maxExpansionAttempts))
             ? Number(sharedPayload.options.maxExpansionAttempts)
-            : 0,
+            : 2,
         },
       };
       if (plan && agentSlice) {
@@ -5464,7 +5478,7 @@ async function runPipeline(config, runId) {
       const preAuthRoles = Array.isArray(config._preAuthRoles) ? config._preAuthRoles : [];
       const allPreAuthVerified = preAuthRoles.length > 0
         && config.testCredentials.every((cred) => {
-          const role = cred.role || 'user';
+          const role = normalizeRoleLabel(cred.role || cred.name || 'user');
           return preAuthRoles.some((r) => r.role === role && r.loginVerified);
         });
       const hasAuthFlow = !!(explorationArtifact?.authFlow);
@@ -5474,12 +5488,12 @@ async function runPipeline(config, runId) {
         // from exploration — skip the redundant login round-trip.
         roles = preAuthRoles;
         Logger.info('PipelineWorker', 'Reusing pre-auth storageStates — skipping duplicate credential injection', {
-          roles: roles.map((r) => r.role),
+          roles: roles.map((r) => normalizeRoleLabel(r.role || r.name || 'user')),
         });
         updateStatus(statusDir, 'auth_injected', {
           runId,
           message: `${roles.filter((r) => r.loginVerified).length}/${roles.length} role login(s) verified (reused from pre-auth)`,
-          roles: roles.map((r) => ({ role: r.role, loginVerified: !!r.loginVerified, reason: r.reason || null })),
+          roles: roles.map((r) => ({ role: normalizeRoleLabel(r.role || r.name || 'user'), loginVerified: !!r.loginVerified, reason: r.reason || null })),
         }, telemetryReporter);
       } else {
         // Either pre-auth failed for some roles OR exploration found a richer
@@ -5501,7 +5515,7 @@ async function runPipeline(config, runId) {
           updateStatus(statusDir, 'auth_injected', {
             runId,
             message: `${verifiedCount}/${roles.length} role login(s) verified`,
-            roles: roles.map((r) => ({ role: r.role, loginVerified: !!r.loginVerified, reason: r.reason || null })),
+            roles: roles.map((r) => ({ role: normalizeRoleLabel(r.role || r.name || 'user'), loginVerified: !!r.loginVerified, reason: r.reason || null })),
           }, telemetryReporter);
         } catch (credErr) {
           Logger.warn('PipelineWorker', 'Credential injection failed (best-effort)', { reason: credErr.message });
@@ -5579,7 +5593,7 @@ async function runPipeline(config, runId) {
             generationMeta.routeAccessSummary = routeAccessSummary;
             generationMeta.blockedAuthRoles = roles
               .filter((r) => r && r.loginVerified === false)
-              .map((r) => ({ role: r.role || r.name || 'user', reason: r.reason || null }));
+              .map((r) => ({ role: normalizeRoleLabel(r.role || r.name || 'user'), reason: r.reason || null }));
           }
 
           // Ensure playwright.config.ts exists after test generation

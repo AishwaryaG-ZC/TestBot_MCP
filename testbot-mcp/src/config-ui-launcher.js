@@ -140,7 +140,7 @@ class ConfigUILauncher {
       generateTests: String(projectInfo.generateTests !== false),
       openDashboard: String(projectInfo.openDashboard !== false),
       strictAIGeneration: String(projectInfo.strictAIGeneration !== false),
-      minGeneratedTests: String(projectInfo.minGeneratedTests || 50),
+      minGeneratedTests: String(projectInfo.minGeneratedTests || 20),
       coverageProfile: projectInfo.coverageProfile || 'qa-max',
       phaseMode: projectInfo.phaseMode || 'two-phase',
       serverPort: String(this.config.port),

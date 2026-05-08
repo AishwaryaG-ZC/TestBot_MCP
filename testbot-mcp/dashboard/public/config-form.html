@@ -785,7 +785,7 @@
                 return;
             }
 
-            const validCredentials = state.credentials.filter(c => c.username || c.password);
+            const validCredentials = state.credentials.filter(c => c.username && c.password);
 
             const payload = {
                 testType: state.mode,

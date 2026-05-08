@@ -34,6 +34,14 @@ function stateFileFor(projectPath, role) {
   return path.join(authDirFor(projectPath), `${STATE_FILE_PREFIX}${safeRole}.json`);
 }
 
+function normalizeRoleLabel(role) {
+  const raw = String(role || 'user').trim().toLowerCase();
+  if (!raw) return 'user';
+  if (raw === 'administrator' || raw === 'superadmin' || raw === 'super_admin') return 'admin';
+  if (raw === 'customer' || raw === 'member' || raw === 'authed' || raw === 'authenticated') return 'user';
+  return raw.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
 function ensureAuthDir(projectPath) {
   const dir = authDirFor(projectPath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -67,32 +75,66 @@ async function driveLogin({ baseURL, authFlow, credentials, storageStatePath }) 
     const loginUrl = authFlow?.loginUrl
       ? new URL(authFlow.loginUrl, baseURL).toString()
       : baseURL;
-    const loginPathname = (() => { try { return new URL(loginUrl).pathname; } catch { return loginUrl; } })();
 
     // Use `load` not `networkidle` — Next.js/Supabase apps have persistent background
     // fetches that can prevent networkidle from firing within any reasonable timeout.
     await page.goto(loginUrl, { waitUntil: 'load', timeout: 30_000 });
 
-    const userField = authFlow?.credentialFields?.username || 'input[type="email"], input[name="email"], input[name="username"]';
+    // Re-read the actual URL after any auto-redirects so loginPathname reflects
+    // the page the user sees (e.g., '/' → '/login'). Without this, a successful
+    // login that redirects back to '/' is mis-classified as failure because
+    // finalPathname ('/') === loginPathname ('/').
+    let loginPathname = (() => { try { return new URL(page.url()).pathname; } catch { return (() => { try { return new URL(loginUrl).pathname; } catch { return loginUrl; } })(); } })();
+
+    const userField = authFlow?.credentialFields?.username || 'input[type="email"], input[name="email"], input[name="username"], input[autocomplete="username"]';
     const passField = authFlow?.credentialFields?.password || 'input[type="password"], input[name="password"]';
 
     // Wait for the input to be visible — JS-rendered forms appear after hydration.
-    await page.locator(userField).first().waitFor({ state: 'visible', timeout: 15_000 });
+    let formFound = false;
+    try {
+      await page.locator(userField).first().waitFor({ state: 'visible', timeout: 12_000 });
+      formFound = true;
+    } catch { /* form not visible at navigated URL — try common login paths */ }
+
+    // When no authFlow URL was given and the form wasn't found at baseURL, probe
+    // common login paths. Many SPAs show a public home at '/' while the login
+    // form lives at '/login', '/signin', etc.
+    if (!formFound && !authFlow?.loginUrl) {
+      for (const tryPath of ['/login', '/signin', '/auth/login', '/auth/signin', '/sign-in']) {
+        try {
+          await page.goto(new URL(tryPath, baseURL).toString(), { waitUntil: 'load', timeout: 15_000 });
+          await page.locator(userField).first().waitFor({ state: 'visible', timeout: 5_000 });
+          loginPathname = (() => { try { return new URL(page.url()).pathname; } catch { return tryPath; } })();
+          formFound = true;
+          break;
+        } catch { /* try next */ }
+      }
+    }
+
+    if (!formFound) {
+      return { ok: false, reason: 'Login form not found — could not locate username/email input on any login page' };
+    }
+
     await page.fill(userField, credentials.username, { timeout: 10_000 });
     await page.fill(passField, credentials.password, { timeout: 10_000 });
 
-    const submit = page.locator('button[type="submit"], input[type="submit"]').first();
-
-    // Wait for SPA navigation to complete. Supabase fires router.replace() in the
-    // .then() of signInWithPassword — this is async and fires AFTER the API response,
-    // so networkidle can resolve before the redirect. waitForURL is the only reliable
-    // signal that the auth flow has actually completed.
+    // Prefer keyboard Enter — more reliable than finding a submit button, which may
+    // lack type="submit" in SPA forms. Falls back to a broad button selector that
+    // covers <button> elements without explicit type (which defaults to submit).
     await Promise.all([
       page.waitForURL(
         (url) => { try { return url.pathname !== loginPathname; } catch { return false; } },
         { timeout: 20_000 }
       ).catch(() => null),
-      submit.click({ timeout: 10_000 }),
+      page.locator(passField).first().press('Enter').catch(async () => {
+        const submit = page.locator([
+          'button[type="submit"]',
+          'input[type="submit"]',
+          'button:not([type="reset"]):not([type="button"])',
+        ].join(', ')).first();
+        const count = await submit.count().catch(() => 0);
+        if (count > 0) await submit.click({ timeout: 10_000 });
+      }),
     ]);
 
     // Allow middleware chain redirects (e.g. /admin → / for non-admin users) to settle.
@@ -140,16 +182,16 @@ async function injectCredentials({
   const roles = [];
   for (const cred of credentials) {
     if (!cred?.username || !cred?.password) continue;
-    const role = cred.role || 'user';
+    const role = normalizeRoleLabel(cred.role || cred.name || 'user');
     const storageStatePath = stateFileFor(projectPath, role);
 
     const result = await driveLogin({ baseURL, authFlow, credentials: cred, storageStatePath });
     if (result.ok) {
       Logger.info('CredentialsInjector', `Login verified for role=${role}`, { storageStatePath });
-      roles.push({ role, storageStatePath, loginVerified: true });
+      roles.push({ role, name: role, storageStatePath, loginVerified: true });
     } else {
       Logger.warn('CredentialsInjector', `Login failed for role=${role}`, { reason: result.reason });
-      roles.push({ role, storageStatePath: null, loginVerified: false, reason: result.reason });
+      roles.push({ role, name: role, storageStatePath: null, loginVerified: false, reason: result.reason });
     }
   }
   return roles;
@@ -159,4 +201,5 @@ module.exports = {
   injectCredentials,
   authDirFor,
   stateFileFor,
+  normalizeRoleLabel,
 };

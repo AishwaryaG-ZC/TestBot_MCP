@@ -297,6 +297,7 @@ export interface ParsedPRD {
 
 export interface Role {
   name: string                 // e.g. "admin", "user"
+  role?: string                // MCP credential injector historically emits this alias
   storageStatePath?: string    // path to Playwright storageState JSON for this role
   loginVerified?: boolean
 }

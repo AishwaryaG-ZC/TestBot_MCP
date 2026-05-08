@@ -426,11 +426,11 @@ class HealixMCPServer {
     if (!credentials) return undefined;
     
     if (Array.isArray(credentials)) {
-      const validCreds = credentials.filter(c => c.username || c.password);
+      const validCreds = credentials.filter(c => c.username && c.password);
       return validCreds.length > 0 ? validCreds : undefined;
     }
     
-    if (credentials.username || credentials.password) {
+    if (credentials.username && credentials.password) {
       return [credentials];
     }
     
@@ -564,16 +564,16 @@ class HealixMCPServer {
     const parsedMinGeneratedTests = Number(params.minGeneratedTests);
     let minGeneratedTests = Number.isFinite(parsedMinGeneratedTests) && parsedMinGeneratedTests > 0
       ? Math.floor(parsedMinGeneratedTests)
-      : 50;
-    if (shouldAutoUpgrade && minGeneratedTests < 50) {
+      : 20;
+    if (shouldAutoUpgrade && minGeneratedTests < 20) {
       const previous = minGeneratedTests;
-      minGeneratedTests = 50;
+      minGeneratedTests = 20;
       configAutoUpgrades.push({
         kind: 'config_auto_upgraded',
-        detail: `Promoted minGeneratedTests=${previous} → 50 for local project with detected pages/workflows`,
+        detail: `Promoted minGeneratedTests=${previous} → 20 for local project with detected pages/workflows`,
         field: 'minGeneratedTests',
         from: previous,
-        to: 50,
+        to: 20,
       });
     }
 
@@ -1055,7 +1055,7 @@ class HealixMCPServer {
           autoOpenBrowser: z.boolean().optional().describe('Allow browser auto-open for config/dashboard pages (default: false, ignored when headless=true).'),
           generationMode: z.enum(['openai-first', 'openai-only', 'template-only', 'saas-only']).optional().describe('Generation strategy'),
           strictAIGeneration: z.boolean().optional().describe('Enforce AI-only generation with no template fallback (default: true)'),
-          minGeneratedTests: z.number().int().min(1).max(500).optional().describe('Minimum generated tests required before execution (default: 50)'),
+          minGeneratedTests: z.number().int().min(1).max(500).optional().describe('Minimum generated tests required before execution (default: 20)'),
           coverageProfile: z.enum(['balanced', 'qa-max', 'exhaustive']).optional().describe('Generation depth and coverage profile (default: qa-max)'),
           phaseMode: z.enum(['single', 'two-phase']).optional().describe('Execution mode: single pass or gate+deep two-phase (default: two-phase)'),
           serverStartTimeoutMs: z.number().int().min(10000).max(300000).optional().describe('Server startup timeout in ms before failing readiness checks (default: 90000)'),
@@ -1851,7 +1851,7 @@ Return the JSON structure above based on what you find in the codebase.
           generateTests: baseConfig.generateTests,
           openDashboard: baseConfig.openDashboard,
           strictAIGeneration: baseConfig.strictAIGeneration !== false,
-          minGeneratedTests: Number(baseConfig.minGeneratedTests || 50),
+          minGeneratedTests: Number(baseConfig.minGeneratedTests || 20),
           coverageProfile: baseConfig.coverageProfile || 'qa-max',
           phaseMode: baseConfig.phaseMode || 'two-phase',
           headless,
