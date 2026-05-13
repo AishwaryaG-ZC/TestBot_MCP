@@ -44,6 +44,7 @@ const {
 } = require('./qa-contracts');
 const Logger = require('./logger');
 const MCPTelemetryReporter = require('./mcp-telemetry');
+const { detectProjectKey } = require('./detect-project-key');
 
 // Initialize logger for the worker process
 Logger.initialize();
@@ -7067,6 +7068,149 @@ async function maybeRunFailureTriage({ config, testResults, runBudget, runId }) 
   });
 }
 
+// ── Workspace sync helpers ────────────────────────────────────────────────────
+
+/**
+ * Pre-flight: pull all shared test files from the workspace and write them to
+ * tests/generated/ on the local machine. Inject the team coverage manifest into
+ * config so the planner scopes generation to uncovered targets only.
+ *
+ * Completely non-blocking on error — any failure falls back to solo mode.
+ * Returns { workspaceId, filesWritten, teamCoverage } or null if solo mode.
+ */
+async function runWorkspacePreflight({ client, config, testsDir }) {
+  if (!client) return null;
+  try {
+    const identity = detectProjectKey(config.projectPath);
+    if (!identity) return null;
+
+    const workspace = await client.resolveWorkspace({ projectKey: identity.projectKey });
+    if (!workspace || !workspace.found || !workspace.member) return null;
+
+    const workspaceId = workspace.workspaceId;
+    Logger.info('WorkspaceSync', 'Workspace found — syncing team test files', {
+      workspaceId,
+      projectName: workspace.projectName,
+      role: workspace.role,
+    });
+
+    // Pull and write remote files
+    const remoteFiles = await client.pullWorkspaceTestFiles({ workspaceId });
+    const { createHash } = require('crypto');
+    let filesWritten = 0;
+    for (const rf of remoteFiles) {
+      if (!rf.fileName || !rf.content) continue;
+      try {
+        const localPath = path.join(testsDir, rf.fileName);
+        let localHash = null;
+        if (fs.existsSync(localPath)) {
+          try { localHash = createHash('sha256').update(fs.readFileSync(localPath, 'utf-8')).digest('hex'); } catch { /* ignore */ }
+        }
+        if (localHash !== rf.contentHash) {
+          fs.mkdirSync(testsDir, { recursive: true });
+          fs.writeFileSync(localPath, rf.content, 'utf-8');
+          filesWritten++;
+        }
+      } catch (writeErr) {
+        Logger.warn('WorkspaceSync', `Failed to write remote file ${rf.fileName}`, { message: writeErr.message });
+      }
+    }
+    Logger.info('WorkspaceSync', `Preflight sync complete`, { filesWritten, totalRemote: remoteFiles.length });
+
+    // Pull coverage manifest
+    const teamCoverage = await client.pullWorkspaceCoverage({ workspaceId });
+
+    return { workspaceId, filesWritten, teamCoverage: teamCoverage?.covered || null, identity };
+  } catch (err) {
+    Logger.warn('WorkspaceSync', 'Workspace preflight failed — continuing in solo mode', { message: err.message });
+    return null;
+  }
+}
+
+/**
+ * Post-generation: push all newly written test files to the workspace.
+ * Reads each file in testsDir, extracts coverage signals, pushes batch.
+ * Fire-and-forget — never throws.
+ */
+async function runWorkspacePostGenSync({ client, workspaceId, testsDir, runId, config }) {
+  if (!client || !workspaceId) return;
+  try {
+    const specFiles = listGeneratedTestFiles(config.projectPath);
+    if (specFiles.length === 0) return;
+
+    const { createHash } = require('crypto');
+    const filesToPush = [];
+    for (const filePath of specFiles) {
+      try {
+        const content = fs.readFileSync(filePath, 'utf-8');
+        const fileName = path.basename(filePath);
+        const signals = extractSpecSignals(content, fileName);
+        filesToPush.push({
+          fileName,
+          content,
+          contentHash: createHash('sha256').update(content).digest('hex'),
+          agent: null,
+          testType: config.testType || 'both',
+          runId: runId || null,
+          coverageSignals: {
+            routes: signals.routes || [],
+            apiEndpoints: signals.apiEndpoints || [],
+            catMarkers: signals.catMarkers || [],
+            reqMarkers: signals.reqMarkers || [],
+          },
+        });
+      } catch { /* skip unreadable files */ }
+    }
+
+    if (filesToPush.length > 0) {
+      await client.pushWorkspaceTestFiles({ workspaceId, files: filesToPush });
+      Logger.info('WorkspaceSync', `Pushed ${filesToPush.length} test files to workspace`, { workspaceId });
+    }
+  } catch (err) {
+    Logger.warn('WorkspaceSync', 'Post-gen workspace push failed (non-blocking)', { message: err.message });
+  }
+}
+
+/**
+ * Post-execution: push coverage targets for passed tests to the registry.
+ * Fire-and-forget — never throws.
+ */
+async function runWorkspaceCoveragePush({ client, workspaceId, runId, testResults, testsDir, config }) {
+  if (!client || !workspaceId) return;
+  try {
+    const specFiles = listGeneratedTestFiles(config.projectPath);
+    const targets = [];
+
+    for (const filePath of specFiles) {
+      try {
+        const content = fs.readFileSync(filePath, 'utf-8');
+        const fileName = path.basename(filePath);
+        const signals = extractSpecSignals(content, fileName);
+
+        for (const route of signals.routes || []) {
+          targets.push({ type: 'route', key: route, fileName });
+        }
+        for (const api of signals.apiEndpoints || []) {
+          targets.push({ type: 'api', key: api, fileName });
+        }
+        for (const cat of signals.catMarkers || []) {
+          targets.push({ type: 'category', key: cat, fileName });
+        }
+        for (const req of signals.reqMarkers || []) {
+          targets.push({ type: 'requirement', key: req, fileName });
+        }
+      } catch { /* skip */ }
+    }
+
+    if (targets.length > 0) {
+      await client.pushWorkspaceCoverage({ workspaceId, runId, targets });
+      Logger.info('WorkspaceSync', `Pushed ${targets.length} coverage targets`, { workspaceId });
+    }
+  } catch (err) {
+    Logger.warn('WorkspaceSync', 'Coverage push failed (non-blocking)', { message: err.message });
+  }
+}
+
 /**
  * Main pipeline function.
  */
@@ -7128,6 +7272,7 @@ async function runPipeline(config, runId) {
   let phaseResults = null;
   let routeAccessSummary = null;
   const aiOnlyEnforced = strictAIEnabled(config);
+  let workspaceState = null; // populated by pre-flight if shared workspace found
 
   updateStatus(statusDir, 'started', {
     runId,
@@ -7143,6 +7288,51 @@ async function runPipeline(config, runId) {
   });
 
   try {
+    // -------------------------------------------------------
+    // -1. Workspace pre-flight sync (team test sharing)
+    // -------------------------------------------------------
+    // Pull shared test files from the team workspace and write them to
+    // tests/generated/ so the planner + coverage top-up see teammates' work.
+    // Completely non-blocking — any failure falls back to solo mode.
+    const testsDir = path.join(config.projectPath, 'tests', 'generated');
+    workspaceState = await runWorkspacePreflight({ client: durableClient, config, testsDir });
+    if (workspaceState) {
+      updateStatus(statusDir, 'workspace_sync', {
+        runId,
+        message: workspaceState.filesWritten > 0
+          ? `Workspace sync: pulled ${workspaceState.filesWritten} test file(s) from teammates`
+          : 'Workspace sync: team suite up to date (no new files)',
+        workspaceId: workspaceState.workspaceId,
+        filesWritten: workspaceState.filesWritten,
+        coveredRoutes: (workspaceState.teamCoverage?.routes || []).length,
+      }, telemetryReporter);
+    }
+    if (workspaceState?.teamCoverage) {
+      const tc = workspaceState.teamCoverage;
+      config = {
+        ...config,
+        _workspaceId: workspaceState.workspaceId,
+        _workspaceTeamCoverage: tc,
+        generationFeedback: {
+          ...(config.generationFeedback || {}),
+          existingSuiteManifest: {
+            ...(config.generationFeedback?.existingSuiteManifest || {}),
+            covered: {
+              routes: tc.routes || [],
+              apiEndpoints: tc.apiEndpoints || [],
+              catMarkers: tc.categories || [],
+              reqMarkers: tc.requirements || [],
+            },
+          },
+        },
+      };
+      Logger.info('PipelineWorker', 'Injected team coverage manifest into planner context', {
+        coveredRoutes: (tc.routes || []).length,
+        coveredApis: (tc.apiEndpoints || []).length,
+        coveredCategories: (tc.categories || []).length,
+      });
+    }
+
     // -------------------------------------------------------
     // 0. Port pre-flight check (must run before test generation)
     // -------------------------------------------------------
@@ -8202,6 +8392,19 @@ async function runPipeline(config, runId) {
       }
     }
 
+    // -------------------------------------------------------
+    // Workspace post-gen sync: push newly written test files
+    // -------------------------------------------------------
+    if (workspaceState?.workspaceId) {
+      await runWorkspacePostGenSync({
+        client: durableClient,
+        workspaceId: workspaceState.workspaceId,
+        testsDir: path.join(config.projectPath, 'tests', 'generated'),
+        runId,
+        config,
+      });
+    }
+
     let testResults;
 
     testResults = await withStageBudget(runBudget, 'execution', async () => {
@@ -8258,6 +8461,19 @@ async function runPipeline(config, runId) {
       passed: testResults.passed,
       failed: testResults.failed,
     });
+
+    // Workspace post-execution: push coverage registry (fire-and-forget)
+    if (workspaceState?.workspaceId) {
+      runWorkspaceCoveragePush({
+        client: durableClient,
+        workspaceId: workspaceState.workspaceId,
+        runId,
+        testResults,
+        testsDir: path.join(config.projectPath, 'tests', 'generated'),
+        config,
+      }).catch(() => undefined);
+    }
+
     phaseResults = testResults.phaseResults || null;
     if (generationMeta && testResults.tierBAuthPass) {
       generationMeta.tierBAuthPass = testResults.tierBAuthPass;

@@ -870,6 +870,133 @@ class WebappClient {
     });
   }
 
+  async _get(path, { timeoutMs } = {}) {
+    const url = `${this.dashboardUrl}${path}`;
+    const fetchFn = getFetch();
+    const limit = Number.isFinite(timeoutMs) ? timeoutMs : 30_000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), limit);
+    let response;
+    try {
+      response = await fetchFn(url, {
+        method: 'GET',
+        headers: { 'x-api-key': this.apiKey || '' },
+        signal: controller.signal,
+      });
+    } catch (networkErr) {
+      clearTimeout(timer);
+      if (networkErr.name === 'AbortError') {
+        const err = new Error(`Healix webapp GET timed out after ${limit}ms: ${path}`);
+        err.code = 'WEBAPP_TIMEOUT';
+        throw err;
+      }
+      const err = new Error(`Cannot reach Healix webapp at ${url}: ${networkErr.message}`);
+      err.code = 'WEBAPP_UNREACHABLE';
+      throw err;
+    }
+    clearTimeout(timer);
+
+    let payload = null;
+    const rawText = await response.text().catch(() => '');
+    try { payload = rawText ? JSON.parse(rawText) : null; } catch { payload = null; }
+
+    if (!response.ok) {
+      const detail = payload?.error || rawText.slice(0, 400) || `HTTP ${response.status}`;
+      const err = new Error(`Healix webapp GET ${path} failed (${response.status}): ${detail}`);
+      err.code = response.status === 401 ? 'INVALID_API_KEY' :
+                 response.status === 403 ? 'WORKSPACE_ACCESS_DENIED' :
+                 response.status === 404 ? 'NOT_FOUND' :
+                 response.status >= 500 ? 'WEBAPP_SERVER_ERROR' : 'WEBAPP_ERROR';
+      err.status = response.status;
+      err.payload = payload;
+      throw err;
+    }
+    return payload;
+  }
+
+  // ── Workspace sync methods ──────────────────────────────────────────────────
+
+  /**
+   * Resolve a workspace for the given project key.
+   * Returns { workspaceId, role, projectName, ... } or null if no workspace.
+   * Returns null (non-throwing) when the workspace doesn't exist (solo mode).
+   * Throws on auth errors so the pipeline can surface them.
+   */
+  async resolveWorkspace({ projectKey }) {
+    if (!this.apiKey || !projectKey) return null;
+    try {
+      return await this._get(
+        `/api/workspaces/resolve?projectKey=${encodeURIComponent(projectKey)}`,
+        { timeoutMs: 10_000 }
+      );
+    } catch (err) {
+      if (err.status === 404) return { found: false };
+      if (err.status === 403) {
+        Logger.warn('WebappClient', 'Workspace found but not a member — running solo', {
+          projectKey,
+          hint: 'Join the workspace via invite code in the Healix dashboard.',
+        });
+        return null;
+      }
+      if (err.code === 'WORKSPACE_REQUIRES_PAID_PLAN' || err.status === 403) return null;
+      Logger.warn('WebappClient', 'resolveWorkspace failed (non-blocking)', { code: err.code, message: err.message });
+      return null;
+    }
+  }
+
+  /** Pull all shared test files for a workspace. Returns [] on any error. */
+  async pullWorkspaceTestFiles({ workspaceId }) {
+    if (!this.apiKey || !workspaceId) return [];
+    try {
+      const data = await this._get(`/api/workspaces/${workspaceId}/test-files`, { timeoutMs: 60_000 });
+      return Array.isArray(data?.files) ? data.files : [];
+    } catch (err) {
+      Logger.warn('WebappClient', 'pullWorkspaceTestFiles failed (non-blocking)', { code: err.code, message: err.message });
+      return [];
+    }
+  }
+
+  /** Push generated test files to the workspace. Fire-and-forget safe. */
+  async pushWorkspaceTestFiles({ workspaceId, files }) {
+    if (!this.apiKey || !workspaceId || !Array.isArray(files) || files.length === 0) return null;
+    try {
+      return await this._post(
+        `/api/workspaces/${workspaceId}/test-files`,
+        { files },
+        { timeoutMs: 60_000 }
+      );
+    } catch (err) {
+      Logger.warn('WebappClient', 'pushWorkspaceTestFiles failed (non-blocking)', { code: err.code, message: err.message });
+      return null;
+    }
+  }
+
+  /** Pull the aggregated coverage manifest for a workspace. Returns null on error. */
+  async pullWorkspaceCoverage({ workspaceId }) {
+    if (!this.apiKey || !workspaceId) return null;
+    try {
+      return await this._get(`/api/workspaces/${workspaceId}/coverage`, { timeoutMs: 15_000 });
+    } catch (err) {
+      Logger.warn('WebappClient', 'pullWorkspaceCoverage failed (non-blocking)', { code: err.code, message: err.message });
+      return null;
+    }
+  }
+
+  /** Append coverage entries after test execution. Fire-and-forget safe. */
+  async pushWorkspaceCoverage({ workspaceId, runId, targets }) {
+    if (!this.apiKey || !workspaceId || !Array.isArray(targets) || targets.length === 0) return null;
+    try {
+      return await this._post(
+        `/api/workspaces/${workspaceId}/coverage`,
+        { runId: runId || null, targets },
+        { timeoutMs: 15_000 }
+      );
+    } catch (err) {
+      Logger.warn('WebappClient', 'pushWorkspaceCoverage failed (non-blocking)', { code: err.code, message: err.message });
+      return null;
+    }
+  }
+
   /**
    * Fire-and-forget durable phase write. If the webapp is unreachable, the call
    * fails silently — the pipeline must never block on this best-effort state.
