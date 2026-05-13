@@ -283,7 +283,20 @@ class WebappClient {
    * Same return shape as `generateTests` (tests[], generationMeta, agentRuns);
    * just narrower — typically a single agent's tests.
    */
-  async generateTestsForAgent({ agent, context, prd, parsedPRD, explorationArtifact, roles, testType, projectInfo, options, transportTimeoutMs }) {
+  async generateTestsForAgent({
+    agent,
+    context,
+    prd,
+    parsedPRD,
+    explorationArtifact,
+    roles,
+    testType,
+    projectInfo,
+    options,
+    transportTimeoutMs,
+    transportRetryDelaysMs,
+    transportRetryMaxElapsedMs,
+  }) {
     this._assertKey('/api/generate-tests');
     if (!KNOWN_AGENTS.includes(agent)) {
       const err = new Error(
@@ -315,8 +328,12 @@ class WebappClient {
         // layer. If the socket drops after minutes, retrying duplicates the
         // whole agent and burns the pipeline budget. Retry only immediate
         // connection flakes.
-        retryDelaysMs: [0, 1000],
-        retryMaxElapsedMs: 15_000,
+        retryDelaysMs: Array.isArray(transportRetryDelaysMs) && transportRetryDelaysMs.length > 0
+          ? transportRetryDelaysMs
+          : [0, 1000],
+        retryMaxElapsedMs: Number.isFinite(Number(transportRetryMaxElapsedMs))
+          ? Number(transportRetryMaxElapsedMs)
+          : 15_000,
       }
     );
   }

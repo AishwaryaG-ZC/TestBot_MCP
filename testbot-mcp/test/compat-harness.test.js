@@ -136,6 +136,7 @@ test('form extraction detects React hook and Zod required fields', () => {
   `, path.join(process.cwd(), 'app/projects/[slug]/issues/new/page.tsx'));
 
   assert.equal(forms.length, 1);
+  assert.equal(forms[0].componentName, 'NewIssuePage');
   assert.ok(forms[0].fields.some((field) => field.name === 'title' && field.required === true));
   assert.ok(forms[0].fields.some((field) => field.name === 'email' && field.required === true));
 });

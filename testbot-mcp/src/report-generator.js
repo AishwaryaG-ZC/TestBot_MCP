@@ -483,6 +483,10 @@ class ReportGenerator {
         generator: 'healix-mcp',
         runId: this.stripAnsiAndNormalize(runId || null),
         generationMeta: generationMeta || null,
+        pipelineDecisionSummary: this.stripAnsiAndNormalize(generationMeta?.pipelineDecisionSummary || null),
+        pipelineDecisionLogPath: generationMeta?.pipelineDecisionLogPath
+          ? this.normalizePathForReport(generationMeta.pipelineDecisionLogPath)
+          : null,
         qaContractSummary: this.stripAnsiAndNormalize(generationMeta?.qaContractSummary || null),
         qaContractCoverage: this.stripAnsiAndNormalize(generationMeta?.qaContractCoverage || null),
         qaContractWarnings: this.stripAnsiAndNormalize(generationMeta?.qaContractWarnings || []),

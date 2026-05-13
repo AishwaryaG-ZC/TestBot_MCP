@@ -18,12 +18,20 @@ const {
   buildGenerationRepairContext,
   minimumUsefulRunnableFloor,
   adaptiveRunnableFloor,
+  effectiveRetainedRunnableFloor,
   shouldAttemptCoverageTopUp,
   collectGenerationQuality,
   buildExistingSuiteManifest,
+  buildFailedAgentRetryMetadata,
+  buildCoverageRetryMetadata,
   countSkippedTestsInContent,
   countTestsInContent,
   evaluateGenerationQualityGates,
+  maybeRunCoverageTopUp,
+  recordRunDecision,
+  readRunDecisionEvents,
+  buildPipelineDecisionSummary,
+  boundDecisionMetadata,
   hasApiSurfaceForGeneration,
   effectiveApiEndpoints,
   auditGeneratedTestQuality,
@@ -42,6 +50,8 @@ const {
   pruneGeneratedTestsByQuality,
   quarantineGeneratedSpecFiles,
   filterDeltaTopUpTests,
+  normalizeGeneratedRouteFamily,
+  assessQualityRecoveryNetBenefit,
   salvageGeneratedTestValidation,
   ensureHealixValidationConfig,
   safeWriteGeneratedTest,
@@ -88,6 +98,143 @@ function withTempProject(fn) {
     throw error;
   }
 }
+
+test('pipeline decision logger appends sanitized JSONL and emits telemetry', () => {
+  withTempProject((projectPath) => {
+    const statusDir = path.join(projectPath, 'healix-reports', '.runs', 'decision-run');
+    const emitted = [];
+    const telemetryReporter = {
+      isEnabled: () => true,
+      emitBackground: (event) => emitted.push(event),
+    };
+
+    const longSpec = `import { test } from '@playwright/test';\n${'x'.repeat(2200)}`;
+    recordRunDecision(statusDir, telemetryReporter, {
+      runId: 'decision-run',
+      decisionType: 'auth_decision',
+      phase: 'auth_injecting',
+      status: 'warning',
+      message: 'Auth flow reused verified storage state.',
+      metadata: {
+        username: 'admin@example.com',
+        password: 'SuperSecret123',
+        authorization: 'Bearer token-secret',
+        cookie: 'sid=session-secret',
+        nested: {
+          supabaseAnonKey: 'anon-secret',
+          keep: 'safe-value',
+        },
+        firstSpecPreview: longSpec,
+      },
+    });
+
+    const events = readRunDecisionEvents(statusDir);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].eventType, 'pipeline_decision');
+    assert.equal(events[0].decisionType, 'auth_decision');
+    assert.equal(events[0].status, 'warning');
+    assert.equal(events[0].metadata.password, '[REDACTED]');
+    assert.equal(events[0].metadata.authorization, '[REDACTED]');
+    assert.equal(events[0].metadata.cookie, '[REDACTED]');
+    assert.equal(events[0].metadata.nested.supabaseAnonKey, '[REDACTED]');
+    assert.equal(events[0].metadata.nested.keep, 'safe-value');
+    assert.equal(typeof events[0].metadata.firstSpecPreview.sha256, 'string');
+    assert.equal(events[0].metadata.firstSpecPreview.length, longSpec.length);
+    assert.match(events[0].metadata.firstSpecPreview.preview, /truncated/);
+
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0].eventType, 'pipeline_decision');
+    assert.equal(emitted[0].metadata.password, '[REDACTED]');
+  });
+});
+
+test('pipeline decision metadata is bounded without losing serializability', () => {
+  const metadata = boundDecisionMetadata({
+    files: Array.from({ length: 120 }, (_, index) => ({
+      filename: `file-${index}.spec.ts`,
+      stderr: `error ${index}`,
+    })),
+    credentials: {
+      apiKey: 'secret',
+    },
+  });
+
+  const serialized = JSON.stringify(metadata);
+  assert.ok(serialized.length <= 26000);
+  assert.equal(serialized.includes('secret'), false);
+  assert.ok(Array.isArray(metadata.files));
+  assert.equal(metadata.files.length, 61);
+  assert.match(metadata.files[60], /truncated/);
+  assert.equal(metadata.files[0].stderr, 'error 0');
+});
+
+test('pipeline decision summary captures retained-suite gate inputs and retryable top-up no-delta', () => {
+  withTempProject((projectPath) => {
+    const statusDir = path.join(projectPath, 'healix-reports', '.runs', 'retained-run');
+    recordRunDecision(statusDir, null, {
+      runId: 'retained-run',
+      decisionType: 'top_up_decision',
+      phase: 'generation_top_up',
+      status: 'warning',
+      message: 'Coverage top-up produced no new valid delta.',
+      metadata: {
+        topUpStatus: 'no_new_valid_delta',
+        target: 50,
+        minimumUsefulRunnableFloor: 12,
+        runnableTests: 19,
+        retryAvailable: true,
+      },
+    });
+    recordRunDecision(statusDir, null, {
+      runId: 'retained-run',
+      decisionType: 'quality_recovery_decision',
+      phase: 'generation_quality_recovery',
+      status: 'warning',
+      message: 'Hard blockers quarantined; retained suite remains executable.',
+      metadata: {
+        preRecoveryRunnableTests: 19,
+        postRecoveryRunnableTests: 9,
+        retainedSuite: {
+          preRecoveryRunnableTests: 19,
+          postRecoveryRunnableTests: 9,
+          originalRunnableFloor: 12,
+          effectiveRunnableFloor: 8,
+          executionAllowedAfterHardQuarantine: true,
+        },
+        quarantinedFileReasons: [{ filename: 'api-site.spec.ts', reason: 'hard_quality_blocker' }],
+      },
+    });
+    recordRunDecision(statusDir, null, {
+      runId: 'retained-run',
+      decisionType: 'final_gating_decision',
+      phase: 'generation_quality',
+      status: 'warning',
+      message: 'Retained suite cleared recovery-adjusted useful floor.',
+      metadata: {
+        target: 50,
+        originalMinimumUsefulRunnableFloor: 12,
+        effectiveRunnableFloor: 8,
+        runnableTestsActual: 9,
+        retainedSuite: {
+          preRecoveryRunnableTests: 19,
+          postRecoveryRunnableTests: 9,
+          effectiveRunnableFloor: 8,
+        },
+      },
+    });
+
+    const summary = buildPipelineDecisionSummary(statusDir);
+    assert.equal(summary.total, 3);
+    assert.equal(summary.byType.top_up_decision, 1);
+    assert.equal(summary.byType.quality_recovery_decision, 1);
+    assert.equal(summary.byType.final_gating_decision, 1);
+    assert.equal(summary.byStatus.warning, 3);
+    assert.equal(summary.finalGating.metadata.effectiveRunnableFloor, 8);
+    assert.equal(summary.finalGating.metadata.retainedSuite.postRecoveryRunnableTests, 9);
+    assert.equal(summary.notable.length, 3);
+    assert.match(summary.logPath, /pipeline-events\.jsonl$/);
+  });
+});
 
 test('QA contracts detect source-derived filter, delete, and form obligations', () => {
   withTempProject((projectPath) => {
@@ -351,6 +498,55 @@ test('QA form contracts require concrete URLs for dynamic Next routes', () => {
   });
 });
 
+test('QA form contracts map shared React Router files by route component', async () => {
+  await withTempProject(async (projectPath) => {
+    const srcDir = path.join(projectPath, 'src');
+    fs.mkdirSync(srcDir, { recursive: true });
+    const appPath = path.join(srcDir, 'App.tsx');
+    fs.writeFileSync(appPath, `
+      import { Routes, Route } from 'react-router-dom';
+      function Overview() {
+        return <main><h1>Home</h1></main>;
+      }
+      function Plan() {
+        return (
+          <main>
+            <h1>Renewal Plan</h1>
+            <form>
+              <input name="accountName" required />
+              <button type="submit">Save plan</button>
+            </form>
+          </main>
+        );
+      }
+      export default function App() {
+        return (
+          <Routes>
+            <Route path="/" element={<Overview />} />
+            <Route path="/plan" element={<Plan />} />
+          </Routes>
+        );
+      }
+    `);
+
+    const gatherer = new ContextGatherer({ projectPath, language: 'typescript' });
+    const pages = await gatherer.findReactRouterRoutes(projectPath);
+    const forms = gatherer.extractFormsFromFile(fs.readFileSync(appPath, 'utf8'), appPath);
+
+    assert.equal(pages.find((page) => page.path === '/')?.routeComponent, 'Overview');
+    assert.equal(pages.find((page) => page.path === '/plan')?.routeComponent, 'Plan');
+    assert.equal(forms[0].componentName, 'Plan');
+
+    const qaContracts = extractQaContracts({
+      projectPath,
+      context: { pages, forms },
+    });
+
+    assert.equal(qaContracts.formValidationContracts.length, 1);
+    assert.equal(qaContracts.formValidationContracts[0].route, '/plan');
+  });
+});
+
 test('quality audit requires runnable QA filter and form contracts to be covered', () => {
   withGeneratedSuite(`
     import { test, expect } from '@playwright/test';
@@ -463,6 +659,95 @@ test('delta top-up manifest rejects duplicate/generated-noise and keeps missing-
     assert.equal(result.rejected.length, 2);
     assert.ok(result.rejected.some((item) => item.reason === 'duplicate_filename'));
     assert.ok(result.rejected.some((item) => item.reason === 'qa_contracts_owned_by_deterministic_pack'));
+  });
+});
+
+test('delta top-up manifest collapses uuid detail routes by route family', () => {
+  const firstProduct = '/shop/11111111-1111-1111-1111-111111111111';
+  const secondProduct = '/shop/22222222-2222-4222-9222-222222222222';
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    test('[CAT:ui_flow] existing product detail', async ({ page }) => {
+      await page.goto('${firstProduct}');
+      await expect(page.getByRole('heading')).toBeVisible();
+    });
+  `, (projectPath) => {
+    assert.equal(normalizeGeneratedRouteFamily(firstProduct), '/shop/:id');
+    assert.equal(normalizeGeneratedRouteFamily(secondProduct), '/shop/:id');
+
+    const manifest = buildExistingSuiteManifest({
+      projectPath,
+      context: {
+        pages: [{ path: firstProduct }, { path: secondProduct }],
+        apiEndpoints: [],
+        forms: [],
+        workflows: [],
+      },
+      testType: 'frontend',
+      routeAccessSummary: { publicRoutes: [firstProduct, secondProduct], protectedRoutes: [] },
+    });
+
+    assert.deepEqual(manifest.missing.routes, []);
+    assert.ok(manifest.covered.routeFamilies.includes('/shop/:id'));
+
+    const result = filterDeltaTopUpTests({
+      existingSuiteManifest: manifest,
+      usedFilenames: new Set(['generated.spec.ts']),
+      incoming: [{
+        filename: 'second-product.spec.ts',
+        content: `import { test } from '@playwright/test'; test('second product repeats covered family', async ({ page }) => { await page.goto('${secondProduct}'); });`,
+      }],
+    });
+
+    assert.equal(result.accepted.length, 0);
+    assert.equal(result.rejected[0].reason, 'no_missing_surface_targeted');
+  });
+});
+
+test('delta top-up rejects duplicate titles requirements and incoming filenames', () => {
+  withGeneratedSuite(`
+    import { test } from '@playwright/test';
+    test('[REQ:F1] existing route title', async ({ page }) => {
+      await page.goto('/dashboard');
+    });
+  `, (projectPath) => {
+    const manifest = buildExistingSuiteManifest({
+      projectPath,
+      context: {
+        pages: [{ path: '/dashboard' }, { path: '/settings' }, { path: '/billing' }],
+        apiEndpoints: [],
+      },
+      testType: 'frontend',
+      routeAccessSummary: { publicRoutes: ['/dashboard', '/settings', '/billing'], protectedRoutes: [] },
+    });
+    const result = filterDeltaTopUpTests({
+      existingSuiteManifest: manifest,
+      usedFilenames: new Set(['generated.spec.ts']),
+      incoming: [
+        {
+          filename: 'settings.spec.ts',
+          content: `import { test } from '@playwright/test'; test('[REQ:F1] existing route title', async ({ page }) => { await page.goto('/settings'); });`,
+        },
+        {
+          filename: 'billing.spec.ts',
+          content: `import { test } from '@playwright/test'; test('[REQ:F1] repeats requirement only', async ({ page }) => { await page.goto('/billing'); });`,
+        },
+        {
+          filename: 'shared.spec.ts',
+          content: `import { test } from '@playwright/test'; test('[REQ:F2] settings delta', async ({ page }) => { await page.goto('/settings'); });`,
+        },
+        {
+          filename: 'shared.spec.ts',
+          content: `import { test } from '@playwright/test'; test('[REQ:F3] billing delta', async ({ page }) => { await page.goto('/billing'); });`,
+        },
+      ],
+    });
+
+    assert.equal(result.accepted.length, 1);
+    assert.equal(result.accepted[0].filename, 'healix-topup-shared.spec.ts');
+    assert.ok(result.rejected.some((item) => item.reason === 'duplicate_test_title'));
+    assert.ok(result.rejected.some((item) => item.reason === 'duplicate_requirement_markers'));
+    assert.ok(result.rejected.some((item) => item.reason === 'duplicate_filename'));
   });
 });
 
@@ -876,6 +1161,81 @@ test('quality gates fail below minimum useful runnable floor after top-up', () =
   });
 });
 
+test('quality gates execute retained suite after hard quarantine using recovery-adjusted floor', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    ${generatedRunnableTests(9)}
+  `, (projectPath) => {
+    const quality = collectGenerationQuality(projectPath);
+    quality.retainedSuite = {
+      type: 'retained_suite_after_hard_quarantine',
+      preRecoveryRunnableTests: 19,
+      postRecoveryRunnableTests: 9,
+      originalRunnableFloor: 12,
+      effectiveRunnableFloor: effectiveRetainedRunnableFloor({
+        originalFloor: 12,
+        preRecoveryRunnableTests: 19,
+      }),
+      qualityRecoveryCoverageLoss: 10,
+      executionAllowedAfterHardQuarantine: true,
+      quarantinedFileReasons: [{ filename: 'api-site.spec.ts', reason: 'hard_quality_blocker' }],
+    };
+
+    const gate = evaluateGenerationQualityGates({
+      config: { projectPath, testType: 'both', coverageProfile: 'qa-max', minGeneratedTests: 50 },
+      context: { pages: Array.from({ length: 9 }, (_, index) => ({ path: `/route-${index}` })) },
+      quality,
+      prdContent: '',
+      parsedPRD: {},
+      requirementsCoverage: {},
+    });
+
+    assert.equal(effectiveRetainedRunnableFloor({ originalFloor: 12, preRecoveryRunnableTests: 19 }), 8);
+    assert.equal(gate.ok, true);
+    assert.equal(gate.result.qualityGateStatus, 'warning');
+    assert.equal(gate.result.minimumUsefulRunnableFloor, 8);
+    assert.equal(gate.result.originalMinimumUsefulRunnableFloor, 12);
+    assert.equal(gate.result.retainedSuite.preRecoveryRunnableTests, 19);
+    assert.equal(gate.result.retainedSuite.postRecoveryRunnableTests, 9);
+    assert.equal(gate.result.executionAllowedDespiteWarnings, true);
+    assert.ok(gate.result.qualityWarnings.some((warning) => warning.code === 'RETAINED_SUITE_AFTER_HARD_QUARANTINE'));
+  });
+});
+
+test('quality gates fail retained suite below recovery-adjusted floor', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    ${generatedRunnableTests(4)}
+  `, (projectPath) => {
+    const quality = collectGenerationQuality(projectPath);
+    quality.retainedSuite = {
+      type: 'retained_suite_after_hard_quarantine',
+      preRecoveryRunnableTests: 19,
+      postRecoveryRunnableTests: 4,
+      originalRunnableFloor: 12,
+      effectiveRunnableFloor: 8,
+      qualityRecoveryCoverageLoss: 15,
+      executionAllowedAfterHardQuarantine: false,
+    };
+
+    const gate = evaluateGenerationQualityGates({
+      config: { projectPath, testType: 'both', coverageProfile: 'qa-max', minGeneratedTests: 50 },
+      context: { pages: Array.from({ length: 4 }, (_, index) => ({ path: `/route-${index}` })) },
+      quality,
+      prdContent: '',
+      parsedPRD: {},
+      requirementsCoverage: {},
+    });
+
+    assert.equal(gate.ok, false);
+    assert.equal(gate.error.code, 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE');
+    assert.equal(gate.error.generationQuality.minimumUsefulRunnableFloor, 8);
+    assert.equal(gate.error.generationQuality.originalMinimumUsefulRunnableFloor, 12);
+    assert.match(gate.error.message, /Retained runnable tests 4 below recovery-adjusted useful floor 8/);
+    assert.equal(gate.error.generationQuality.qualityWarnings[0].message.includes('executing because'), false);
+  });
+});
+
 test('coverage top-up decision runs once for nonzero suites below target', () => {
   const decision = shouldAttemptCoverageTopUp({
     config: { minGeneratedTests: 50 },
@@ -898,6 +1258,163 @@ test('coverage top-up decision runs once for nonzero suites below target', () =>
   });
   assert.equal(targetMet.attempt, false);
   assert.equal(targetMet.reason, 'target_met');
+});
+
+test('coverage top-up WEBAPP_UNREACHABLE preserves useful pre-topup suite', async () => {
+  await withTempProject(async (projectPath) => {
+    const generatedDir = path.join(projectPath, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'pretopup.spec.ts'), `
+      import { test, expect } from '@playwright/test';
+      ${generatedRunnableTests(12)}
+    `);
+
+    const err = new Error('fetch failed');
+    err.code = 'WEBAPP_UNREACHABLE';
+    const event = await maybeRunCoverageTopUp({
+      client: {
+        async generateTestsForAgent() {
+          throw err;
+        },
+      },
+      sharedPayload: {
+        context: { pages: Array.from({ length: 12 }, (_, index) => ({ path: `/route-${index}` })) },
+        projectInfo: { baseURL: 'http://127.0.0.1:5173' },
+        testType: 'frontend',
+        options: {},
+      },
+      testsDir: generatedDir,
+      usedFilenames: new Set(['pretopup.spec.ts']),
+      files: [{ filename: 'pretopup.spec.ts' }],
+      config: {
+        projectPath,
+        baseURL: 'http://127.0.0.1:5173',
+        testType: 'frontend',
+        coverageProfile: 'qa-max',
+        minGeneratedTests: 50,
+      },
+    });
+
+    assert.equal(event.status, 'failed');
+    assert.equal(event.topUpErrorCode, 'WEBAPP_UNREACHABLE');
+    assert.equal(event.continuedWithPreTopUpSuite, true);
+    assert.ok(event.coverageRetry);
+    assert.equal(event.coverageRetry.request.context.generationFeedback.mode, 'coverage_top_up_retry_delta');
+    assert.equal(event.coverageRetry.request.agents[0], 'expansion');
+    assert.equal(fs.existsSync(path.join(generatedDir, 'pretopup.spec.ts')), true);
+
+    const quality = collectGenerationQuality(projectPath);
+    const gate = evaluateGenerationQualityGates({
+      config: { projectPath, testType: 'frontend', coverageProfile: 'qa-max', minGeneratedTests: 50 },
+      context: { pages: Array.from({ length: 12 }, (_, index) => ({ path: `/route-${index}` })) },
+      quality,
+      prdContent: '',
+      parsedPRD: {},
+      requirementsCoverage: {},
+    });
+    assert.equal(gate.ok, true);
+    assert.equal(gate.result.qualityGateStatus, 'warning');
+  });
+});
+
+test('coverage retry metadata stores append-only expansion payload from suite manifest', () => {
+  withTempProject((projectPath) => {
+    const generatedDir = path.join(projectPath, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'smoke.spec.ts'), `
+      import { test, expect } from '@playwright/test';
+      test('[REQ:home] [CAT:ui_flow] home renders', async ({ page }) => {
+        await page.goto('/');
+        await expect(page.getByRole('heading', { name: 'Home' })).toBeVisible();
+      });
+    `);
+
+    const retry = buildCoverageRetryMetadata({
+      config: { projectPath, testType: 'frontend', minGeneratedTests: 50, coverageProfile: 'qa-max' },
+      runId: 'coverage-retry-run',
+      reason: 'no_new_valid_delta',
+      sharedPayload: {
+        context: {
+          pages: [
+            { path: '/', sourceFile: 'src/App.tsx', headings: ['Home'] },
+            { path: '/about', sourceFile: 'src/About.tsx', headings: ['About'] },
+          ],
+          authProbe: { token: 'session-token-secret' },
+        },
+        prd: 'Home and about pages must render',
+        roles: [{ role: 'admin', username: 'admin@example.com', password: 'secret' }],
+        testType: 'frontend',
+        projectInfo: { name: 'Coverage Fixture' },
+        options: { minGeneratedTests: 50 },
+      },
+      retainedSuite: {
+        preRecoveryRunnableTests: 19,
+        postRecoveryRunnableTests: 9,
+        effectiveRunnableFloor: 8,
+        originalRunnableFloor: 12,
+      },
+    });
+
+    assert.ok(retry.available);
+    assert.equal(retry.request.agents[0], 'expansion');
+    assert.equal(retry.request.context.generationFeedback.mode, 'coverage_top_up_retry_delta');
+    assert.equal(retry.request.context.generationFeedback.retainedSuite.postRecoveryRunnableTests, 9);
+    assert.ok(retry.existingSuiteManifest.covered.reqMarkers.includes('home'));
+    assert.equal(JSON.stringify(retry.request).includes('admin@example.com'), false);
+    assert.equal(JSON.stringify(retry.request).includes('secret'), false);
+    assert.equal(JSON.stringify(retry.request).includes('session-token-secret'), false);
+  });
+});
+
+test('failed-agent retry metadata stores append-only retry payload without credential secrets', () => {
+  withTempProject((projectPath) => {
+    const generatedDir = path.join(projectPath, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'smoke.spec.ts'), `
+      import { test, expect } from '@playwright/test';
+      test('[REQ:home] [CAT:ui_flow] home renders', async ({ page }) => {
+        await page.goto('/');
+        await expect(page.getByRole('heading', { name: 'Home' })).toBeVisible();
+      });
+    `);
+
+    const retry = buildFailedAgentRetryMetadata({
+      agentFailures: [{ agent: 'frontend', code: 'WEBAPP_TIMEOUT', message: 'timed out' }],
+      agentsRequested: ['smoke', 'frontend', 'workflow'],
+      agentsCompleted: ['smoke'],
+      config: { projectPath, testType: 'frontend', minGeneratedTests: 50 },
+      runId: 'retry-run',
+      agentTransportTimeoutMs: 120000,
+      sharedPayload: {
+        context: {
+          pages: [{ path: '/', sourceFile: 'src/App.tsx' }],
+          authProbe: { token: 'session-token-secret', cookie: 'auth-cookie-secret' },
+        },
+        prd: 'Home must render',
+        roles: [{ role: 'admin', username: 'admin@example.com', password: 'secret', loginVerified: true, storageStatePath: '.healix/auth.json' }],
+        testType: 'frontend',
+        projectInfo: {
+          name: 'Retry Fixture',
+          testCredentials: [{ role: 'admin', username: 'admin@example.com', password: 'secret' }],
+        },
+        options: { minGeneratedTests: 50, coverageProfile: 'qa-max' },
+      },
+    });
+
+    assert.ok(retry);
+    assert.deepEqual(retry.agents, ['frontend']);
+    assert.equal(retry.request.roles[0].password, undefined);
+    assert.equal(retry.request.roles[0].username, undefined);
+    assert.equal(retry.request.roles[0].storageStatePath, '.healix/auth.json');
+    assert.equal(retry.request.context.generationFeedback.mode, 'failed_agent_retry_delta');
+    assert.ok(retry.existingSuiteManifest.covered.reqMarkers.includes('home'));
+    assert.ok(retry.recommendedTimeoutMs > 120000);
+    const serializedRequest = JSON.stringify(retry.request);
+    assert.equal(serializedRequest.includes('admin@example.com'), false);
+    assert.equal(serializedRequest.includes('secret'), false);
+    assert.equal(serializedRequest.includes('session-token-secret'), false);
+    assert.equal(serializedRequest.includes('auth-cookie-secret'), false);
+  });
 });
 
 test('quality gates allow small targets at the minimum useful floor', () => {
@@ -977,6 +1494,13 @@ test('pipeline error classifier treats min-count and useful-floor failures as ge
   assert.equal(insufficient.stage, 'generation');
   assert.equal(insufficient.reason, 'insufficient_runnable_coverage');
   assert.equal(insufficient.errorCode, 'INSUFFICIENT_RUNNABLE_COVERAGE');
+
+  const retained = classifyPipelineErrorFromStderr({
+    stderr: 'Retained runnable tests 4 below recovery-adjusted useful floor 8 after hard quality quarantine.',
+  });
+  assert.equal(retained.stage, 'generation');
+  assert.equal(retained.reason, 'insufficient_retained_runnable_coverage');
+  assert.equal(retained.errorCode, 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE');
 });
 
 test('pipeline error classifier treats occupied unreachable target port as setup failure', () => {
@@ -1084,6 +1608,62 @@ test('quality audit accepts UI specs grounded to source files and observed route
     });
 
     assert.equal(audit.valid, true);
+  });
+});
+
+test('quality audit treats deterministic QA contract specs as source-grounded obligations', () => {
+  withTempProject((projectPath) => {
+    const srcDir = path.join(projectPath, 'src');
+    const generatedDir = path.join(projectPath, 'tests', 'generated');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(srcDir, 'App.tsx'),
+      `export function Plan(){ return <form><input name="accountName" required /><button>Save Plan</button></form> }`,
+    );
+    fs.writeFileSync(
+      path.join(generatedDir, 'healix-qa-contracts.spec.ts'),
+      `
+        import { test, expect } from '@playwright/test';
+        test('[QAC:qac-form-validation-plan-src-app-tsx] [CAT:form_validation] /plan requires accessible inline validation', async ({ page }) => {
+          // [SRC:src/App.tsx] Required fields: accountName.
+          await page.goto('/plan');
+          const form = page.locator('form').first();
+          await expect(form).toBeVisible();
+          await form.locator('button').click();
+          await expect(page.locator('[role="alert"], [aria-invalid="true"]').first()).toBeVisible();
+        });
+      `,
+    );
+
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'frontend',
+      context: {
+        pages: [{ path: '/plan', sourceFile: 'src/App.tsx', description: 'Success plan form' }],
+        sourceContext: {
+          files: [{ file: 'src/App.tsx', routePaths: ['/plan'], assertableText: ['Save Plan'] }],
+          routePaths: ['/plan'],
+          assertableText: ['Save Plan'],
+        },
+        qaContracts: {
+          formValidationContracts: [{
+            id: 'qac-form-validation-plan-src-app-tsx',
+            marker: '[QAC:qac-form-validation-plan-src-app-tsx]',
+            route: '/plan',
+            sourceFile: 'src/App.tsx',
+            requiredFields: [{ name: 'accountName' }],
+            runnable: true,
+          }],
+        },
+      },
+      explorationArtifact: {
+        routes: [{ path: '/plan', requiresAuth: false, forms: [{ fields: [{ name: 'accountName', required: true }] }] }],
+      },
+    });
+
+    assert.equal(audit.valid, true);
+    assert.equal(audit.ungroundedUiFiles.length, 0);
   });
 });
 
@@ -1445,6 +2025,30 @@ test('quality audit allows exact supplied credential fixtures for API auth setup
     });
 
     assert.ok(!audit.errors.some((error) => error.startsWith('hardcoded_unverified_credentials:')));
+  });
+});
+
+test('quality audit normalizes template-literal base URL API requests', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+
+    const BASE = process.env.HEALIX_BASE_URL || 'http://127.0.0.1:3000';
+
+    test('[CAT:api_contract] GET /shop through shared base URL', async ({ request }) => {
+      const res = await request.get(\`\${BASE}/shop\`);
+      expect(res.status()).toBe(200);
+    });
+  `, (projectPath) => {
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'both',
+      context: {
+        apiEndpoints: [{ method: 'GET', path: '/shop' }],
+      },
+    });
+
+    assert.equal(audit.valid, true);
+    assert.equal(audit.errors.some((error) => String(error).startsWith('ungrounded_api_endpoint:')), false);
   });
 });
 
@@ -1900,6 +2504,140 @@ test('quality quarantine removes only file-specific bad generated specs', () => 
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('hard-only quality quarantine keeps soft file issues for execution warnings', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-quality-quarantine-soft-'));
+  try {
+    const generatedDir = path.join(root, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'soft.spec.ts'), `import { test } from '@playwright/test'; test('soft', async () => {});`);
+    fs.writeFileSync(path.join(generatedDir, 'hard.spec.ts'), `import { test } from '@playwright/test'; test('hard', async () => {});`);
+
+    const softRecovery = quarantineGeneratedSpecFiles({
+      projectPath: root,
+      qualityAudit: { errors: ['missing_source_reference:soft.spec.ts'] },
+      reason: 'soft',
+      hardOnly: true,
+    });
+    assert.equal(softRecovery.applied, false);
+    assert.equal(softRecovery.reason, 'no_hard_file_specific_failures');
+    assert.equal(fs.existsSync(path.join(generatedDir, 'soft.spec.ts')), true);
+
+    const hardRecovery = quarantineGeneratedSpecFiles({
+      projectPath: root,
+      qualityAudit: { errors: ['hardcoded_unverified_credentials:hard.spec.ts:user@example.test'] },
+      reason: 'hard',
+      hardOnly: true,
+    });
+    assert.equal(hardRecovery.applied, true);
+    assert.deepEqual(hardRecovery.quarantinedFiles.map((file) => file.filename), ['hard.spec.ts']);
+    assert.equal(fs.existsSync(path.join(generatedDir, 'hard.spec.ts')), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('quality audit prunes source-role and CSS selector mismatches inside mixed specs', () => {
+  withTempProject((projectPath) => {
+    const srcDir = path.join(projectPath, 'src');
+    const generatedDir = path.join(projectPath, 'tests', 'generated');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(srcDir, 'App.tsx'), `
+      export function App() {
+        return <main>
+          <h1>Customer Success Console</h1>
+          <ul><li><strong>Northwind Robotics</strong></li></ul>
+          <select id="risk-filter"><option>High Risk</option></select>
+        </main>
+      }
+    `);
+    fs.writeFileSync(path.join(generatedDir, 'mixed.spec.ts'), `
+      import { test, expect } from '@playwright/test';
+      test('bad source-role selector [SRC:src/App.tsx] [CAT:ui_flow]', async ({ page }) => {
+        await page.goto('/');
+        await expect(page.locator('main').getByRole('link', { name: 'Northwind Robotics', exact: true })).toBeVisible();
+      });
+      test('bad CSS selector [SRC:src/App.tsx] [CAT:ui_flow]', async ({ page }) => {
+        await page.goto('/');
+        await expect(page.locator('main .account-list a').first()).toBeVisible();
+      });
+      test('good grounded selector [SRC:src/App.tsx] [CAT:ui_flow]', async ({ page }) => {
+        await page.goto('/');
+        await expect(page.getByRole('heading', { name: 'Customer Success Console' })).toBeVisible();
+        await expect(page.locator('select#risk-filter')).toBeVisible();
+      });
+    `);
+
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'frontend',
+      context: {
+        pages: [{ path: '/', sourceFile: 'src/App.tsx', selectorHints: ['Customer Success Console', 'High Risk'] }],
+      },
+    });
+
+    assert.equal(audit.valid, false);
+    assert.ok(audit.errors.some((error) => error.startsWith('brittle_source_selector_mismatch:mixed.spec.ts:')));
+
+    const pruning = pruneGeneratedTestsByQuality({ projectPath, qualityAudit: audit, reason: 'selector_mismatch' });
+    assert.equal(pruning.applied, true);
+    assert.equal(pruning.prunedFiles[0].removedTests, 2);
+
+    const remaining = fs.readFileSync(path.join(generatedDir, 'mixed.spec.ts'), 'utf-8');
+    assert.doesNotMatch(remaining, /account-list|Northwind Robotics/);
+    assert.match(remaining, /good grounded selector/);
+  });
+});
+
+test('quality recovery net-benefit rejects collapsing a useful suite below floor or categories', () => {
+  const beforeQuality = {
+    runnableTests: 19,
+    totalTests: 19,
+    categories: {
+      ui_flow: 4,
+      workflow_journey: 2,
+      api_contract: 1,
+      api_negative: 1,
+      api_stress: 1,
+    },
+  };
+  const afterQuality = {
+    runnableTests: 2,
+    totalTests: 2,
+    categories: {
+      ui_flow: 2,
+      workflow_journey: 1,
+      api_contract: 0,
+      api_negative: 0,
+      api_stress: 0,
+    },
+  };
+  const assessment = assessQualityRecoveryNetBenefit({
+    config: { testType: 'both', coverageProfile: 'qa-max', minGeneratedTests: 50 },
+    context: {
+      pages: [{ path: '/' }],
+      apiEndpoints: [{ method: 'GET', path: '/api/products' }],
+    },
+    beforeQuality,
+    afterQuality,
+  });
+
+  assert.equal(assessment.keep, false);
+  assert.equal(assessment.reason, 'would_drop_below_minimum_useful_floor');
+
+  const hardAssessment = assessQualityRecoveryNetBenefit({
+    config: { testType: 'both', coverageProfile: 'qa-max', minGeneratedTests: 50 },
+    context: {
+      pages: [{ path: '/' }],
+      apiEndpoints: [{ method: 'GET', path: '/api/products' }],
+    },
+    beforeQuality,
+    afterQuality,
+    hardRecovery: true,
+  });
+  assert.equal(hardAssessment.keep, true);
 });
 
 test('quality pruning removes only brittle generated test blocks inside a mixed file', () => {

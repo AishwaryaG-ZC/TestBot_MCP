@@ -289,12 +289,21 @@ function applySourceRouteBase(route, file) {
 
 function routeFromFormFile(form, pages = []) {
   const file = form?.file || form?.sourceFile || '';
-  const matchingPage = pages.find((page) =>
+  const sameFilePages = pages.filter((page) =>
     page?.sourceFile && file && String(page.sourceFile) === String(file)
   );
-  if (matchingPage?.path) return applySourceRouteBase(matchingPage.path, file);
+  const componentName = form?.componentName || form?.routeComponent || form?.component || null;
+  if (componentName && sameFilePages.length > 0) {
+    const componentPage = sameFilePages.find((page) =>
+      String(page.routeComponent || '') === String(componentName) ||
+      (Array.isArray(page.components) && page.components.some((name) => String(name) === String(componentName)))
+    );
+    if (componentPage?.path) return applySourceRouteBase(componentPage.path, file);
+  }
   if (form?.path || form?.route) return applySourceRouteBase(form.path || form.route, file);
   if (form?.action && String(form.action).startsWith('/')) return applySourceRouteBase(form.action, file);
+  const matchingPage = sameFilePages[0] || null;
+  if (matchingPage?.path) return applySourceRouteBase(matchingPage.path, file);
 
   const normalized = String(file).replace(/\\/g, '/');
   const appMatch = normalized.match(/(?:^|\/)(?:src\/)?app\/(.+?)\/page\.(?:tsx?|jsx?)$/);
@@ -598,7 +607,7 @@ ${contracts.map((contract) => {
     } else {
       await form.evaluate((node) => (node as HTMLFormElement).requestSubmit());
     }
-    await expect(form.locator('[role="alert"], [aria-invalid="true"]').first(), 'empty required submit should surface accessible inline validation').toBeVisible({ timeout: 2000 });
+    await expect(page.locator('[role="alert"], [aria-invalid="true"]').first(), 'empty required submit should surface accessible inline validation').toBeVisible({ timeout: 2000 });
   });`;
 }).join('\n\n')}
 });

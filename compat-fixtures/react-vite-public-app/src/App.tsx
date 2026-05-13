@@ -59,16 +59,33 @@ export function Accounts() {
 }
 
 export function Plan() {
+  const [submitted, setSubmitted] = useState(false);
   return (
     <Shell>
       <h2>Success Plan</h2>
-      <form aria-label="Success plan form">
+      <form aria-label="Success plan form" noValidate onSubmit={(event) => {
+        event.preventDefault();
+        setSubmitted(true);
+      }}>
         <label htmlFor="account-name">Account Name</label>
-        <input id="account-name" name="accountName" placeholder="Northwind Robotics" required />
+        <input
+          id="account-name"
+          name="accountName"
+          placeholder="Northwind Robotics"
+          required
+          aria-invalid={submitted ? 'true' : undefined}
+        />
         <label htmlFor="renewal-owner">Renewal Owner</label>
-        <input id="renewal-owner" name="renewalOwner" placeholder="Maya Chen" required />
+        <input
+          id="renewal-owner"
+          name="renewalOwner"
+          placeholder="Maya Chen"
+          required
+          aria-invalid={submitted ? 'true' : undefined}
+        />
         <button type="submit">Save Plan</button>
       </form>
+      {submitted ? <p role="alert">Account Name and Renewal Owner are required.</p> : null}
       <p role="status">Plan Saved</p>
     </Shell>
   );

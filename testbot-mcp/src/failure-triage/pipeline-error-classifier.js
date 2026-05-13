@@ -29,6 +29,14 @@
 
 const CLASSIFIERS = [
   {
+    id: 'insufficient_retained_runnable_coverage',
+    test: (s) => /INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE/i.test(s)
+      || /Retained runnable tests \d+ below recovery-adjusted useful floor/i.test(s),
+    stage: 'generation',
+    errorCode: 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE',
+    userFacingMessage: 'Healix quarantined invalid generated specs, but too few retained runnable tests remained after applying the recovery-adjusted floor. Retry a focused coverage top-up or add source-backed routes/forms to improve coverage.',
+  },
+  {
     id: 'insufficient_runnable_coverage',
     test: (s) => /INSUFFICIENT_RUNNABLE_COVERAGE/i.test(s)
       || /Generated runnable tests \d+ below (?:adaptive|minimum useful) floor/i.test(s),

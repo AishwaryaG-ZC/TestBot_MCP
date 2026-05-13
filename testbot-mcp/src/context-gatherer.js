@@ -261,8 +261,10 @@ class ContextGatherer {
     const forms = [];
     
     // Detect form elements
-    const formMatches = content.match(/<form[^>]*>[\s\S]*?<\/form>/gi) || [];
-    const formHookMatches = content.match(/useForm\s*\([^)]*\)/gi) || [];
+    const formMatchRecords = Array.from(content.matchAll(/<form[^>]*>[\s\S]*?<\/form>/gi));
+    const formMatches = formMatchRecords.map((match) => match[0]);
+    const formHookMatchRecords = Array.from(content.matchAll(/useForm\s*\([^)]*\)/gi));
+    const formHookMatches = formHookMatchRecords.map((match) => match[0]);
     const labelsMap = new Map();
 
     const attrValue = (tag, attrName) => {
@@ -465,9 +467,13 @@ class ContextGatherer {
     if (content.includes('email')) validationPatterns.push('email');
     
     if (fields.length > 0 || formMatches.length > 0 || formHookMatches.length > 0) {
+      const primaryFormIndex = Number.isFinite(formMatchRecords[0]?.index)
+        ? formMatchRecords[0].index
+        : (Number.isFinite(formHookMatchRecords[0]?.index) ? formHookMatchRecords[0].index : 0);
       const formTag = formMatches[0] || '';
       const actionMatch = formTag.match(/\baction=["']([^"']+)["']/i);
       const methodMatch = formTag.match(/\bmethod=["']([^"']+)["']/i);
+      const componentName = this.extractNearestComponentName(content, primaryFormIndex);
       const selectorHints = fields
         .flatMap((field) => [field.testId, field.label, field.placeholder, field.name])
         .filter(Boolean)
@@ -483,6 +489,7 @@ class ContextGatherer {
         submitButtons: submitButtons.slice(0, 10),
         action: actionMatch?.[1] || null,
         method: (methodMatch?.[1] || 'POST').toUpperCase(),
+        componentName,
         selectorHints,
       });
     }
@@ -1944,14 +1951,33 @@ class ContextGatherer {
   }
 
   extractRouteComponentName(content, matchIndex = 0) {
-    const window = String(content || '').slice(Math.max(0, matchIndex - 200), matchIndex + 500);
-    const elementMatch = window.match(/element=\{\s*<([A-Z][A-Za-z0-9_]*)\b/);
+    const afterRoutePath = String(content || '').slice(Math.max(0, matchIndex), matchIndex + 700);
+    const elementMatch = afterRoutePath.match(/(?:element\s*=\s*\{\s*<|element\s*:\s*<)([A-Z][A-Za-z0-9_]*)\b/);
     if (elementMatch) return elementMatch[1];
 
-    const componentMatch = window.match(/component=\{\s*([A-Z][A-Za-z0-9_]*)\s*\}/);
+    const componentMatch = afterRoutePath.match(/(?:component|Component)\s*=\s*\{\s*([A-Z][A-Za-z0-9_]*)\s*\}/);
     if (componentMatch) return componentMatch[1];
 
+    const objectComponentMatch = afterRoutePath.match(/(?:component|Component)\s*:\s*([A-Z][A-Za-z0-9_]*)\b/);
+    if (objectComponentMatch) return objectComponentMatch[1];
+
     return null;
+  }
+
+  extractNearestComponentName(content, targetIndex = 0) {
+    const text = String(content || '');
+    const index = Math.max(0, Number.isFinite(targetIndex) ? targetIndex : 0);
+    const componentPattern = /(?:export\s+default\s+)?function\s+([A-Z][A-Za-z0-9_]*)\s*\(|(?:export\s+)?(?:const|let|var)\s+([A-Z][A-Za-z0-9_]*)\s*=\s*(?:\([^)]*\)|[A-Za-z0-9_]+)?\s*=>|(?:export\s+)?(?:const|let|var)\s+([A-Z][A-Za-z0-9_]*)\s*=\s*function\b/g;
+    let match;
+    let nearest = null;
+    while ((match = componentPattern.exec(text)) !== null) {
+      if (match.index > index) break;
+      nearest = {
+        name: match[1] || match[2] || match[3],
+        index: match.index,
+      };
+    }
+    return nearest?.name || null;
   }
 
   normalizeSourceLiteral(value) {
