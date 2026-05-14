@@ -102,39 +102,173 @@ export async function parsePRD(
   const client = new OpenAIClient({
     apiKey: opts.openaiApiKey,
     model: opts.model,
-    temperature: 0.1,
     timeout: opts.timeoutMs ?? 300_000, // gpt-5.5-mini reasoning:medium needs up to ~3 min
   })
 
-  const messages: OpenAIMessage[] = [
-    { role: 'system', content: PARSER_SYSTEM_PROMPT },
-    { role: 'user', content: `PRD:\n\n${trimmed}` },
-  ]
+  const chunks = splitPRDIntoChunks(trimmed)
+  const parsedChunks: ParsedPRD[] = []
+  const usage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
+  let modelUsed = opts.model || 'unknown'
 
-  const result = await client.callOpenAI(messages)
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index]
+    const messages: OpenAIMessage[] = [
+      { role: 'system', content: PARSER_SYSTEM_PROMPT },
+      {
+        role: 'user',
+        content: `PRD chunk ${index + 1}/${chunks.length}. Parse only this chunk; preserve exact AC text.\n\n${chunk}`,
+      },
+    ]
 
-  let parsed: ParsedPRD
-  try {
-    const jsonText = extractJsonObject(result.text)
-    const raw = JSON.parse(jsonText) as unknown
-    parsed = normalizeParsedPRD(raw)
-  } catch (e) {
-    const err = e instanceof Error ? e : new Error(String(e))
-    throw new Error(`PRD parse failed — OpenAI returned non-JSON output: ${err.message}`)
+    try {
+      const result = await client.callOpenAI(messages)
+      usage.promptTokens += result.usage.promptTokens
+      usage.completionTokens += result.usage.completionTokens
+      usage.totalTokens += result.usage.totalTokens
+      modelUsed = result.modelUsed
+      const jsonText = extractJsonObject(result.text)
+      parsedChunks.push(normalizeParsedPRD(JSON.parse(jsonText) as unknown))
+    } catch {
+      parsedChunks.push(regexFallbackParsedPRD(chunk, index + 1))
+    }
   }
 
+  const parsed = renumberParsedPRD(mergeParsedPRDChunks(parsedChunks))
   parsed.sourceHash = hashPRD(trimmed)
   parsed.parsedAt = new Date().toISOString()
 
   return {
     parsedPRD: parsed,
     tokenUsage: {
-      promptTokens: result.usage.promptTokens,
-      completionTokens: result.usage.completionTokens,
-      totalTokens: result.usage.totalTokens,
-      modelUsed: result.modelUsed,
+      promptTokens: usage.promptTokens,
+      completionTokens: usage.completionTokens,
+      totalTokens: usage.totalTokens,
+      modelUsed,
     },
   }
+}
+
+function splitPRDIntoChunks(text: string, maxChars = 5000): string[] {
+  const sections = text
+    .split(/(?=^#{1,3}\s+|\n[A-Z][^\n]{2,80}\n[-=]{3,}\n)/m)
+    .map((section) => section.trim())
+    .filter(Boolean)
+  if (sections.length === 0) return [text]
+
+  const chunks: string[] = []
+  let current = ''
+  for (const section of sections) {
+    if (current && current.length + section.length + 2 > maxChars) {
+      chunks.push(current.trim())
+      current = section
+    } else {
+      current = current ? `${current}\n\n${section}` : section
+    }
+  }
+  if (current.trim()) chunks.push(current.trim())
+  return chunks.length > 0 ? chunks : [text]
+}
+
+function mergeParsedPRDChunks(chunks: ParsedPRD[]): ParsedPRD {
+  const personas = new Map<string, { name: string; description: string }>()
+  const nonFunctional = new Map<string, { kind: 'perf' | 'a11y' | 'i18n' | 'security'; text: string }>()
+  const features: PRDFeature[] = []
+  for (const chunk of chunks) {
+    for (const feature of chunk.features || []) {
+      if ((feature.userStories || []).some((story) => (story.acceptanceCriteria || []).length > 0)) {
+        features.push(feature)
+      }
+    }
+    for (const persona of chunk.personas || []) {
+      const key = persona.name.toLowerCase()
+      if (!personas.has(key)) personas.set(key, persona)
+    }
+    for (const item of chunk.nonFunctional || []) {
+      nonFunctional.set(`${item.kind}:${item.text.toLowerCase()}`, item)
+    }
+  }
+  return {
+    features,
+    personas: [...personas.values()],
+    nonFunctional: [...nonFunctional.values()],
+  }
+}
+
+function renumberParsedPRD(parsed: ParsedPRD): ParsedPRD {
+  return {
+    ...parsed,
+    features: (parsed.features || []).map((feature, featureIndex) => {
+      const featureId = `F${featureIndex + 1}`
+      return {
+        ...feature,
+        id: featureId,
+        userStories: (feature.userStories || []).map((story, storyIndex) => {
+          const storyId = `${featureId}.S${storyIndex + 1}`
+          return {
+            ...story,
+            id: storyId,
+            acceptanceCriteria: (story.acceptanceCriteria || []).map((ac, acIndex) => ({
+              ...ac,
+              id: `${storyId}.AC${acIndex + 1}`,
+            })),
+          }
+        }),
+      }
+    }),
+  }
+}
+
+function regexFallbackParsedPRD(chunk: string, chunkIndex: number): ParsedPRD {
+  const lines = chunk.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  const heading = lines.find((line) => /^#{1,4}\s+/.test(line))?.replace(/^#{1,4}\s+/, '').trim()
+    || `PRD Section ${chunkIndex}`
+  const acLines = lines
+    .map((line) => line.replace(/^[-*]\s+/, '').replace(/^\d+[.)]\s+/, '').trim())
+    .filter((line) =>
+      /(?:\bAC\b|acceptance|given |when |then |must |should |can |cannot |required|invalid|error|security|role|admin|viewer|a11y|accessib|boundary|empty|whitespace)/i.test(line)
+    )
+    .slice(0, 30)
+  const criteria = (acLines.length > 0 ? acLines : lines.slice(0, 8)).map((text, index) => ({
+    id: `F${chunkIndex}.S1.AC${index + 1}`,
+    kind: /invalid|error|cannot|unauthorized|forbidden|reject|missing/i.test(text)
+      ? 'negative' as const
+      : (/boundary|empty|whitespace|null|max|min|required/i.test(text) ? 'boundary' as const : 'positive' as const),
+    authRequired: /login|auth|role|admin|viewer|member|user|account|dashboard/i.test(text),
+    roleHint: inferRoleHint(text),
+    text,
+  }))
+  const personas = Array.from(new Set(lines.flatMap((line) =>
+    [...line.matchAll(/\b(admin|manager|member|viewer|customer|user|owner|guest)\b/gi)].map((match) => match[1].toLowerCase())
+  ))).map((name) => ({ name, description: `${name} role inferred from PRD text` }))
+  const nonFunctional = lines
+    .filter((line) => /performance|latency|accessibility|a11y|security|i18n|international/i.test(line))
+    .slice(0, 12)
+    .map((text) => ({
+      kind: /accessibility|a11y/i.test(text)
+        ? 'a11y' as const
+        : (/security/i.test(text) ? 'security' as const : (/i18n|international/i.test(text) ? 'i18n' as const : 'perf' as const)),
+      text,
+    }))
+
+  return {
+    features: [{
+      id: `F${chunkIndex}`,
+      name: heading,
+      userStories: [{
+        id: `F${chunkIndex}.S1`,
+        persona: personas[0]?.name || '',
+        goal: heading,
+        acceptanceCriteria: criteria,
+      }],
+    }],
+    personas,
+    nonFunctional,
+  }
+}
+
+function inferRoleHint(text: string): string | undefined {
+  const match = String(text || '').match(/\b(admin|manager|member|viewer|customer|user|owner|guest)\b/i)
+  return match ? match[1].toLowerCase() : undefined
 }
 
 // Strip markdown fences and extract the first JSON object.

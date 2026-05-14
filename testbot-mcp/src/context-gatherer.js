@@ -32,6 +32,11 @@ class ContextGatherer {
       'out',
       'vendor',
       'target',
+      'public',
+      'static',
+      'assets',
+      'generated',
+      'gen',
     ]);
   }
 
@@ -1040,6 +1045,12 @@ class ContextGatherer {
         pages.push(...appPages);
       }
     }
+
+    for (const appDir of this.findNestedFrameworkDirs(projectPath, ['app', path.join('src', 'app')])) {
+      if (appDir === nextAppDir || appDir === srcAppDir) continue;
+      const appPages = this.scanNextAppDir(appDir, '');
+      pages.push(...appPages);
+    }
     
     // React Router - scan for route definitions
     const routerPages = await this.findReactRouterRoutes(projectPath);
@@ -1292,6 +1303,16 @@ class ContextGatherer {
         endpoints.push(...apiEndpoints);
       }
     }
+
+    for (const apiDir of this.findNestedFrameworkDirs(projectPath, [
+      path.join('pages', 'api'),
+      path.join('src', 'pages', 'api'),
+      path.join('app', 'api'),
+      path.join('src', 'app', 'api'),
+    ])) {
+      if (apiDirs.includes(apiDir)) continue;
+      endpoints.push(...this.scanAPIRoutes(apiDir, '/api'));
+    }
     
     // Express/Node.js routes
     const expressEndpoints = await this.findExpressRoutes(projectPath);
@@ -1331,11 +1352,21 @@ class ContextGatherer {
         const fullPath = path.join(dir, entry.name);
         
         if (entry.isDirectory()) {
-          const routePart = entry.name.startsWith('[')
-            ? `:${entry.name.replace(/[\[\]]/g, '')}`
-            : entry.name;
+          const optionalCatchAll = entry.name.match(/^\[\[\.\.\.([^\]]+)\]\]$/);
+          const catchAll = entry.name.match(/^\[\.\.\.([^\]]+)\]$/);
+          const dynamicSegment = entry.name.match(/^\[([^\]]+)\]$/);
+          const routePart = optionalCatchAll
+            ? ''
+            : catchAll
+              ? `:${catchAll[1]}`
+              : dynamicSegment
+                ? `:${dynamicSegment[1]}`
+                : entry.name;
           
-          const subEndpoints = this.scanAPIRoutes(fullPath, `${basePath}/${routePart}`);
+          const subEndpoints = this.scanAPIRoutes(
+            fullPath,
+            routePart ? `${basePath}/${routePart}` : basePath,
+          );
           endpoints.push(...subEndpoints);
         } else if (this.isPageFile(entry.name)) {
           const routeName = entry.name.replace(/\.(js|jsx|ts|tsx)$/, '');
@@ -1784,7 +1815,39 @@ class ContextGatherer {
    * Helper: Check if file is a page file
    */
   isPageFile(filename) {
-    return /\.(js|jsx|ts|tsx)$/.test(filename) && !filename.includes('.test.') && !filename.includes('.spec.');
+    return /\.(js|jsx|ts|tsx)$/.test(filename)
+      && !/\.d\.ts$/i.test(filename)
+      && !/\.(?:min|bundle|chunk|compiled)\.(?:mjs|cjs|jsx?|tsx?)$/i.test(filename)
+      && !filename.includes('.test.')
+      && !filename.includes('.spec.');
+  }
+
+  findNestedFrameworkDirs(projectPath, relativeCandidates, maxDepth = 2) {
+    const found = [];
+    const root = path.resolve(projectPath);
+    const skip = new Set([...this.skipDirs, 'tests', 'healix-reports']);
+    const walk = (dir, depth) => {
+      if (depth > maxDepth) return;
+      let entries = [];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory() || entry.name.startsWith('.') || skip.has(entry.name)) continue;
+        const child = path.join(dir, entry.name);
+        for (const rel of relativeCandidates) {
+          const candidate = path.join(child, rel);
+          if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+            found.push(candidate);
+          }
+        }
+        walk(child, depth + 1);
+      }
+    };
+    walk(root, 1);
+    return [...new Set(found)];
   }
 
   /**

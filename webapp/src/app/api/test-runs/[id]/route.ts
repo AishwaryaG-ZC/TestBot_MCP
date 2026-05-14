@@ -4,6 +4,7 @@ import { db } from '@/lib/db'
 import { testRuns, testFailures, generationJobs } from '@/lib/db/schema'
 import { eq, and, desc, sql } from 'drizzle-orm'
 import { extractRunIdFromReport, getLiveRunsForUser } from '@/lib/mcp-live-runs'
+import { loadQaFindingsForRun } from '@/lib/qa-corpus'
 
 // ── Generation-job progress projection (P2-i) ────────────────────────────────
 // Normalizes a linked generation_jobs row into the wire shape consumed by the
@@ -138,8 +139,9 @@ export async function GET(
         .limit(1)
 
       if (ingestedRow) {
-        const [test_failures, generationJob] = await Promise.all([
+        const [test_failures, qa_findings, generationJob] = await Promise.all([
           loadFailuresForRun(ingestedRow.id, user.id),
+          loadQaFindingsForRun(ingestedRow.id, user.id),
           loadLatestGenerationJob(ingestedRow.id, user.id),
         ])
         const data = {
@@ -159,6 +161,8 @@ export async function GET(
           coverage_metrics: ingestedRow.coverageMetrics ?? null,
           tier_results: ingestedRow.tierResults ?? null,
           pipeline_error: ingestedRow.pipelineError ?? null,
+          finding_summary: ingestedRow.findingSummary ?? null,
+          qa_findings,
           test_failures,
           framework: ingestedRow.framework,
           source: ingestedRow.source,
@@ -195,8 +199,9 @@ export async function GET(
       return NextResponse.json({ error: 'Test run not found' }, { status: 404 })
     }
 
-    const [test_failures, generationJob] = await Promise.all([
+    const [test_failures, qa_findings, generationJob] = await Promise.all([
       loadFailuresForRun(row.id, user.id),
+      loadQaFindingsForRun(row.id, user.id),
       loadLatestGenerationJob(row.id, user.id),
     ])
     const data = {
@@ -216,6 +221,8 @@ export async function GET(
       coverage_metrics: row.coverageMetrics ?? null,
       tier_results: row.tierResults ?? null,
       pipeline_error: row.pipelineError ?? null,
+      finding_summary: row.findingSummary ?? null,
+      qa_findings,
       test_failures,
       framework: row.framework,
       source: row.source,

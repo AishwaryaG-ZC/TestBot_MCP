@@ -52,6 +52,15 @@ export interface PipelineError {
 export type FailureVerdict = 'test_is_wrong' | 'app_is_wrong' | 'environment' | 'ambiguous' | 'flake'
 export type FailureVerdictSource = 'classifier' | 'ai' | 'user_override'
 
+export interface FindingSummary {
+  total: number
+  realTotal: number
+  bySeverity: Record<string, number>
+  byStatus: Record<string, number>
+  byCategory: Record<string, number>
+  highestSeverity: string | null
+}
+
 export interface TestFailure {
   id: string
   test_name: string
@@ -72,11 +81,35 @@ export interface TestFailure {
   created_at: string | null
 }
 
+export interface QaFinding {
+  id: string
+  test_run_id: string
+  test_case_id: string | null
+  test_case_run_id: string | null
+  project_fingerprint: string
+  fingerprint: string
+  title: string
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info' | string
+  status: string
+  category: string | null
+  finding_type: string | null
+  test_name: string | null
+  test_file: string | null
+  recommendation: string | null
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  evidence: any | null
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  raw_finding: any | null
+  first_seen_at: string | null
+  last_seen_at: string | null
+  created_at: string | null
+}
+
 export interface TestRun {
   id: string
   user_id: string
   creation_name: string
-  status: 'running' | 'passed' | 'failed' | 'error'
+  status: 'running' | 'passed' | 'failed' | 'error' | 'completed_with_findings'
   total_tests: number
   passed_tests: number
   failed_tests: number
@@ -92,6 +125,8 @@ export interface TestRun {
   coverage_metrics: any | null
   tier_results?: Record<string, { passed: number; failed: number; blocked: number; skipped: number; total: number }> | null
   pipeline_error?: PipelineError | null
+  finding_summary?: FindingSummary | null
+  qa_findings?: QaFinding[] | null
   test_failures?: TestFailure[] | null
   framework: string | null
   source: 'mcp' | 'api' | 'dashboard'
