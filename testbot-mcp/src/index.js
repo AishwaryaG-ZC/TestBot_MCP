@@ -29,6 +29,8 @@ const fetch = global.fetch || require('node-fetch');
 const Logger = require('./logger');
 const AutoDetector = require('./auto-detector');
 const PlaywrightIntegration = require('./playwright-integration');
+const ContextGatherer = require('./context-gatherer');
+const { ensureQaContractSpec, summarizeQaContracts } = require('./qa-contracts');
 const AIAnalyzer = require('./ai-providers/index');
 const ReportGenerator = require('./report-generator');
 const DashboardLauncher = require('./dashboard-launcher');
@@ -891,7 +893,7 @@ class HealixMCPServer {
     // Crash detection: if worker exits before writing a terminal status (regardless of
     // exit code), write an error immediately so waitForPipelineCompletion returns fast
     // instead of hanging for 30 minutes.
-    const WORKER_TERMINAL_PHASES = new Set(['completed', 'error', 'error_reported', 'failed']);
+    const WORKER_TERMINAL_PHASES = new Set(['completed', 'completed-partial', 'infra-failed', 'error', 'error_reported', 'failed']);
     const crashStatusFile = path.join(
       config.projectPath, 'healix-reports', '.runs', runId, 'status.json'
     );
@@ -970,7 +972,7 @@ class HealixMCPServer {
    * the AI can show the user real results once testing completes.
    */
   async waitForPipelineCompletion(statusFile, maxWaitMs = 1800000) {
-    const TERMINAL_PHASES = new Set(['completed', 'error', 'error_reported', 'failed']);
+    const TERMINAL_PHASES = new Set(['completed', 'completed-partial', 'infra-failed', 'error', 'error_reported', 'failed']);
     const POLL_INTERVAL_MS = 4000;
     const startedAt = Date.now();
 
@@ -1026,6 +1028,147 @@ class HealixMCPServer {
             ],
             isError: true,
           };
+        }
+      }
+    );
+
+    this.server.registerTool(
+      'healix_health',
+      {
+        description: 'Run a fast Healix health/smoke probe against the configured app URL without generating tests.',
+        inputSchema: z.object({
+          projectPath: z.string().optional(),
+          baseURL: z.string().url(),
+          healthEndpoints: z.array(z.string()).optional(),
+        }),
+      },
+      async (args) => {
+        const telemetryStartedAt = this.trackToolInvocation('healix_health', args);
+        try {
+          await this.validateApiKey();
+          const baseURL = String(args.baseURL || '').replace(/\/+$/, '');
+          const endpoints = ['/', ...(args.healthEndpoints || ['/health', '/api/health'])];
+          const probes = [];
+          for (const endpoint of endpoints) {
+            const url = endpoint.startsWith('http') ? endpoint : `${baseURL}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
+            try {
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort(), 3000);
+              const response = await fetch(url, { signal: controller.signal, redirect: 'manual' });
+              clearTimeout(timer);
+              probes.push({ url, status: response.status, ok: response.status < 500 });
+            } catch (error) {
+              probes.push({ url, status: null, ok: false, error: error.message });
+            }
+          }
+          const ok = probes.some((probe) => probe.url === `${baseURL}/` && probe.ok) && probes.every((probe) => probe.ok || !/\/health$|\/api\/health$/.test(probe.url));
+          this.trackToolResult('healix_health', telemetryStartedAt);
+          return { content: [{ type: 'text', text: JSON.stringify({ ok, probes }, null, 2) }] };
+        } catch (error) {
+          this.trackToolResult('healix_health', telemetryStartedAt, error);
+          return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
+
+    this.server.registerTool(
+      'healix_static_analysis',
+      {
+        description: 'Gather deterministic source inventory for routes, API endpoints, forms, workflows, and QA contracts without using browser exploration or AI generation.',
+        inputSchema: z.object({
+          projectPath: z.string().optional(),
+          language: z.string().optional(),
+        }),
+      },
+      async (args) => {
+        const telemetryStartedAt = this.trackToolInvocation('healix_static_analysis', args);
+        try {
+          await this.validateApiKey();
+          const projectPath = args.projectPath || process.cwd();
+          const gatherer = new ContextGatherer({ projectPath, language: args.language });
+          const context = await gatherer.gatherRichContext();
+          const summary = {
+            pages: context.pages?.length || 0,
+            apiEndpoints: context.apiEndpoints?.length || 0,
+            workflows: context.workflows?.length || 0,
+            qaContracts: summarizeQaContracts(context.qaContracts || {}),
+          };
+          this.trackToolResult('healix_static_analysis', telemetryStartedAt);
+          return { content: [{ type: 'text', text: JSON.stringify({ projectPath, summary, context }, null, 2) }] };
+        } catch (error) {
+          this.trackToolResult('healix_static_analysis', telemetryStartedAt, error);
+          return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
+
+    this.server.registerTool(
+      'healix_tier0_codegen',
+      {
+        description: 'Generate deterministic Tier-0 Healix QA contract specs into tests/healix-tier0 without running AI generation.',
+        inputSchema: z.object({
+          projectPath: z.string().optional(),
+          testType: z.enum(['frontend', 'backend', 'both']).optional(),
+          codebaseContext: CODEBASE_CONTEXT_SCHEMA.optional(),
+        }),
+      },
+      async (args) => {
+        const telemetryStartedAt = this.trackToolInvocation('healix_tier0_codegen', args);
+        try {
+          await this.validateApiKey();
+          const projectPath = args.projectPath || process.cwd();
+          let context = args.codebaseContext;
+          if (!context) {
+            const gatherer = new ContextGatherer({ projectPath });
+            context = await gatherer.gatherRichContext();
+          }
+          const result = ensureQaContractSpec({
+            projectPath,
+            context,
+            testType: args.testType || 'both',
+            outputDir: path.join(projectPath, 'tests', 'healix-tier0'),
+            suite: 'tier0-deterministic',
+          });
+          this.trackToolResult('healix_tier0_codegen', telemetryStartedAt);
+          return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+        } catch (error) {
+          this.trackToolResult('healix_tier0_codegen', telemetryStartedAt, error);
+          return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
+        }
+      }
+    );
+
+    this.server.registerTool(
+      'healix_run_tests',
+      {
+        description: 'Run Playwright for a specific Healix suite directory, such as tests/healix-tier0 or tests/healix-ai.',
+        inputSchema: z.object({
+          projectPath: z.string().optional(),
+          baseURL: z.string().url(),
+          startCommand: z.string().optional(),
+          port: z.number().optional(),
+          suiteDir: z.string().default('tests/healix-tier0'),
+          testType: z.enum(['frontend', 'backend', 'both']).optional(),
+        }),
+      },
+      async (args) => {
+        const telemetryStartedAt = this.trackToolInvocation('healix_run_tests', args);
+        try {
+          await this.validateApiKey();
+          const playwright = new PlaywrightIntegration({
+            projectPath: args.projectPath || process.cwd(),
+            baseURL: args.baseURL,
+            startCommand: args.startCommand,
+            port: args.port,
+            suiteDir: args.suiteDir,
+            testType: args.testType || 'both',
+          });
+          const results = await playwright.runTests();
+          this.trackToolResult('healix_run_tests', telemetryStartedAt);
+          return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+        } catch (error) {
+          this.trackToolResult('healix_run_tests', telemetryStartedAt, error);
+          return { content: [{ type: 'text', text: `Error: ${error.message}` }], isError: true };
         }
       }
     );
@@ -1998,7 +2141,7 @@ Return the JSON structure above based on what you find in the codebase.
       };
     }
 
-    const TERMINAL_PHASES = new Set(['completed', 'error', 'error_reported', 'failed']);
+    const TERMINAL_PHASES = new Set(['completed', 'completed-partial', 'infra-failed', 'error', 'error_reported', 'failed']);
     const isTerminal = TERMINAL_PHASES.has(status.phase);
 
     const base = {

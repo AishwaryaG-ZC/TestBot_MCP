@@ -5,7 +5,7 @@ import { mcpTelemetryEvents } from '@/lib/db/schema'
 const DEFAULT_WINDOW_HOURS = 24
 const DEFAULT_EVENT_LIMIT = 1200
 
-const TERMINAL_PHASES = new Set(['completed', 'error', 'error_reported', 'failed'])
+const TERMINAL_PHASES = new Set(['completed', 'completed-partial', 'infra-failed', 'error', 'error_reported', 'failed'])
 const ORPHAN_TIMEOUT_MS = 30 * 60 * 1000 // 30 minutes for pipeline phases
 const CONFIG_UI_ORPHAN_TIMEOUT_MS = 4 * 60 * 60 * 1000 // 4 hours for awaiting_config_ui
 
@@ -34,7 +34,7 @@ type LiveRunSnapshot = {
   runId: string
   phase: string
   status: string
-  runStatus: 'running' | 'passed' | 'failed' | 'error'
+  runStatus: 'created' | 'running' | 'passed' | 'failed' | 'error' | 'completed-partial' | 'infra-failed' | 'stalled'
   errorCode: string | null
   reason: string | null
   message: string | null
@@ -76,16 +76,19 @@ function resolveOrphanedSnapshot(snapshot: LiveRunSnapshot): LiveRunSnapshot {
 
   return {
     ...snapshot,
-    runStatus: 'failed',
+    runStatus: 'stalled',
     errorCode: snapshot.errorCode || 'ORPHANED_RUN',
     message: `Run stopped responding in phase: ${snapshot.phase}`,
   }
 }
 
-function mapPhaseToRunStatus(phase: string, status: string): 'running' | 'passed' | 'failed' | 'error' {
+function mapPhaseToRunStatus(phase: string, status: string): LiveRunSnapshot['runStatus'] {
   const normalizedPhase = phase.toLowerCase()
   const normalizedStatus = status.toLowerCase()
 
+  if (normalizedPhase === 'created') return 'created'
+  if (normalizedPhase === 'completed-partial') return 'completed-partial'
+  if (normalizedPhase === 'infra-failed') return 'infra-failed'
   if (normalizedPhase === 'completed' || normalizedStatus === 'success') {
     return 'passed'
   }

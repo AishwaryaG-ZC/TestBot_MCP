@@ -25,7 +25,9 @@ function StatusBadge({ status }: { status: string }) {
   const s = (status ?? '').toLowerCase();
   if (s === 'passed') return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Passed</span>;
   if (s === 'failed') return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-red-500/10 text-red-400 border border-red-500/20">Failed</span>;
-  if (s === 'running') return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-blue-500/10 text-blue-400 border border-blue-500/20 animate-pulse">Running</span>;
+  if (s === 'running' || s === 'created' || s.includes('running')) return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-blue-500/10 text-blue-400 border border-blue-500/20 animate-pulse">Running</span>;
+  if (s === 'completed-partial') return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-amber-500/10 text-amber-300 border border-amber-500/25">Partial</span>;
+  if (s === 'infra-failed' || s === 'stalled') return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-red-500/10 text-red-300 border border-red-500/20">{s === 'stalled' ? 'Stalled' : 'Infra failed'}</span>;
   if (s === 'completed_with_findings') return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-amber-500/10 text-amber-300 border border-amber-500/25">Findings</span>;
   return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">{status}</span>;
 }

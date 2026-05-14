@@ -4,6 +4,7 @@ import { db } from '@/lib/db'
 import { testRuns } from '@/lib/db/schema'
 import { eq, and, desc, asc, count, sql } from 'drizzle-orm'
 import { getLiveRunsForUser } from '@/lib/mcp-live-runs'
+import { authenticateApiKeyRequest, redactSecrets } from '@/lib/qa-corpus'
 
 function compareRows(
   a: Record<string, unknown>,
@@ -152,4 +153,83 @@ export async function GET(request: NextRequest) {
     console.error('[Test Runs] GET error:', error)
     return NextResponse.json({ error: 'Failed to fetch test runs' }, { status: 500 })
   }
+}
+
+export async function POST(request: NextRequest) {
+  let body: Record<string, unknown>
+  try {
+    body = (await request.json()) as Record<string, unknown>
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+  }
+
+  const auth = await authenticateApiKeyRequest(request, body, '/api/test-runs')
+  if (!auth.ok) return NextResponse.json(auth.body, { status: auth.status })
+
+  const runId = typeof body.run_id === 'string' ? body.run_id.slice(0, 180) : null
+  if (!runId) return NextResponse.json({ error: 'Missing required field: run_id' }, { status: 400 })
+
+  const now = new Date()
+  const creationName =
+    (typeof body.creation_name === 'string' && body.creation_name.trim()) ||
+    (typeof body.project_name === 'string' && body.project_name.trim()) ||
+    `Healix run ${runId.slice(-8)}`
+  const status = typeof body.status === 'string' ? body.status.slice(0, 80) : 'created'
+  const projectPath = typeof body.project_path === 'string' ? body.project_path.slice(0, 2000) : null
+  const framework = typeof body.framework === 'string' ? body.framework.slice(0, 120) : null
+  const redactedMetadata =
+    body.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata)
+      ? (redactSecrets(body.metadata) as Record<string, unknown>)
+      : {}
+  const rawReport = {
+    metadata: {
+      runId,
+      projectName: creationName,
+      live: true,
+      createdBy: 'healix-mcp',
+      ...redactedMetadata,
+    },
+  }
+
+  const [existing] = await db
+    .select({ id: testRuns.id })
+    .from(testRuns)
+    .where(and(eq(testRuns.userId, auth.userId), sql`${testRuns.reportJson}->'metadata'->>'runId' = ${runId}`))
+    .limit(1)
+
+  const values = {
+    creationName,
+    status,
+    projectPath,
+    framework,
+    source: 'mcp',
+    currentPhase: status,
+    currentPhaseAt: now,
+    reportJson: rawReport,
+    updatedAt: now,
+  }
+
+  const [row] = existing
+    ? await db
+        .update(testRuns)
+        .set(values)
+        .where(and(eq(testRuns.id, existing.id), eq(testRuns.userId, auth.userId)))
+        .returning({ id: testRuns.id, status: testRuns.status, currentPhase: testRuns.currentPhase })
+    : await db
+        .insert(testRuns)
+        .values({
+          ...values,
+          userId: auth.userId,
+        })
+        .returning({ id: testRuns.id, status: testRuns.status, currentPhase: testRuns.currentPhase })
+
+  return NextResponse.json({
+    success: true,
+    data: {
+      id: row.id,
+      run_id: runId,
+      status: row.status,
+      current_phase: row.currentPhase,
+    },
+  })
 }

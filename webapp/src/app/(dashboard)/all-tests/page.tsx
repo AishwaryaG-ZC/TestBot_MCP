@@ -72,13 +72,17 @@ function StatusCell({ pass, total }: { pass: number; total: number }) {
 function statusBadgeClass(status: string | null | undefined) {
   if (status === 'passed') return 'bg-emerald-500/10 text-emerald-400'
   if (status === 'failed') return 'bg-red-500/10 text-red-400'
-  if (status === 'running') return 'bg-blue-500/10 text-blue-400'
+  if (status === 'running' || status === 'created' || status?.includes('running')) return 'bg-blue-500/10 text-blue-400'
+  if (status === 'infra-failed' || status === 'stalled') return 'bg-red-500/10 text-red-300'
   if (status === 'completed_with_findings') return 'bg-amber-500/10 text-amber-300'
+  if (status === 'completed-partial') return 'bg-amber-500/10 text-amber-300'
   return 'bg-amber-500/10 text-amber-400'
 }
 
 function statusLabel(status: string | null | undefined) {
   if (status === 'completed_with_findings') return 'findings'
+  if (status === 'completed-partial') return 'partial'
+  if (status === 'infra-failed') return 'infra failed'
   return status || 'unknown'
 }
 

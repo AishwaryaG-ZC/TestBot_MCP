@@ -887,6 +887,31 @@ class WebappClient {
     });
   }
 
+  async createOrUpdateLiveRun({ runId, projectName, projectPath, status = 'created', metadata = {} } = {}) {
+    if (!this.apiKey || !runId) return null;
+    try {
+      return await this._post(
+        '/api/test-runs',
+        {
+          api_key: this.apiKey,
+          run_id: runId,
+          project_name: projectName || null,
+          project_path: projectPath || null,
+          status,
+          metadata,
+        },
+        { timeoutMs: this._timeout('phase') }
+      );
+    } catch (err) {
+      Logger.warn('WebappClient', 'createOrUpdateLiveRun failed (non-blocking)', {
+        runId,
+        code: err?.code,
+        message: err?.message,
+      });
+      return null;
+    }
+  }
+
   /**
    * Fire-and-forget durable phase write. If the webapp is unreachable, the call
    * fails silently — the pipeline must never block on this best-effort state.

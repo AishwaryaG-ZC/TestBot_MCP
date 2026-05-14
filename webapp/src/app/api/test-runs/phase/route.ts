@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { apiKeys, testRuns, mcpTelemetryEvents } from '@/lib/db/schema'
-import { and, eq } from 'drizzle-orm'
+import { and, eq, sql } from 'drizzle-orm'
 import { hashApiKey } from '@/lib/utils/api-keys'
 import { logBlockedRequest } from '@/lib/security-logger'
 
@@ -52,11 +52,22 @@ export async function POST(request: NextRequest) {
     const userId = keyRecord.userId
     const now = new Date()
 
-    if (testRunId) {
+    const liveStatus = phase === 'error_reported' || phase === 'error'
+      ? 'error'
+      : phase === 'completed' || phase === 'completed-partial' || phase === 'infra-failed'
+        ? phase
+        : phase === 'smoke-passed' || phase === 'tier0-running' || phase === 'tier0-complete' || phase === 'ai-running' || phase === 'ai-failed' || phase === 'created'
+          ? phase
+          : 'running'
+
+    if (testRunId || runId) {
+      const where = testRunId
+        ? and(eq(testRuns.id, testRunId), eq(testRuns.userId, userId))
+        : and(eq(testRuns.userId, userId), sql`${testRuns.reportJson}->'metadata'->>'runId' = ${runId}`)
       await db
         .update(testRuns)
-        .set({ currentPhase: phase, currentPhaseAt: now, updatedAt: now })
-        .where(and(eq(testRuns.id, testRunId), eq(testRuns.userId, userId)))
+        .set({ status: liveStatus, currentPhase: phase, currentPhaseAt: now, updatedAt: now })
+        .where(where)
     }
 
     const stageBudget = body.stage_budget

@@ -1001,7 +1001,7 @@ function fillDynamicPath(pathname: string, value: string | number): string {
 
 function collectionPathForDynamic(pathname: string): string {
   const normalized = String(pathname);
-  if (/^\/api\/comments\/issue\/[:{]/.test(normalized)) return '/api/issues';
+  if (/^\\/api\\/comments\\/issue\\/[:{]/.test(normalized)) return '/api/issues';
   return pathname
     .replace(/(?:\\/\\{[^}]+\\}|\\/:[A-Za-z_][\\w-]*)(?:\\/.*)?$/, '') || '/';
 }
@@ -1333,7 +1333,7 @@ ${buildRbacContractTests(rbacContracts, roles)}
   };
 }
 
-function ensureQaContractSpec({ projectPath, context = {}, roles = [], testType = 'both' } = {}) {
+function ensureQaContractSpec({ projectPath, context = {}, roles = [], testType = 'both', outputDir = null, suite = 'tier0' } = {}) {
   const qaContracts = context.qaContracts || {};
   const spec = buildQaContractSpec({ qaContracts, roles, testType });
   const questions = buildQaContractQuestions(qaContracts);
@@ -1358,13 +1358,17 @@ function ensureQaContractSpec({ projectPath, context = {}, roles = [], testType 
   if (!spec) {
     return result;
   }
-  const generatedDir = path.join(projectPath, 'tests', 'generated');
+  const generatedDir = outputDir
+    ? (path.isAbsolute(outputDir) ? outputDir : path.join(projectPath, outputDir))
+    : path.join(projectPath, 'tests', 'generated');
   fs.mkdirSync(generatedDir, { recursive: true });
   const targetPath = path.join(generatedDir, spec.filename);
   fs.writeFileSync(targetPath, spec.content, 'utf-8');
   result.written = true;
   result.filename = spec.filename;
   result.path = targetPath;
+  result.suite = suite;
+  result.outputDir = generatedDir;
   result.generatedTests = (spec.content.match(/\btest\s*\(/g) || []).length;
   return result;
 }
@@ -1425,4 +1429,6 @@ module.exports = {
   buildQaContractSpec,
   ensureQaContractSpec,
   auditQaContractCoverage,
+  sourceAuthorityScore,
+  sourceFileLooksNonAuthoritative,
 };

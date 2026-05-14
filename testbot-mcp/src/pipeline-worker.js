@@ -42,6 +42,8 @@ const {
   auditQaContractCoverage,
   summarizeQaContracts,
   buildQaContractQuestions,
+  sourceAuthorityScore,
+  sourceFileLooksNonAuthoritative,
 } = require('./qa-contracts');
 const Logger = require('./logger');
 const MCPTelemetryReporter = require('./mcp-telemetry');
@@ -90,6 +92,10 @@ const STRICT_AI_REQUIRED_CATEGORIES = [
   'api_negative',
   'api_stress',
 ];
+
+const HEALIX_TIER0_SUITE_DIR = 'tests/healix-tier0';
+const HEALIX_AI_SUITE_DIR = 'tests/healix-ai';
+const HEALIX_LEGACY_SUITE_DIR = 'tests/generated';
 
 const GENERATED_SPEC_FILE_PATTERN = /\.(?:spec|test)\.(?:ts|js|mts|mjs|cts|cjs)$/i;
 const GENERATED_SPEC_FILENAME_PATTERN = /[A-Za-z0-9_.-]+\.(?:spec|test)\.(?:ts|js|mts|mjs|cts|cjs)\b/g;
@@ -723,8 +729,13 @@ function hasApiSurfaceForGeneration(context = {}, projectInfo = {}) {
     || hasBackendService(projectInfo);
 }
 
-function listGeneratedTestFiles(projectPath) {
-  const generatedDir = path.join(projectPath, 'tests', 'generated');
+function resolveSuiteDir(projectPath, suiteDir = HEALIX_LEGACY_SUITE_DIR) {
+  const raw = String(suiteDir || HEALIX_LEGACY_SUITE_DIR).trim() || HEALIX_LEGACY_SUITE_DIR;
+  return path.isAbsolute(raw) ? raw : path.join(projectPath, raw);
+}
+
+function listGeneratedTestFiles(projectPath, suiteDir = HEALIX_LEGACY_SUITE_DIR) {
+  const generatedDir = resolveSuiteDir(projectPath, suiteDir);
   if (!fs.existsSync(generatedDir)) {
     return [];
   }
@@ -732,6 +743,228 @@ function listGeneratedTestFiles(projectPath) {
   return fs.readdirSync(generatedDir)
     .filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name))
     .map((name) => path.join(generatedDir, name));
+}
+
+function defaultSuiteDirsForProject(projectPath) {
+  const modernSuiteDirs = [HEALIX_TIER0_SUITE_DIR, HEALIX_AI_SUITE_DIR];
+  const hasModernSpecs = modernSuiteDirs.some((suiteDir) =>
+    listGeneratedTestFiles(projectPath, suiteDir).length > 0
+  );
+  return hasModernSpecs ? modernSuiteDirs : [HEALIX_LEGACY_SUITE_DIR];
+}
+
+function listSuiteTestFiles(projectPath, suiteDirs = null) {
+  const effectiveSuiteDirs = Array.isArray(suiteDirs) && suiteDirs.length > 0
+    ? suiteDirs
+    : defaultSuiteDirsForProject(projectPath);
+  return effectiveSuiteDirs.flatMap((suiteDir) => listGeneratedTestFiles(projectPath, suiteDir));
+}
+
+function relativeSourcePath(projectPath, sourceFile) {
+  if (!sourceFile) return null;
+  const normalized = String(sourceFile).replace(/\\/g, '/');
+  const projectRoot = String(projectPath || '').replace(/\\/g, '/');
+  if (projectRoot && normalized.startsWith(projectRoot)) {
+    return path.relative(projectPath, sourceFile).replace(/\\/g, '/');
+  }
+  return normalized;
+}
+
+function sourceAuthorityMetadata(projectPath, sourceFile) {
+  const relative = relativeSourcePath(projectPath, sourceFile);
+  if (!relative) {
+    return { sourceFile: null, authorityRank: null, authoritative: false };
+  }
+  const rank = sourceAuthorityScore(relative);
+  return {
+    sourceFile: relative,
+    authorityRank: rank,
+    authoritative: !sourceFileLooksNonAuthoritative(relative) && rank < 100,
+  };
+}
+
+function buildStaticInventory({ projectPath, context = {} } = {}) {
+  const pages = (context.pages || []).map((page) => ({
+    route: page.route || page.path || page.url || null,
+    title: page.title || page.name || null,
+    ...sourceAuthorityMetadata(projectPath, page.sourceFile || page.file || page.pathOnDisk),
+    confidence: Number.isFinite(Number(page.confidence)) ? Number(page.confidence) : null,
+  })).filter((page) => page.route || page.sourceFile);
+
+  const apiEndpoints = effectiveApiEndpoints(context).map((endpoint) => ({
+    method: String(endpoint.method || 'GET').toUpperCase(),
+    path: endpoint.path || endpoint.route || endpoint.url || null,
+    authRequired: endpoint.authRequired ?? endpoint.requiresAuth ?? null,
+    roleGate: endpoint.roleGate || endpoint.requiredRole || endpoint.guard || null,
+    requiredFields: endpoint.requiredFields || endpoint.bodyFields || [],
+    responseFields: endpoint.responseFields || endpoint.fields || [],
+    ...sourceAuthorityMetadata(projectPath, endpoint.sourceFile || endpoint.file || endpoint.source),
+    confidence: Number.isFinite(Number(endpoint.confidence)) ? Number(endpoint.confidence) : null,
+  })).filter((endpoint) => endpoint.path || endpoint.sourceFile);
+
+  const forms = (context.forms || context.formContracts || []).map((form) => ({
+    route: form.route || form.path || null,
+    id: form.id || form.name || form.component || null,
+    requiredFields: form.requiredFields || form.fields || [],
+    ...sourceAuthorityMetadata(projectPath, form.sourceFile || form.file || form.source),
+    confidence: Number.isFinite(Number(form.confidence)) ? Number(form.confidence) : null,
+  })).filter((form) => form.route || form.sourceFile);
+
+  const lowAuthoritySources = [...pages, ...apiEndpoints, ...forms]
+    .filter((item) => item.sourceFile && item.authoritative === false)
+    .slice(0, 25)
+    .map((item) => item.sourceFile);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    version: 1,
+    projectPath,
+    summary: {
+      pages: pages.length,
+      apiEndpoints: apiEndpoints.length,
+      forms: forms.length,
+      filterContracts: (context.qaContracts?.filterContracts || []).length,
+      formValidationContracts: (context.qaContracts?.formValidationContracts || []).length,
+      statusContracts: (context.qaContracts?.statusContracts || []).length,
+      boundaryContracts: (context.qaContracts?.boundaryContracts || []).length,
+      rbacContracts: (context.qaContracts?.rbacContracts || []).length,
+      lowAuthoritySources: lowAuthoritySources.length,
+    },
+    pages,
+    apiEndpoints,
+    forms,
+    qaContracts: {
+      summary: summarizeQaContracts(context.qaContracts || {}),
+      questions: buildQaContractQuestions(context.qaContracts || {}),
+    },
+    sourceAuthority: {
+      lowAuthoritySources,
+      ranking: 'canonical backend/source files before route handlers before app/lib; build/minified/generated artifacts are non-authoritative',
+    },
+  };
+}
+
+function writeStaticInventory(statusDir, inventory) {
+  if (!statusDir || !inventory) return null;
+  const inventoryPath = path.join(statusDir, 'inventory.json');
+  try {
+    fs.writeFileSync(inventoryPath, JSON.stringify(inventory, null, 2), 'utf-8');
+    return inventoryPath;
+  } catch (error) {
+    Logger.warn('PipelineWorker', 'Failed to write static inventory', { reason: error.message });
+    return null;
+  }
+}
+
+async function fetchSmokeProbe(url, { expectJson = false, timeoutMs = 3000 } = {}) {
+  const fetchFn = global.fetch || ((target, opts) => import('node-fetch').then((m) => m.default(target, opts)));
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchFn(url, { signal: controller.signal, redirect: 'manual' });
+    const contentType = String(response.headers?.get?.('content-type') || '');
+    let bodyPreview = '';
+    if (expectJson && response.status >= 200 && response.status < 300) {
+      bodyPreview = await response.text().catch(() => '');
+      try {
+        JSON.parse(bodyPreview || 'null');
+      } catch {
+        return {
+          ok: false,
+          status: response.status,
+          reason: 'bad_auth_json',
+          contentType,
+          bodyPreview: bodyPreview.slice(0, 300),
+        };
+      }
+    }
+    return {
+      ok: response.status < 500,
+      status: response.status,
+      reason: response.status >= 500 ? 'server_5xx' : null,
+      contentType,
+      bodyPreview: bodyPreview.slice(0, 300),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: null,
+      reason: error?.name === 'AbortError' ? 'timeout' : 'unreachable',
+      error: error?.message || String(error),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function runSmokeGate({ config = {}, context = {}, statusDir = null, runId = null, telemetryReporter = null } = {}) {
+  const baseURL = String(config.baseURL || '').replace(/\/+$/, '');
+  if (!baseURL) return { status: 'skipped', reason: 'no_base_url', probes: [] };
+  const probes = [];
+  const addProbe = (name, pathOrUrl, options = {}) => {
+    if (!pathOrUrl) return;
+    let url = String(pathOrUrl);
+    if (url.startsWith('/')) url = `${baseURL}${url}`;
+    if (!/^https?:\/\//i.test(url)) return;
+    probes.push({ name, url, ...options });
+  };
+
+  addProbe('base_url', `${baseURL}/`, { required: true });
+  const configuredHealth = Array.isArray(config.healthEndpoints) ? config.healthEndpoints : [];
+  for (const endpoint of configuredHealth) addProbe('configured_health', endpoint, { required: true });
+  if (configuredHealth.length === 0) {
+    addProbe('health', '/health', { required: false });
+    addProbe('api_health', '/api/health', { required: false });
+  }
+  const hasAuthMe = effectiveApiEndpoints(context).some((endpoint) =>
+    String(endpoint.method || 'GET').toUpperCase() === 'GET' &&
+    /\/api\/auth\/me\/?$/i.test(String(endpoint.path || endpoint.route || ''))
+  );
+  if (hasAuthMe) addProbe('auth_me', '/api/auth/me', { required: false, expectJson: true });
+  const readRoute = (context.pages || [])
+    .map((page) => page.route || page.path || page.url)
+    .find((route) => typeof route === 'string' && route.startsWith('/') && !route.includes('[') && !route.includes(':'));
+  if (readRoute && readRoute !== '/') addProbe('source_read_route', readRoute, { required: false });
+
+  const results = [];
+  for (const probe of probes) {
+    const result = await fetchSmokeProbe(probe.url, { expectJson: !!probe.expectJson });
+    results.push({ ...probe, ...result });
+  }
+  const blockers = results.filter((probe) =>
+    probe.required && !probe.ok ||
+    probe.reason === 'server_5xx' ||
+    probe.reason === 'bad_auth_json'
+  );
+  const status = blockers.length > 0 ? 'failed' : 'passed';
+  const smokeGate = {
+    status,
+    probes: results,
+    blockers,
+  };
+  if (statusDir) {
+    recordRunDecision(statusDir, telemetryReporter, {
+      runId,
+      decisionType: 'smoke_gate_decision',
+      phase: 'smoke_gate',
+      status: status === 'passed' ? 'success' : 'error',
+      message: status === 'passed'
+        ? 'Smoke gate passed; environment is reachable.'
+        : 'Smoke gate found environment-level blockers.',
+      metadata: smokeGate,
+    });
+  }
+  if (blockers.length > 0) {
+    const error = new Error(`Smoke gate failed: ${blockers.map((probe) => `${probe.name}:${probe.reason || probe.status}`).join(', ')}`);
+    error.code = 'INFRASTRUCTURE_FAILURE';
+    error.diagnostics = {
+      stage: 'smoke_gate',
+      reason: 'smoke_gate_failed',
+      smokeGate,
+    };
+    throw error;
+  }
+  return smokeGate;
 }
 
 function extractBracketMarkers(text, prefix) {
@@ -950,8 +1183,12 @@ function buildExistingSuiteManifest({
   testType = 'both',
   quality = null,
   routeAccessSummary = null,
+  suiteDirs = null,
 } = {}) {
-  const files = listGeneratedTestFiles(projectPath);
+  const effectiveSuiteDirs = Array.isArray(suiteDirs) && suiteDirs.length > 0
+    ? suiteDirs
+    : defaultSuiteDirsForProject(projectPath);
+  const files = listSuiteTestFiles(projectPath, effectiveSuiteDirs);
   const contents = [];
   const fileManifests = [];
   const covered = {
@@ -1013,7 +1250,7 @@ function buildExistingSuiteManifest({
     qaContracts: (qaCoverage.missing || []).slice(0, 50),
   };
 
-  const totals = quality || collectGenerationQuality(projectPath, {});
+  const totals = quality || collectGenerationQuality(projectPath, { suiteDirs: effectiveSuiteDirs });
   return {
     files: fileManifests.map((file) => ({
       filename: file.filename,
@@ -1321,8 +1558,8 @@ function qualityAuditHasHardErrors(qualityAudit = {}) {
   return (qualityAudit.errors || []).some(isHardQualityAuditError);
 }
 
-function fileContainsOnlyBrittleTests(projectPath, filename) {
-  const filePath = path.join(projectPath, 'tests', 'generated', path.basename(filename || ''));
+function fileContainsOnlyBrittleTests(projectPath, filename, suiteDir = HEALIX_LEGACY_SUITE_DIR) {
+  const filePath = path.join(resolveSuiteDir(projectPath, suiteDir), path.basename(filename || ''));
   if (!fs.existsSync(filePath)) return false;
   let content = '';
   try {
@@ -1373,14 +1610,14 @@ function demoteSoftQualityAuditErrors(qualityAudit = {}, reason = 'soft_quality_
   };
 }
 
-function snapshotGeneratedSpecFiles(projectPath) {
-  const generatedDir = path.join(projectPath, 'tests', 'generated');
+function snapshotGeneratedSpecFiles(projectPath, suiteDir = HEALIX_LEGACY_SUITE_DIR) {
+  const generatedDir = resolveSuiteDir(projectPath, suiteDir);
   const snapshot = {
     generatedDir,
     files: [],
   };
   if (!fs.existsSync(generatedDir)) return snapshot;
-  for (const filePath of listGeneratedTestFiles(projectPath)) {
+  for (const filePath of listGeneratedTestFiles(projectPath, suiteDir)) {
     try {
       snapshot.files.push({
         filename: path.basename(filePath),
@@ -1394,9 +1631,10 @@ function snapshotGeneratedSpecFiles(projectPath) {
 }
 
 function restoreGeneratedSpecSnapshot(projectPath, snapshot = {}) {
-  const generatedDir = snapshot.generatedDir || path.join(projectPath, 'tests', 'generated');
+  const generatedDir = snapshot.generatedDir || resolveSuiteDir(projectPath, HEALIX_AI_SUITE_DIR);
   ensureDir(generatedDir);
-  for (const filePath of listGeneratedTestFiles(projectPath)) {
+  const suiteDir = path.relative(projectPath, generatedDir).replace(/\\/g, '/') || generatedDir;
+  for (const filePath of listGeneratedTestFiles(projectPath, suiteDir)) {
     try {
       fs.rmSync(filePath, { force: true });
     } catch {
@@ -1578,8 +1816,8 @@ function isBrittleGeneratedTestBlock(blockContent) {
   return false;
 }
 
-function pruneGeneratedTestsByQuality({ projectPath, qualityAudit = {}, reason = 'quality_audit' } = {}) {
-  const generatedDir = path.join(projectPath, 'tests', 'generated');
+function pruneGeneratedTestsByQuality({ projectPath, qualityAudit = {}, reason = 'quality_audit', suiteDir = HEALIX_LEGACY_SUITE_DIR } = {}) {
+  const generatedDir = resolveSuiteDir(projectPath, suiteDir);
   if (!fs.existsSync(generatedDir)) {
     return { applied: false, reason: 'generated_dir_missing', prunedFiles: [] };
   }
@@ -1632,8 +1870,8 @@ function pruneGeneratedTestsByQuality({ projectPath, qualityAudit = {}, reason =
   };
 }
 
-function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason = 'quality_audit', hardOnly = false } = {}) {
-  const generatedDir = path.join(projectPath, 'tests', 'generated');
+function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason = 'quality_audit', hardOnly = false, suiteDir = HEALIX_LEGACY_SUITE_DIR } = {}) {
+  const generatedDir = resolveSuiteDir(projectPath, suiteDir);
   if (!fs.existsSync(generatedDir)) {
     return { applied: false, reason: 'generated_dir_missing', quarantinedFiles: [] };
   }
@@ -2036,7 +2274,10 @@ function originFromUrl(value) {
 }
 
 function collectGenerationQuality(projectPath, options = {}) {
-  const files = listGeneratedTestFiles(projectPath);
+  const suiteDirs = Array.isArray(options.suiteDirs) && options.suiteDirs.length > 0
+    ? options.suiteDirs
+    : [options.suiteDir || HEALIX_LEGACY_SUITE_DIR];
+  const files = listSuiteTestFiles(projectPath, suiteDirs);
   const categories = Object.fromEntries(STRICT_AI_REQUIRED_CATEGORIES.map((name) => [name, 0]));
   let totalTests = 0;
   let skippedTests = 0;
@@ -2112,7 +2353,7 @@ function collectGenerationQuality(projectPath, options = {}) {
   };
 }
 
-function buildRequirementsCoverage({ prdContent, prdContents, projectPath }) {
+function buildRequirementsCoverage({ prdContent, prdContents, projectPath, suiteDirs = null }) {
   const fallback = {
     totalRequirements: 0,
     mappedRequirements: 0,
@@ -2142,7 +2383,7 @@ function buildRequirementsCoverage({ prdContent, prdContents, projectPath }) {
     return fallback;
   }
 
-  const filePaths = listGeneratedTestFiles(projectPath);
+  const filePaths = listSuiteTestFiles(projectPath, suiteDirs);
   const corpus = [];
   for (const filePath of filePaths) {
     try {
@@ -3570,8 +3811,8 @@ function rewritePlaywrightImportToFixture(content, fixtureImportPath) {
 // and storageState auto-load that auth-gated SPAs need — without it, every UI
 // test redirects to '/' and fails on `url.toContain('/dashboard')`. The cursor
 // overlay is a separate, optional concern; see applyMouseCursorOverlayToGeneratedTests.
-function ensureHealixFixtureImports({ projectPath, roles = [] }) {
-  const generatedDir = path.join(projectPath, 'tests', 'generated');
+function ensureHealixFixtureImports({ projectPath, roles = [], suiteDir = HEALIX_LEGACY_SUITE_DIR }) {
+  const generatedDir = resolveSuiteDir(projectPath, suiteDir);
   if (!fs.existsSync(generatedDir)) {
     return { applied: false, reason: 'generated_dir_missing' };
   }
@@ -3615,7 +3856,7 @@ function ensureHealixFixtureImports({ projectPath, roles = [] }) {
   };
 }
 
-function applyMouseCursorOverlayToGeneratedTests({ projectPath, enabled }) {
+function applyMouseCursorOverlayToGeneratedTests({ projectPath, enabled, suiteDir = HEALIX_LEGACY_SUITE_DIR }) {
   if (!enabled) {
     return { enabled: false, reason: 'disabled' };
   }
@@ -3624,7 +3865,7 @@ function applyMouseCursorOverlayToGeneratedTests({ projectPath, enabled }) {
   // and run unconditionally. This function is responsible only for the cursor
   // overlay init script, which is the reason fixtures were originally touched
   // here. If the fixture's already in place we're a no-op.
-  const result = ensureHealixFixtureImports({ projectPath });
+  const result = ensureHealixFixtureImports({ projectPath, suiteDir });
   if (!result.applied) {
     return { enabled: false, reason: result.reason };
   }
@@ -3645,8 +3886,8 @@ function resolveFailureAnalysisProvider() {
   return { provider: null, reason: 'HEALIX_API_KEY is required for AI failure analysis' };
 }
 
-function resetGeneratedTestsDir(projectPath) {
-  const testsDir = path.join(projectPath, 'tests', 'generated');
+function resetGeneratedTestsDir(projectPath, suiteDir = HEALIX_LEGACY_SUITE_DIR) {
+  const testsDir = resolveSuiteDir(projectPath, suiteDir);
   fs.rmSync(testsDir, { recursive: true, force: true });
   ensureDir(testsDir);
   return testsDir;
@@ -3662,8 +3903,8 @@ function resetGeneratedTestsDir(projectPath) {
  * Promise chain rejected, so the meta object never made it back out.
  * Disk is the only source of truth that survived the budget trip.
  */
-function rescuePartialGeneration({ projectPath, generatorName, error, startedAt, summarizedReason }) {
-  const testsDir = path.join(projectPath, 'tests', 'generated');
+function rescuePartialGeneration({ projectPath, generatorName, error, startedAt, summarizedReason, suiteDir = HEALIX_AI_SUITE_DIR }) {
+  const testsDir = resolveSuiteDir(projectPath, suiteDir);
   if (!fs.existsSync(testsDir)) return null;
 
   let entries;
@@ -3923,7 +4164,7 @@ function removeHealixOwnedSupplementalAuthConfig(projectPath, reason = 'stale') 
   }
 }
 
-function writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles) {
+function writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles, suiteDir = HEALIX_LEGACY_SUITE_DIR) {
   if (!verifiedRoles || verifiedRoles.length === 0) return null;
   const tierBProjects = verifiedRoles.map((r) => `    {
       name: 'tierB-auth-${normalizeRoleLabel(r.role || r.name || 'user')}',
@@ -3942,7 +4183,7 @@ function writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles) {
 import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
-  testDir: './tests/generated',
+  testDir: ${JSON.stringify(resolveSuiteDir(projectPath, suiteDir))},
   testMatch: [
     '**/*.spec.{ts,js,mts,mjs,cts,cjs}',
     '**/*.test.{ts,js,mts,mjs,cts,cjs}',
@@ -3984,7 +4225,7 @@ ${tierBProjects}
   }
 }
 
-function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
+function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = [], suiteDir = HEALIX_LEGACY_SUITE_DIR) {
   const candidates = [
     'playwright.config.ts',
     'playwright.config.js',
@@ -4015,7 +4256,7 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
       if (verifiedRolesSummary.length > 0) {
         const verifiedRoles = (roles || []).filter((r) => r && r.loginVerified && r.storageStatePath);
         const baseURL = projectInfo.baseURL || 'http://localhost:3000';
-        supplementalAuthConfigPath = writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles);
+        supplementalAuthConfigPath = writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles, suiteDir);
       }
       Logger.info('PipelineWorker', 'Existing Playwright config detected — skipping tier-aware config generation', {
         path: candidate,
@@ -4083,7 +4324,7 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
   const config = `import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
-  testDir: './tests/generated',
+  testDir: ${JSON.stringify(resolveSuiteDir(projectPath, suiteDir))},
   // 60 s per test — Supabase auth + Next.js SSR can easily push past 30 s on cold starts.
   timeout: 60000,
   fullyParallel: true,
@@ -4282,8 +4523,8 @@ function escapeRegExp(value) {
   return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function ensureHealixValidationConfig({ projectPath, targetFilename = null } = {}) {
-  const generatedDir = path.join(projectPath, 'tests', 'generated');
+function ensureHealixValidationConfig({ projectPath, targetFilename = null, suiteDir = HEALIX_LEGACY_SUITE_DIR } = {}) {
+  const generatedDir = resolveSuiteDir(projectPath, suiteDir);
   const validationDir = path.join(projectPath, 'tests', '.healix-validation');
   ensureDir(validationDir);
 
@@ -4291,8 +4532,8 @@ function ensureHealixValidationConfig({ projectPath, targetFilename = null } = {
     ? path.basename(targetFilename)
     : null;
   const configName = safeTarget
-    ? `playwright.validation.${safeTarget.replace(/[^a-zA-Z0-9_.-]/g, '_')}.cjs`
-    : 'playwright.validation.all.cjs';
+    ? `playwright.validation.${String(suiteDir).replace(/[^a-zA-Z0-9_.-]/g, '_')}.${safeTarget.replace(/[^a-zA-Z0-9_.-]/g, '_')}.cjs`
+    : `playwright.validation.${String(suiteDir).replace(/[^a-zA-Z0-9_.-]/g, '_')}.all.cjs`;
   const configPath = path.join(validationDir, configName);
   const testMatch = safeTarget
     ? `[new RegExp(${JSON.stringify(`${escapeRegExp(safeTarget)}$`)})]`
@@ -4325,21 +4566,21 @@ module.exports = {
   };
 }
 
-function normalizeValidationTarget(testTarget) {
+function normalizeValidationTarget(testTarget, suiteDir = HEALIX_LEGACY_SUITE_DIR) {
   const raw = String(testTarget || '').trim();
-  if (!raw || raw === 'tests/generated' || raw === './tests/generated') {
+  if (!raw || raw === suiteDir || raw === `./${suiteDir}` || raw === 'tests/generated' || raw === './tests/generated') {
     return null;
   }
   const filename = path.basename(raw);
   return GENERATED_SPEC_FILE_PATTERN.test(filename) ? filename : null;
 }
 
-async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTests = true, timeoutMs = 90000, testTarget = 'tests/generated' }) {
+async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTests = true, timeoutMs = 90000, testTarget = HEALIX_LEGACY_SUITE_DIR, suiteDir = HEALIX_LEGACY_SUITE_DIR }) {
   if (!validateGeneratedTests) {
     return { valid: true, skipped: true, listedCount: 0 };
   }
 
-  const generatedDir = path.join(projectPath, 'tests', 'generated');
+  const generatedDir = resolveSuiteDir(projectPath, suiteDir);
   if (!fs.existsSync(generatedDir)) {
     return { valid: false, reason: 'generated_tests_missing' };
   }
@@ -4352,8 +4593,8 @@ async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTe
   }
 
   return new Promise((resolve) => {
-    const targetFilename = normalizeValidationTarget(testTarget);
-    const validationConfig = ensureHealixValidationConfig({ projectPath, targetFilename });
+    const targetFilename = normalizeValidationTarget(testTarget, suiteDir);
+    const validationConfig = ensureHealixValidationConfig({ projectPath, targetFilename, suiteDir });
     const testArgs = ['test', '--list', '--config', validationConfig.configPath];
     const command = buildPlaywrightCommand(projectPath, testArgs);
 
@@ -4430,8 +4671,8 @@ function validationCanBeSalvaged(validation = {}) {
   ].includes(reason) || /No tests found|No tests loaded/i.test(`${stderr}\n${stdout}`);
 }
 
-function quarantineGeneratedSpecFilesByName({ projectPath, files = [], reason = 'validation_salvage' } = {}) {
-  const generatedDir = path.join(projectPath, 'tests', 'generated');
+function quarantineGeneratedSpecFilesByName({ projectPath, files = [], reason = 'validation_salvage', suiteDir = HEALIX_LEGACY_SUITE_DIR } = {}) {
+  const generatedDir = resolveSuiteDir(projectPath, suiteDir);
   if (!fs.existsSync(generatedDir)) {
     return { applied: false, reason: 'generated_dir_missing', quarantinedFiles: [] };
   }
@@ -4474,8 +4715,9 @@ async function salvageGeneratedTestValidation({
   timeoutMs = 90000,
   validator = validateGeneratedTestsWithList,
   protectedSpecFiles = [],
+  suiteDir = HEALIX_LEGACY_SUITE_DIR,
 } = {}) {
-  const specFiles = listGeneratedTestFiles(projectPath);
+  const specFiles = listGeneratedTestFiles(projectPath, suiteDir);
   const protectedSet = new Set((protectedSpecFiles || []).map((file) => path.basename(file)).filter(Boolean));
   const event = {
     attempted: false,
@@ -4501,11 +4743,12 @@ async function salvageGeneratedTestValidation({
     const filename = path.basename(filePath);
     const relTarget = path.relative(projectPath, filePath).replace(/\\/g, '/');
     const validation = await validator({
-      projectPath,
-      validateGeneratedTests,
-      timeoutMs: perFileTimeout,
-      testTarget: relTarget,
-    });
+        projectPath,
+        validateGeneratedTests,
+        timeoutMs: perFileTimeout,
+        testTarget: relTarget,
+        suiteDir,
+      });
     if (validation?.valid && Number(validation.listedCount || 0) > 0) {
       event.keptSpecFiles.push({
         filename,
@@ -4537,6 +4780,7 @@ async function salvageGeneratedTestValidation({
       projectPath,
       validateGeneratedTests,
       timeoutMs: Math.max(5000, timeoutMs),
+      suiteDir,
     });
     event.finalValidation = finalValidation;
     if (finalValidation?.valid) {
@@ -4552,6 +4796,7 @@ async function salvageGeneratedTestValidation({
     projectPath,
     files: event.invalidSpecFiles,
     reason: 'validation_salvage',
+    suiteDir,
   });
   event.quarantinedSpecFiles = quarantine.quarantinedFiles || [];
 
@@ -4564,6 +4809,7 @@ async function salvageGeneratedTestValidation({
     projectPath,
     validateGeneratedTests,
     timeoutMs: Math.max(5000, timeoutMs),
+    suiteDir,
   });
   event.finalValidation = finalValidation;
   if (finalValidation?.valid) {
@@ -4584,8 +4830,8 @@ async function salvageGeneratedTestValidation({
  * user sees only the generic "usually caused by missing test runner
  * dependencies" message with no way to diagnose further.
  */
-function buildPipelineDiagnostics({ projectPath, stage, reason, stderr, stdout, qualityAudit, validationSalvage = null } = {}) {
-  const generatedDir = projectPath ? path.join(projectPath, 'tests', 'generated') : null;
+function buildPipelineDiagnostics({ projectPath, stage, reason, stderr, stdout, qualityAudit, validationSalvage = null, suiteDir = HEALIX_LEGACY_SUITE_DIR } = {}) {
+  const generatedDir = projectPath ? resolveSuiteDir(projectPath, suiteDir) : null;
   let firstSpecPreview = null;
   let generatedSpecCount = 0;
 
@@ -5177,8 +5423,8 @@ function findContextualSelectorIssues({ projectPath, blockContent } = {}) {
   return [...new Set(issues)];
 }
 
-function auditGeneratedTestQuality({ projectPath, testType, context, explorationArtifact = null, roles = [] }) {
-  const generatedDir = path.join(projectPath, 'tests', 'generated');
+function auditGeneratedTestQuality({ projectPath, testType, context, explorationArtifact = null, roles = [], suiteDir = HEALIX_LEGACY_SUITE_DIR }) {
+  const generatedDir = resolveSuiteDir(projectPath, suiteDir);
   const apiEndpointCount = effectiveApiEndpoints(context).length;
   Logger.info('PipelineWorker', `[QUALITY AUDIT] Starting audit — testType=${testType} apiEndpoints=${apiEndpointCount} dir=${generatedDir}`);
 
@@ -6137,8 +6383,10 @@ async function maybeRunCoverageTopUp({
   telemetryReporter = null,
   sourceTag = 'saas-topup',
 }) {
+  const suiteDirsForTopUp = defaultSuiteDirsForProject(config.projectPath);
   const before = collectGenerationQuality(config.projectPath, {
     baseURL: config.baseURL || sharedPayload?.projectInfo?.baseURL,
+    suiteDirs: suiteDirsForTopUp,
   });
   const decision = shouldAttemptCoverageTopUp({ config, quality: before });
   if (!decision.attempt) return null;
@@ -6168,6 +6416,7 @@ async function maybeRunCoverageTopUp({
     testType: sharedPayload?.testType || config.testType,
     quality: before,
     routeAccessSummary,
+    suiteDirs: suiteDirsForTopUp,
   });
   let preTopUpAudit = null;
   try {
@@ -6177,6 +6426,7 @@ async function maybeRunCoverageTopUp({
       context: sharedPayload?.context || {},
       explorationArtifact: sharedPayload?.explorationArtifact || null,
       roles: sharedPayload?.roles || [],
+      suiteDir: HEALIX_AI_SUITE_DIR,
     });
   } catch (auditErr) {
     Logger.warn('PipelineWorker', 'Pre-top-up quality audit failed (non-fatal)', {
@@ -6297,6 +6547,7 @@ async function maybeRunCoverageTopUp({
 
     const after = collectGenerationQuality(config.projectPath, {
       baseURL: config.baseURL || sharedPayload?.projectInfo?.baseURL,
+      suiteDirs: defaultSuiteDirsForProject(config.projectPath),
     });
     event.after = after;
     event.status = after.runnableTests > before.runnableTests
@@ -7258,10 +7509,10 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
   const validateGeneratedTests = config.validateGeneratedTests !== false;
   const qualityRecoveryEvents = [];
   let deterministicTier0Pack = null;
+  const validationTimeoutMs = () => Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.validation);
 
   const runValidation = async (generator) => withStageBudget(runBudget, 'validation', async () => {
     const protectedSpecFiles = [];
-    const validationTimeoutMs = () => Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.validation);
     const recordValidationSalvage = (salvage) => {
       generationMeta.validationSalvage = salvage;
       generationMeta.validationSalvageHistory = Array.isArray(generationMeta.validationSalvageHistory)
@@ -7273,6 +7524,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         projectPath: config.projectPath,
         validateGeneratedTests,
         timeoutMs: validationTimeoutMs(),
+        suiteDir: HEALIX_AI_SUITE_DIR,
       });
 
       if (!validation.valid) {
@@ -7282,6 +7534,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           validateGeneratedTests,
           timeoutMs: validationTimeoutMs(),
           protectedSpecFiles,
+          suiteDir: HEALIX_AI_SUITE_DIR,
         });
         recordValidationSalvage(salvage);
         if (statusDir) {
@@ -7374,91 +7627,16 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       throw error;
     };
 
-    const qaContractPack = ensureQaContractSpec({
-      projectPath: config.projectPath,
-      context,
-      roles,
-      testType: config.testType,
-    });
-    if (qaContractPack.written) {
-      Logger.info('PipelineWorker', 'Wrote deterministic QA contract spec', {
-        filename: qaContractPack.filename,
-        generatedTests: qaContractPack.generatedTests,
-        qaContractSummary: qaContractPack.qaContractSummary,
-      });
-      try {
-        const verifiedRoles = (roles || []).filter((role) => role && role.loginVerified && role.storageStatePath);
-        qaContractPack.fixtureWiring = ensureHealixFixtureImports({
-          projectPath: config.projectPath,
-          roles: verifiedRoles,
-        });
-      } catch (fixtureError) {
-        qaContractPack.fixtureWiring = {
-          applied: false,
-          reason: 'qa_contract_fixture_patch_failed',
-          error: fixtureError.message,
-        };
-        Logger.warn('PipelineWorker', 'Failed to wire Healix fixture after QA contract generation', {
-          generator,
-          reason: fixtureError.message,
-        });
-      }
-      if (statusDir) {
-        updateStatus(statusDir, 'generation_quality_recovered', {
-          runId,
-          message: `Added ${qaContractPack.generatedTests} source-derived QA contract test(s).`,
-          qaContractSummary: qaContractPack.qaContractSummary,
-          qaContractQuestions: qaContractPack.qaContractQuestions,
-        }, telemetryReporter);
-      }
-      const qaContractValidation = await validateGeneratedTestsWithList({
-        projectPath: config.projectPath,
-        validateGeneratedTests,
-        timeoutMs: validationTimeoutMs(),
-        testTarget: qaContractPack.filename,
-      });
-      qaContractPack.listValidation = qaContractValidation;
-      generationMeta.qaContractPackListStatus = qaContractValidation.valid ? 'listed' : 'failed';
-      generationMeta.qaContractPackListError = qaContractValidation.valid
-        ? null
-        : {
-            reason: qaContractValidation.reason || 'validation_failed',
-            stderr: qaContractValidation.stderr || null,
-            stdout: qaContractValidation.stdout || null,
-          };
-      if (qaContractValidation.valid) {
-        protectedSpecFiles.push(qaContractPack.filename);
-      } else {
-        const quarantine = quarantineGeneratedSpecFilesByName({
-          projectPath: config.projectPath,
-          files: [{
-            filename: qaContractPack.filename,
-            reason: qaContractValidation.reason || 'qa_contract_validation_failed',
-            stderr: qaContractValidation.stderr || null,
-            stdout: qaContractValidation.stdout || null,
-          }],
-          reason: 'qa_contract_validation_failed',
-        });
-        qaContractPack.quarantine = quarantine;
-        qualityRecoveryEvents.push({
-          type: 'qa_contract_validation_quarantine',
-          ...quarantine,
-        });
-        Logger.warn('PipelineWorker', 'Quarantined invalid deterministic QA contract spec', {
-          generator,
-          filename: qaContractPack.filename,
-          reason: qaContractValidation.reason,
-        });
-        if (statusDir) {
-          updateStatus(statusDir, 'generation_quality_recovered', {
-            runId,
-            message: `Deterministic QA contract spec failed validation and was quarantined: ${qaContractPack.filename}.`,
-            qaContractPackListStatus: 'failed',
-            qaContractPackListError: generationMeta.qaContractPackListError,
-          }, telemetryReporter);
-        }
-      }
-    }
+    const qaContractPack = deterministicTier0Pack || {
+      written: false,
+      qaContractSummary: summarizeQaContracts(context?.qaContracts || {}),
+      qaContractQuestions: buildQaContractQuestions(context?.qaContracts || {}),
+      qaContractWarnings: [],
+      generatedTests: 0,
+    };
+    // Tier-0 contracts are generated and validated before AI generation starts.
+    // This validation stage is AI-suite scoped so AI audit/recovery can never
+    // quarantine deterministic Tier-0 specs.
     generationMeta.qaContractPack = qaContractPack;
     generationMeta.qaContractSummary = qaContractPack.qaContractSummary;
     generationMeta.qaContractQuestions = qaContractPack.qaContractQuestions;
@@ -7479,6 +7657,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       context,
       explorationArtifact,
       roles,
+      suiteDir: HEALIX_AI_SUITE_DIR,
     });
 
     Logger.info('PipelineWorker', '[QUALITY GATE] auditGeneratedTestQuality result', {
@@ -7502,8 +7681,9 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       const validationBeforeQualityRecovery = validation;
       const beforeRecoveryQuality = collectGenerationQuality(config.projectPath, {
         baseURL: config.baseURL || projectInfo?.baseURL,
+        suiteDir: HEALIX_AI_SUITE_DIR,
       });
-      const beforeRecoverySnapshot = snapshotGeneratedSpecFiles(config.projectPath);
+      const beforeRecoverySnapshot = snapshotGeneratedSpecFiles(config.projectPath, HEALIX_AI_SUITE_DIR);
       const rollbackQualityRecovery = ({ recovery, assessment, demoteIfSoft = true } = {}) => {
         const restore = restoreGeneratedSpecSnapshot(config.projectPath, beforeRecoverySnapshot);
         const rollbackEvent = {
@@ -7558,6 +7738,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         projectPath: config.projectPath,
         qualityAudit,
         reason: `${generator}_quality_audit`,
+        suiteDir: HEALIX_AI_SUITE_DIR,
       });
       if (pruning.applied) {
         qualityRecoveryEvents.push(pruning);
@@ -7611,6 +7792,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           context,
           explorationArtifact,
           roles,
+          suiteDir: HEALIX_AI_SUITE_DIR,
         });
         qualityAudit.qualityRecovery = pruning;
         Logger.info('PipelineWorker', '[QUALITY GATE] post-pruning auditGeneratedTestQuality result', {
@@ -7623,6 +7805,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         });
         const afterPruningQuality = collectGenerationQuality(config.projectPath, {
           baseURL: config.baseURL || projectInfo?.baseURL,
+          suiteDir: HEALIX_AI_SUITE_DIR,
         });
         const pruningAssessment = assessQualityRecoveryNetBenefit({
           config,
@@ -7643,6 +7826,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
             context,
             explorationArtifact,
             roles,
+            suiteDir: HEALIX_AI_SUITE_DIR,
           });
         }
         if (qualityAudit.valid) {
@@ -7659,6 +7843,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         qualityAudit,
         reason: `${generator}_quality_audit`,
         hardOnly: true,
+        suiteDir: HEALIX_AI_SUITE_DIR,
       });
       if (quarantine.applied) {
         qualityRecoveryEvents.push(quarantine);
@@ -7715,10 +7900,12 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           context,
           explorationArtifact,
           roles,
+          suiteDir: HEALIX_AI_SUITE_DIR,
         });
         qualityAudit.qualityRecovery = quarantine;
         const afterQuarantineQuality = collectGenerationQuality(config.projectPath, {
           baseURL: config.baseURL || projectInfo?.baseURL,
+          suiteDir: HEALIX_AI_SUITE_DIR,
         });
         const retainedSuite = buildRetainedSuiteRecoveryMeta({
           config,
@@ -7834,12 +8021,16 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           status: 'started',
         };
         try {
-          const recoveredPack = ensureQaContractSpec({
-            projectPath: config.projectPath,
-            context,
-            roles,
-            testType: config.testType,
-          });
+          const recoveredPack = deterministicTier0Pack?.written
+            ? deterministicTier0Pack
+            : ensureQaContractSpec({
+                projectPath: config.projectPath,
+                context,
+                roles,
+                testType: config.testType,
+                outputDir: resolveSuiteDir(config.projectPath, HEALIX_TIER0_SUITE_DIR),
+                suite: 'tier0-deterministic',
+              });
           qaContractRecovery.qaContractPack = {
             written: recoveredPack.written,
             filename: recoveredPack.filename,
@@ -7856,12 +8047,14 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
             recoveredPack.fixtureWiring = ensureHealixFixtureImports({
               projectPath: config.projectPath,
               roles: verifiedRoles,
+              suiteDir: HEALIX_TIER0_SUITE_DIR,
             });
             const recoveredValidation = await validateGeneratedTestsWithList({
               projectPath: config.projectPath,
               validateGeneratedTests,
               timeoutMs: validationTimeoutMs(),
               testTarget: recoveredPack.filename,
+              suiteDir: HEALIX_TIER0_SUITE_DIR,
             });
             recoveredPack.listValidation = recoveredValidation;
             generationMeta.qaContractPackListStatus = recoveredValidation.valid ? 'listed' : 'failed';
@@ -7897,29 +8090,14 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
                 }, telemetryReporter);
               }
 
-              validation = await validateSuiteOrSalvage({
-                stage: 'validation_after_qa_contract_recovery',
+              const demotedContractAudit = demoteSoftQualityAuditErrors(
                 qualityAudit,
+                'qa_contracts_covered_by_tier0'
+              );
+              qualityAudit = {
+                ...demotedContractAudit,
                 qualityRecovery: qaContractRecovery,
-              });
-              if (!validation.valid) {
-                throwValidationFailure({
-                  validation,
-                  stage: 'validation_after_qa_contract_recovery',
-                  qualityAudit,
-                  qualityRecovery: qaContractRecovery,
-                  messageSuffix: ' after QA contract recovery',
-                });
-              }
-
-              qualityAudit = auditGeneratedTestQuality({
-                projectPath: config.projectPath,
-                testType: config.testType,
-                context,
-                explorationArtifact,
-                roles,
-              });
-              qualityAudit.qualityRecovery = qaContractRecovery;
+              };
               generationMeta.qaContractCoverage = qualityAudit.qaContractCoverage || null;
               generationMeta.qaContractSummary = qualityAudit.qaContractSummary || generationMeta.qaContractSummary || null;
               generationMeta.qaContractWarnings = qualityAudit.qaContractWarnings || [];
@@ -7934,13 +8112,11 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
                 qaContractCoverage: qualityAudit.qaContractCoverage,
               });
 
-              if (qualityAudit.valid) {
-                return {
-                  ...validation,
-                  qualityAudit,
-                  qualityRecovery: qaContractRecovery,
-                };
-              }
+              return {
+                ...validation,
+                qualityAudit,
+                qualityRecovery: qaContractRecovery,
+              };
             } else {
               qaContractRecovery.status = 'validation_failed';
               qaContractRecovery.validation = generationMeta.qaContractPackListError;
@@ -8031,7 +8207,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     if (!config.generateTests) return null;
     try {
       const verifiedRoles = (roles || []).filter((r) => r && r.loginVerified && r.storageStatePath);
-      const fixtureResult = ensureHealixFixtureImports({ projectPath: config.projectPath, roles: verifiedRoles });
+      const fixtureResult = ensureHealixFixtureImports({ projectPath: config.projectPath, roles: verifiedRoles, suiteDir: HEALIX_AI_SUITE_DIR });
       if (fixtureResult.applied && fixtureResult.patchedFiles > 0) {
         Logger.info('PipelineWorker', 'Rewrote @playwright/test imports to __healix-fixture', {
           generator: generatorName,
@@ -8123,6 +8299,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           cursorOverlay = applyMouseCursorOverlayToGeneratedTests({
             projectPath: config.projectPath,
             enabled: isVideoCursorEnabled(config),
+            suiteDir: HEALIX_AI_SUITE_DIR,
           });
         } catch (cursorError) {
           cursorOverlay = {
@@ -8244,6 +8421,8 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
             context,
             roles,
             testType: config.testType,
+            outputDir: resolveSuiteDir(config.projectPath, HEALIX_TIER0_SUITE_DIR),
+            suite: 'tier0-deterministic',
           });
           generationMeta.qaContractPack = recoveredPack;
           generationMeta.qaContractSummary = recoveredPack.qaContractSummary;
@@ -8252,8 +8431,21 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           if (!recoveredPack.written || recoveredPack.generatedTests <= 0) {
             throw new Error('No runnable deterministic QA contract tests were available for rescue.');
           }
-          generationMeta.fixtureWiring = applyFixtureWiring(`${generatorName}-qa-contracts`);
-          const validation = await runValidation(`${generatorName}-qa-contracts`);
+          generationMeta.fixtureWiring = ensureHealixFixtureImports({
+            projectPath: config.projectPath,
+            roles: (roles || []).filter((role) => role && role.loginVerified && role.storageStatePath),
+            suiteDir: HEALIX_TIER0_SUITE_DIR,
+          });
+          const validation = recoveredPack.listValidation || await validateGeneratedTestsWithList({
+            projectPath: config.projectPath,
+            validateGeneratedTests,
+            timeoutMs: validationTimeoutMs(),
+            testTarget: recoveredPack.filename,
+            suiteDir: HEALIX_TIER0_SUITE_DIR,
+          });
+          if (!validation?.valid) {
+            throw new Error(`Tier-0 rescue spec did not list cleanly: ${validation?.reason || 'validation_failed'}`);
+          }
           generationMeta.provider = generatorName;
           generationMeta.selectedGenerator = `${generatorName}-qa-contracts`;
           generationMeta.fallbackUsed = false;
@@ -8332,7 +8524,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           });
           return {
             generated: validation.qualityAudit?.totalFiles || 0,
-            files: listGeneratedTestFiles(config.projectPath).map((filePath) => ({
+            files: listGeneratedTestFiles(config.projectPath, HEALIX_TIER0_SUITE_DIR).map((filePath) => ({
               path: filePath,
               filename: path.basename(filePath),
               type: 'qa_contract',
@@ -8362,12 +8554,15 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
   };
 
   const result = await tryGenerator('saas', async () => {
-    const testsDir = resetGeneratedTestsDir(config.projectPath);
+    const tier0Dir = resetGeneratedTestsDir(config.projectPath, HEALIX_TIER0_SUITE_DIR);
+    const testsDir = resetGeneratedTestsDir(config.projectPath, HEALIX_AI_SUITE_DIR);
     deterministicTier0Pack = ensureQaContractSpec({
       projectPath: config.projectPath,
       context,
       roles: roles || [],
       testType: config.testType,
+      outputDir: tier0Dir,
+      suite: 'tier0-deterministic',
     });
     generationMeta.tier0Deterministic = {
       generatedBeforeAi: true,
@@ -8379,6 +8574,29 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         generatedTests: deterministicTier0Pack.generatedTests,
         qaContractSummary: deterministicTier0Pack.qaContractSummary,
       });
+      const tier0Validation = await validateGeneratedTestsWithList({
+        projectPath: config.projectPath,
+        validateGeneratedTests: config.validateGeneratedTests !== false,
+        timeoutMs: Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.validation),
+        testTarget: deterministicTier0Pack.filename,
+        suiteDir: HEALIX_TIER0_SUITE_DIR,
+      });
+      deterministicTier0Pack.listValidation = tier0Validation;
+      generationMeta.qaContractPackListStatus = tier0Validation.valid ? 'listed' : 'failed';
+      generationMeta.qaContractPackListedTests = tier0Validation.listedCount || 0;
+      if (!tier0Validation.valid) {
+        deterministicTier0Pack.quarantine = quarantineGeneratedSpecFilesByName({
+          projectPath: config.projectPath,
+          files: [{
+            filename: deterministicTier0Pack.filename,
+            reason: tier0Validation.reason || 'tier0_validation_failed',
+            stderr: tier0Validation.stderr || null,
+            stdout: tier0Validation.stdout || null,
+          }],
+          reason: 'tier0_validation_failed',
+          suiteDir: HEALIX_TIER0_SUITE_DIR,
+        });
+      }
       if (statusDir) {
         updateStatus(statusDir, 'generation_tier0_ready', {
           runId,
@@ -8613,6 +8831,7 @@ async function runPipeline(config, runId) {
   const statusDir = path.join(config.projectPath, 'healix-reports', '.runs', runId);
   ensureDir(statusDir);
   const telemetryReporter = new MCPTelemetryReporter();
+  const aiOnlyEnforced = strictAIEnabled(config);
 
   // Localhost + HEALIX_GEN_ASYNC is off-path. The async route was added to
   // escape Vercel's 60s cap; for local dev the sync path is faster and doesn't
@@ -8631,6 +8850,17 @@ async function runPipeline(config, runId) {
     ? new WebappClient({ apiKey: process.env.HEALIX_API_KEY })
     : null;
   if (durableClient) {
+    durableClient.createOrUpdateLiveRun({
+      runId,
+      projectName: config.projectName,
+      projectPath: config.projectPath,
+      status: 'created',
+      metadata: {
+        baseURL: config.baseURL || null,
+        testType: config.testType || null,
+        aiOnlyEnforced,
+      },
+    }).catch(() => undefined);
     setDurablePhaseReporter((payload) => {
       durableClient.reportPhase({
         runId,
@@ -8666,8 +8896,6 @@ async function runPipeline(config, runId) {
   let requirementsCoverage = null;
   let phaseResults = null;
   let routeAccessSummary = null;
-  const aiOnlyEnforced = strictAIEnabled(config);
-
   updateStatus(statusDir, 'started', {
     runId,
     message: 'Healix started',
@@ -8845,6 +9073,38 @@ async function runPipeline(config, runId) {
           Logger.warn('PipelineWorker', 'IDE context enrichment failed (best-effort)', { reason: error.message });
         }
       }
+    }
+
+    let staticInventory = null;
+    if (codebaseContext) {
+      updateStatus(statusDir, 'static_analysis', {
+        runId,
+        message: 'Building deterministic source inventory...',
+        aiOnlyEnforced,
+      }, telemetryReporter);
+      staticInventory = buildStaticInventory({ projectPath: config.projectPath, context: codebaseContext });
+      const inventoryPath = writeStaticInventory(statusDir, staticInventory);
+      if (codebaseContext && typeof codebaseContext === 'object') {
+        codebaseContext.staticInventory = staticInventory;
+      }
+      recordRunDecision(statusDir, telemetryReporter, {
+        runId,
+        decisionType: 'static_analysis_decision',
+        phase: 'static_analysis',
+        status: 'success',
+        message: 'Static source inventory built before exploration.',
+        metadata: {
+          inventoryPath,
+          summary: staticInventory.summary,
+          lowAuthoritySources: staticInventory.sourceAuthority.lowAuthoritySources,
+        },
+      });
+      updateStatus(statusDir, 'static_analysis_complete', {
+        runId,
+        message: `Static inventory: ${staticInventory.summary.pages} page(s), ${staticInventory.summary.apiEndpoints} API endpoint(s), ${staticInventory.summary.forms} form(s).`,
+        inventoryPath,
+        inventorySummary: staticInventory.summary,
+      }, telemetryReporter);
     }
 
     // -------------------------------------------------------
@@ -9066,6 +9326,28 @@ async function runPipeline(config, runId) {
           preStartedProc = null;
         }
       }
+    }
+
+    let smokeGate = null;
+    if (config.baseURL) {
+      updateStatus(statusDir, 'smoke_gate', {
+        runId,
+        message: 'Running environment smoke gate...',
+        baseURL: config.baseURL,
+      }, telemetryReporter);
+      smokeGate = await runSmokeGate({
+        config,
+        context: codebaseContext || {},
+        statusDir,
+        runId,
+        telemetryReporter,
+      });
+      if (generationMeta) generationMeta.smokeGate = smokeGate;
+      updateStatus(statusDir, 'smoke-passed', {
+        runId,
+        message: 'Smoke gate passed.',
+        smokeGate,
+      }, telemetryReporter);
     }
 
     // -------------------------------------------------------
@@ -9366,6 +9648,7 @@ async function runPipeline(config, runId) {
 
           const qualityScan = collectGenerationQuality(config.projectPath, {
             baseURL: config.baseURL || projectInfo.baseURL,
+            suiteDirs: [HEALIX_TIER0_SUITE_DIR, HEALIX_AI_SUITE_DIR],
           });
           if (generationMeta?.retainedSuite) {
             qualityScan.retainedSuite = generationMeta.retainedSuite;
@@ -9491,6 +9774,7 @@ async function runPipeline(config, runId) {
           generationAttempt += 1;
           const failureQuality = extractGenerationFailureQuality(generationError) || collectGenerationQuality(config.projectPath, {
             baseURL: config.baseURL || projectInfo.baseURL,
+            suiteDirs: [HEALIX_TIER0_SUITE_DIR, HEALIX_AI_SUITE_DIR],
           });
           const repairRecord = {
             attempt: generationAttempt,
@@ -9591,7 +9875,7 @@ async function runPipeline(config, runId) {
       });
 
       if (telemetryReporter && telemetryReporter.isEnabled()) {
-        const generatedTestFiles = listGeneratedTestFiles(config.projectPath);
+        const generatedTestFiles = listSuiteTestFiles(config.projectPath, [HEALIX_TIER0_SUITE_DIR, HEALIX_AI_SUITE_DIR]);
 
         for (const filePath of generatedTestFiles) {
           telemetryReporter.emitBackground({
@@ -9737,16 +10021,46 @@ async function runPipeline(config, runId) {
       }
     }
 
+    const preferredExecutionSuites = [
+      {
+        name: 'tier0-deterministic',
+        suiteDir: HEALIX_TIER0_SUITE_DIR,
+        files: listGeneratedTestFiles(config.projectPath, HEALIX_TIER0_SUITE_DIR),
+      },
+      {
+        name: 'tier1-ai-generated',
+        suiteDir: HEALIX_AI_SUITE_DIR,
+        files: listGeneratedTestFiles(config.projectPath, HEALIX_AI_SUITE_DIR),
+      },
+    ].filter((suite) => suite.files.length > 0);
+    const legacySuite = {
+      name: 'legacy-generated',
+      suiteDir: HEALIX_LEGACY_SUITE_DIR,
+      files: listGeneratedTestFiles(config.projectPath, HEALIX_LEGACY_SUITE_DIR),
+    };
+    const executableSuites = [
+      ...preferredExecutionSuites,
+      ...((preferredExecutionSuites.length === 0 || config.generateTests === false) && legacySuite.files.length > 0 ? [legacySuite] : []),
+    ];
+    if (generationMeta) {
+      generationMeta.executionSuites = executableSuites.map((suite) => ({
+        name: suite.name,
+        suiteDir: suite.suiteDir,
+        specCount: suite.files.length,
+        files: suite.files.map((filePath) => path.basename(filePath)),
+      }));
+    }
+
     // Guard: before we spin up the user's dev server + Playwright, verify
     // that there's actually something to run. Otherwise Playwright exits 1
     // and its stderr gets polluted by benign webServer warnings (e.g.
     // Next.js's `baseline-browser-mapping` line), which then surface as the
     // pipeline error and drown out the real cause (nothing to execute).
     try {
-      const generatedSpecFiles = listGeneratedTestFiles(config.projectPath);
+      const generatedSpecFiles = executableSuites.flatMap((suite) => suite.files);
       if (!Array.isArray(generatedSpecFiles) || generatedSpecFiles.length === 0) {
         const err = new Error(
-          `No Playwright spec files found in ${path.join(config.projectPath, 'tests', 'generated')}. ` +
+          `No Playwright spec files found in ${path.join(config.projectPath, 'tests/healix-tier0')}, ${path.join(config.projectPath, 'tests/healix-ai')}, or ${path.join(config.projectPath, 'tests/generated')}. ` +
           'Re-run with test generation enabled, or point Healix at a project that already has specs.'
         );
         err.code = 'NO_TESTS_TO_RUN';
@@ -9763,7 +10077,7 @@ async function runPipeline(config, runId) {
         const fallbackCount = generatedSpecFiles.length - nonFallbackCount;
         if (nonFallbackCount === 0 && fallbackCount > 0) {
           const err = new Error(
-            `Test generation was disabled for this run, but the only specs in ${path.join(config.projectPath, 'tests', 'generated')} are Healix fallback stubs ` +
+            `Test generation was disabled for this run, but the only discovered specs are Healix fallback stubs ` +
             `(${fallbackCount} file${fallbackCount === 1 ? '' : 's'} matching fallback-*.spec.*) from a prior generation attempt. ` +
             'These are generic probes, not AC-traced tests. Re-run with "Generate tests" enabled in the config form to get real tests, ' +
             'or manually delete the fallback-*.spec.* files and point Healix at your own specs.'
@@ -9804,40 +10118,11 @@ async function runPipeline(config, runId) {
       // other errors here are diagnostic — don't block the run
     }
 
-    playwright = new PlaywrightIntegration({
-      ...config,
-      timeout: executionTimeout,
-      serverPidFile,
-      onTestProgress: telemetryReporter && telemetryReporter.isEnabled() ? onTestProgress : undefined,
-      // Emit a `dev_server_ready` telemetry event once the primary dev server
-      // responds (HTTP 2xx/3xx/4xx or TCP fallback). Downstream consumers use
-      // this to distinguish cold-start latency from genuine Playwright flakes.
-      onServerReady: ({ elapsedMs, url }) => {
-        updateStatus(statusDir, 'dev_server_ready', {
-          runId,
-          message: `Primary dev server ready at ${url} (${elapsedMs}ms)`,
-          elapsedMs,
-          url,
-          role: 'primary',
-        }, telemetryReporter);
-      },
-      onExecutionRecovery: ({ nextAttempt, maxAttempts, reason, exitCode, signal, timedOut }) => {
-        updateStatus(statusDir, 'playwright_recovering', {
-          runId,
-          message: `Playwright runner crashed during execution; retrying in safe mode (${nextAttempt}/${maxAttempts})...`,
-          reason,
-          exitCode,
-          signal,
-          timedOut,
-          nextAttempt,
-          maxAttempts,
-        }, telemetryReporter);
-      },
-    });
-
     const mcpParallelEnabled =
-      process.env.PLAYWRIGHT_MCP_PARALLEL === 'true' ||
-      process.env.PLAYWRIGHT_MCP_ENABLED === 'true';
+      executableSuites.length === 1 && (
+        process.env.PLAYWRIGHT_MCP_PARALLEL === 'true' ||
+        process.env.PLAYWRIGHT_MCP_ENABLED === 'true'
+      );
 
     recordRunDecision(statusDir, telemetryReporter, {
       runId,
@@ -9849,8 +10134,13 @@ async function runPipeline(config, runId) {
         configPath: config.playwrightConfigResult?.configPath || config.playwrightConfig || null,
         tierBAuthConfigPath: config.tierBAuthConfigPath || null,
         tierBRoles: config.tierBRoles || [],
-        testDir: path.join(config.projectPath, 'tests', 'generated'),
-        generatedSpecCount: listGeneratedTestFiles(config.projectPath).length,
+        suites: executableSuites.map((suite) => ({
+          name: suite.name,
+          testDir: resolveSuiteDir(config.projectPath, suite.suiteDir),
+          generatedSpecCount: suite.files.length,
+          files: suite.files.map((filePath) => path.basename(filePath)),
+        })),
+        generatedSpecCount: executableSuites.reduce((sum, suite) => sum + suite.files.length, 0),
         generationQuality: generationQuality ? {
           totalTests: generationQuality.totalTests,
           runnableTests: generationQuality.runnableTests,
@@ -9893,7 +10183,8 @@ async function runPipeline(config, runId) {
           roles = mergedAuth.roles;
           // Rewrite the fixture file so it embeds the freshest storageState paths
           // (paths don't change but this ensures the file exists post-generation).
-          ensureHealixFixtureImports({ projectPath: config.projectPath, roles: verifiedMerged });
+          ensureHealixFixtureImports({ projectPath: config.projectPath, roles: verifiedMerged, suiteDir: HEALIX_TIER0_SUITE_DIR });
+          ensureHealixFixtureImports({ projectPath: config.projectPath, roles: verifiedMerged, suiteDir: HEALIX_AI_SUITE_DIR });
         }
         Logger.info('PipelineWorker', 'Pre-execution auth refresh complete', {
           verified: verifiedFresh.length,
@@ -9947,9 +10238,96 @@ async function runPipeline(config, runId) {
 
     let testResults;
 
-    testResults = await withStageBudget(runBudget, 'execution', async () => {
+    const mergeSuiteResults = (base, overlay) => {
+      if (!overlay) return base;
+      const artifacts = {
+        screenshots: [],
+        videos: [],
+        traces: [],
+        other: [],
+        ...(base.artifacts || {}),
+      };
+      for (const type of ['screenshots', 'videos', 'traces', 'other']) {
+        artifacts[type] = [
+          ...((base.artifacts && Array.isArray(base.artifacts[type])) ? base.artifacts[type] : []),
+          ...((overlay.artifacts && Array.isArray(overlay.artifacts[type])) ? overlay.artifacts[type] : []),
+        ];
+      }
+      return {
+        ...base,
+        total: Number(base.total || 0) + Number(overlay.total || 0),
+        passed: Number(base.passed || 0) + Number(overlay.passed || 0),
+        failed: Number(base.failed || 0) + Number(overlay.failed || 0),
+        skipped: Number(base.skipped || 0) + Number(overlay.skipped || 0),
+        flaky: Number(base.flaky || 0) + Number(overlay.flaky || 0),
+        duration: Number(base.duration || 0) + Number(overlay.duration || 0),
+        tests: [...(base.tests || []), ...(overlay.tests || [])],
+        failures: [...(base.failures || []), ...(overlay.failures || [])],
+        artifacts,
+      };
+    };
+
+    const annotateSuiteResults = (suite, results) => {
+      const annotatedTests = (results.tests || []).map((test) => ({
+        ...test,
+        tier: suite.name,
+        healixSuite: suite.name,
+      }));
+      return {
+        ...results,
+        tests: annotatedTests,
+        failures: (results.failures || []).map((failure) => ({
+          ...failure,
+          tier: suite.name,
+          healixSuite: suite.name,
+        })),
+        healixSuite: suite.name,
+        suiteDir: suite.suiteDir,
+      };
+    };
+
+    const runOneSuite = async (suite) => {
+      updateStatus(statusDir, suite.name === 'tier0-deterministic' ? 'tier0-running' : 'ai-running', {
+        runId,
+        message: `Running ${suite.name} suite (${suite.files.length} spec${suite.files.length === 1 ? '' : 's'})...`,
+        suite: suite.name,
+        suiteDir: suite.suiteDir,
+        specCount: suite.files.length,
+      }, telemetryReporter);
+
+      playwright = new PlaywrightIntegration({
+        ...config,
+        suiteDir: suite.suiteDir,
+        timeout: executionTimeout,
+        serverPidFile,
+        onTestProgress: telemetryReporter && telemetryReporter.isEnabled() ? onTestProgress : undefined,
+        onServerReady: ({ elapsedMs, url }) => {
+          updateStatus(statusDir, 'dev_server_ready', {
+            runId,
+            message: `Primary dev server ready at ${url} (${elapsedMs}ms)`,
+            elapsedMs,
+            url,
+            role: 'primary',
+            suite: suite.name,
+          }, telemetryReporter);
+        },
+        onExecutionRecovery: ({ nextAttempt, maxAttempts, reason, exitCode, signal, timedOut }) => {
+          updateStatus(statusDir, 'playwright_recovering', {
+            runId,
+            message: `Playwright runner crashed during ${suite.name}; retrying in safe mode (${nextAttempt}/${maxAttempts})...`,
+            reason,
+            exitCode,
+            signal,
+            timedOut,
+            nextAttempt,
+            maxAttempts,
+            suite: suite.name,
+          }, telemetryReporter);
+        },
+      });
+
       if (!mcpParallelEnabled) {
-        return playwright.runTests();
+        return annotateSuiteResults(suite, await playwright.runTests());
       }
 
       Logger.info('PipelineWorker', 'Parallel execution enabled: direct + Playwright MCP');
@@ -9975,20 +10353,105 @@ async function runPipeline(config, runId) {
           projectPath: config.projectPath,
           dedupeStrategy: config.resultMerge?.dedupeStrategy,
         });
-        return merger.mergeResults(directOutcome.value, mcpOutcome.value);
+        return annotateSuiteResults(suite, merger.mergeResults(directOutcome.value, mcpOutcome.value));
       }
 
       if (directOutcome.status === 'fulfilled') {
         Logger.warn('PipelineWorker', 'Playwright MCP execution failed; using direct results only', {
           reason: mcpOutcome.reason?.message,
         });
-        return directOutcome.value;
+        return annotateSuiteResults(suite, directOutcome.value);
       }
 
       Logger.warn('PipelineWorker', 'Direct execution failed; using Playwright MCP results only', {
         reason: directOutcome.reason?.message,
       });
-      return mcpOutcome.value;
+      return annotateSuiteResults(suite, mcpOutcome.value);
+    };
+
+    testResults = await withStageBudget(runBudget, 'execution', async () => {
+      let aggregate = {
+        total: 0,
+        passed: 0,
+        failed: 0,
+        skipped: 0,
+        flaky: 0,
+        duration: 0,
+        tests: [],
+        failures: [],
+        artifacts: { screenshots: [], videos: [], traces: [], other: [] },
+        suiteResults: [],
+        suiteFailures: [],
+      };
+
+      for (const suite of executableSuites) {
+        try {
+          const suiteResults = await runOneSuite(suite);
+          aggregate = mergeSuiteResults(aggregate, suiteResults);
+          aggregate.suiteResults.push({
+            suite: suite.name,
+            suiteDir: suite.suiteDir,
+            total: suiteResults.total,
+            passed: suiteResults.passed,
+            failed: suiteResults.failed,
+            skipped: suiteResults.skipped,
+            duration: suiteResults.duration,
+          });
+          updateStatus(statusDir, suite.name === 'tier0-deterministic' ? 'tier0-complete' : 'ai-complete', {
+            runId,
+            message: `${suite.name} complete: ${suiteResults.passed}/${suiteResults.total} passed`,
+            suite: suite.name,
+            results: {
+              total: suiteResults.total,
+              passed: suiteResults.passed,
+              failed: suiteResults.failed,
+              skipped: suiteResults.skipped,
+              duration: suiteResults.duration,
+            },
+          }, telemetryReporter);
+        } catch (suiteError) {
+          const suiteFailure = {
+            suite: suite.name,
+            suiteDir: suite.suiteDir,
+            message: suiteError?.message || String(suiteError),
+            code: suiteError?.code || classifyErrorCode(suiteError),
+          };
+          aggregate.suiteFailures.push(suiteFailure);
+          Logger.warn('PipelineWorker', 'Suite execution failed', suiteFailure);
+          updateStatus(statusDir, suite.name === 'tier0-deterministic' ? 'tier0-failed' : 'ai-failed', {
+            runId,
+            message: `${suite.name} execution failed: ${suiteFailure.message}`,
+            suite: suite.name,
+            suiteDir: suite.suiteDir,
+            errorCode: suiteFailure.code,
+            error: suiteFailure.message,
+          }, telemetryReporter);
+          if (suite.name === 'tier0-deterministic' && executableSuites.length === 1) {
+            throw suiteError;
+          }
+        }
+      }
+
+      if (aggregate.total === 0) {
+        const failure = aggregate.suiteFailures[0];
+        const err = new Error(failure
+          ? `No executable Healix suite completed. First failure (${failure.suite}): ${failure.message}`
+          : 'No executable Healix suite completed.');
+        err.code = failure?.code || 'NO_TESTS_TO_RUN';
+        err.diagnostics = {
+          stage: 'execution',
+          reason: 'no_suite_results',
+          suiteFailures: aggregate.suiteFailures,
+          generatedSpecCount: executableSuites.reduce((sum, suite) => sum + suite.files.length, 0),
+        };
+        throw err;
+      }
+
+      if (aggregate.suiteFailures.length > 0) {
+        aggregate.partialExecution = true;
+        aggregate.partialExecutionReason = 'one_or_more_suites_failed';
+      }
+      return aggregate;
     });
     if (progressFlushTimer) {
       clearTimeout(progressFlushTimer);
@@ -10000,8 +10463,21 @@ async function runPipeline(config, runId) {
       total: testResults.total,
       passed: testResults.passed,
       failed: testResults.failed,
+      partialExecution: !!testResults.partialExecution,
     });
     phaseResults = testResults.phaseResults || null;
+    if (generationMeta) {
+      generationMeta.executionSuites = generationMeta.executionSuites || executableSuites.map((suite) => ({
+        name: suite.name,
+        suiteDir: suite.suiteDir,
+        specCount: suite.files.length,
+        files: suite.files.map((filePath) => path.basename(filePath)),
+      }));
+      generationMeta.executionSuiteResults = testResults.suiteResults || [];
+      generationMeta.executionSuiteFailures = testResults.suiteFailures || [];
+      generationMeta.partialExecution = !!testResults.partialExecution;
+      generationMeta.partialExecutionReason = testResults.partialExecutionReason || null;
+    }
     if (generationMeta && testResults.tierBAuthPass) {
       generationMeta.tierBAuthPass = testResults.tierBAuthPass;
     }
@@ -10030,7 +10506,7 @@ async function runPipeline(config, runId) {
       allSkippedError.diagnostics = {
         stage: 'execution',
         reason: 'playwright_all_tests_skipped',
-        generatedSpecCount: listGeneratedTestFiles(config.projectPath).length,
+        generatedSpecCount: executableSuites.reduce((sum, suite) => sum + suite.files.length, 0),
         qualityAuditErrors: ['zero_runnable_tests'],
         routeAccessSummary,
       };
@@ -10294,9 +10770,22 @@ async function runPipeline(config, runId) {
       ? `${Math.round((testResults.passed / testResults.total) * 100)}%`
       : '0%';
 
-    updateStatus(statusDir, 'completed', {
+    const aiUnavailableTier0Only = Boolean(
+      generationMeta?.partialGenerationWarning?.reason === 'ai_generation_empty_qa_contract_rescue' ||
+      (generationMeta?.selectedGenerator && String(generationMeta.selectedGenerator).endsWith('-qa-contracts'))
+    );
+    if (generationMeta && aiUnavailableTier0Only) {
+      generationMeta.completedPartialReason = 'ai_generation_unavailable_tier0_only';
+    }
+    const terminalPhase = testResults.partialExecution || aiUnavailableTier0Only ? 'completed-partial' : 'completed';
+    const terminalMessage = testResults.partialExecution
+      ? `Pipeline complete with partial suite execution — ${passRate} pass rate`
+      : aiUnavailableTier0Only
+        ? `Pipeline complete with deterministic Tier-0 results; AI generation was unavailable — ${passRate} pass rate`
+        : `Pipeline complete — ${passRate} pass rate`;
+    updateStatus(statusDir, terminalPhase, {
       runId,
-      message: `Pipeline complete — ${passRate} pass rate`,
+      message: terminalMessage,
       results: {
         total: testResults.total,
         passed: testResults.passed,
@@ -10389,7 +10878,8 @@ async function runPipeline(config, runId) {
     });
     attachPipelineDecisionSummary(errorGenerationMeta, statusDir);
 
-    updateStatus(statusDir, 'error', {
+    const pipelineFailurePhase = errorCode === 'INFRASTRUCTURE_FAILURE' ? 'infra-failed' : 'error';
+    updateStatus(statusDir, pipelineFailurePhase, {
       runId,
       message: `Pipeline failed: ${userFacingError}`,
       error: userFacingError,
@@ -10479,7 +10969,7 @@ async function runPipeline(config, runId) {
         ? Number(error.diagnostics.generatedSpecCount)
         : (Number.isFinite(Number(validationSalvage?.originalSpecCount))
             ? Number(validationSalvage.originalSpecCount)
-            : listGeneratedTestFiles(config.projectPath).length);
+            : listSuiteTestFiles(config.projectPath, [HEALIX_TIER0_SUITE_DIR, HEALIX_AI_SUITE_DIR]).length);
       const pipelineDecisionSummary = buildPipelineDecisionSummary(statusDir);
       const pipelineError = {
         errorCode,
@@ -10537,7 +11027,7 @@ async function runPipeline(config, runId) {
       recordRunDecision(statusDir, telemetryReporter, {
         runId,
         decisionType: 'dashboard_sync_decision',
-        phase: 'error_reported',
+            phase: pipelineFailurePhase === 'infra-failed' ? 'infra-failed' : 'error_reported',
         status: errorReport.actualRunId || errorReport.url ? 'success' : 'warning',
         message: errorReport.actualRunId
           ? 'Error report synced to dashboard.'
@@ -10551,7 +11041,7 @@ async function runPipeline(config, runId) {
       attachPipelineDecisionSummary(errorGenerationMeta, statusDir);
       patchReportWithPipelineDecisionSummary(errorReport.path, statusDir);
 
-      updateStatus(statusDir, 'error_reported', {
+      updateStatus(statusDir, pipelineFailurePhase === 'infra-failed' ? 'infra-failed' : 'error_reported', {
         runId,
         message: 'Pipeline failed and error report was generated.',
         errorCode,

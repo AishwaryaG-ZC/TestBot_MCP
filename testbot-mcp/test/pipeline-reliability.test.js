@@ -459,6 +459,8 @@ test('deterministic QA contract spec uses live property checks and accessible fo
   assert.match(spec.content, /requestSubmit\(\)/);
   assert.doesNotMatch(spec.content, /checkValidity\(/);
   assert.doesNotMatch(spec.content, /\$\{separator\}|\$\{encodeURIComponent|healix\.local/);
+  assert.ok(spec.content.includes('if (/^\\/api\\/comments\\/issue\\/[:{]/.test(normalized))'));
+  assert.equal(spec.content.includes('if (/^/api/comments/issue/[:{]/.test(normalized))'), false);
 });
 
 test('Tier-0 QA contracts generate a11y status boundary and RBAC invariants', () => {

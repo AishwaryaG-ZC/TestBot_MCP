@@ -466,14 +466,18 @@ function StatusBadge({ status }: { status: string }) {
 
 function runStatusLabel(status: string | null | undefined): string {
   if (status === 'completed_with_findings') return 'completed with findings';
+  if (status === 'completed-partial') return 'completed partial';
+  if (status === 'infra-failed') return 'infra failed';
   return status || 'unknown';
 }
 
 function runStatusClass(status: string | null | undefined): string {
   if (status === 'passed') return 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400';
   if (status === 'failed') return 'bg-red-500/10 border border-red-500/20 text-red-400';
-  if (status === 'running') return 'bg-blue-500/10 border border-blue-500/20 text-blue-400';
+  if (status === 'infra-failed' || status === 'stalled') return 'bg-red-500/10 border border-red-500/20 text-red-300';
+  if (status === 'running' || status === 'created' || status?.includes('running')) return 'bg-blue-500/10 border border-blue-500/20 text-blue-400';
   if (status === 'completed_with_findings') return 'bg-amber-500/10 border border-amber-500/25 text-amber-300';
+  if (status === 'completed-partial') return 'bg-amber-500/10 border border-amber-500/25 text-amber-300';
   return 'bg-amber-500/10 border border-amber-500/20 text-amber-400';
 }
 
