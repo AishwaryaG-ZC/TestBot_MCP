@@ -1239,6 +1239,10 @@ IMPORTANT: Return ONLY valid JSON.`
             requiresAuth: !!contract.requiresAuth,
             runnable: contract.runnable !== false,
           })),
+          a11yContracts: (context.qaContracts.a11yContracts || []).slice(0, 25),
+          statusCodeContracts: (context.qaContracts.statusCodeContracts || []).slice(0, 25),
+          boundaryValidationContracts: (context.qaContracts.boundaryValidationContracts || []).slice(0, 25),
+          rbacContracts: (context.qaContracts.rbacContracts || []).slice(0, 25),
         }
       : null
 
@@ -1446,7 +1450,7 @@ IMPORTANT: Return ONLY valid JSON.`
       'A button click or form submit does not imply navigation. Only assert a URL change when OBSERVED_FLOWS endCondition, routeAccess, or sourceContext proves that exact action navigates; otherwise assert visible in-place feedback, changed button state, toast/dialog/inline message, or continued page usability.',
       'Do not assert conditional UI before triggering its condition. Menus, dropdowns, dialogs, accordions, drawers, mobile nav, filters, tabs, and collapsed panels must be opened/selected first, then asserted within the opened container.',
       'Avoid contradictory before/after assertions. After a transition, assert either the pre-state remains because the app stayed in place, or the post-state appears because the transition completed; never both in the same success path.',
-      'When CONTEXT_JSON.context.qaContracts is present, generated tests may include the listed [QAC:<id>] markers and must follow those source-derived contracts exactly. Filter contracts assert every returned row satisfies the inferred field equality; form-validation contracts assert role="alert" or aria-invalid="true" after empty required submit; delete-status contracts with requiresConfirmation are advisory and must not be turned into hard failures unless source explicitly requires 204.',
+      'When CONTEXT_JSON.context.qaContracts is present, generated tests may include listed [QAC:<id>] markers only for exact source-derived contracts. Deterministic Tier-0 owns a11y, filter, status, boundary, form-validation, and RBAC contract coverage; AI tests should not duplicate or weaken those contracts.',
     )
     const payloadObj = payload as { prd?: string } | null
     if (payloadObj?.prd && String(payloadObj.prd).trim()) {

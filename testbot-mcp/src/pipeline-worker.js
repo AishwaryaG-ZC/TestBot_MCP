@@ -459,6 +459,24 @@ function countSkippedTestsInContent(content) {
   return declarationMatches.length + runtimeSkips;
 }
 
+function countSkippedTestDeclarationsInContent(content) {
+  if (!content) return 0;
+  const text = String(content);
+  const skipDeclarationPattern = /\b(?:test|it)\.skip\s*\(\s*(['"`])[\s\S]*?\1\s*,\s*(?:async\s*)?(?:\(|function\b)/g;
+  return (text.match(skipDeclarationPattern) || []).length;
+}
+
+function countSkippedTestsForGeneratedFile(content, filename = '') {
+  // Deterministic contract specs use runtime test.skip(...) guards when a live
+  // sample or concrete route is unavailable. Those guards are valid runtime
+  // behavior, not skipped declarations, and must not tank the generation
+  // runnable-ratio gate before Playwright has a chance to execute the suite.
+  if (/healix-qa-contracts\.spec\.[cm]?[jt]s$/i.test(String(filename || ''))) {
+    return countSkippedTestDeclarationsInContent(content);
+  }
+  return countSkippedTestsInContent(content);
+}
+
 function buildRouteAccessSummary(explorationArtifact) {
   const routes = Array.isArray(explorationArtifact?.routes) ? explorationArtifact.routes : [];
   const publicRoutes = routes
@@ -909,7 +927,7 @@ function extractSpecSignals(content, filename = null) {
   }
 
   const totalTests = countTestsInContent(text);
-  const skippedTests = countSkippedTestsInContent(text);
+  const skippedTests = countSkippedTestsForGeneratedFile(text, filename);
   return {
     filename,
     testTitles: extractGeneratedTestTitles(text),
@@ -2037,7 +2055,7 @@ function collectGenerationQuality(projectPath, options = {}) {
     }
 
     totalTests += countTestsInContent(content);
-    skippedTests += countSkippedTestsInContent(content);
+    skippedTests += countSkippedTestsForGeneratedFile(content, path.basename(filePath));
     const detected = detectCoverageCategoriesFromContent(content, path.basename(filePath));
     for (const category of detected) {
       categories[category] = (categories[category] || 0) + 1;
@@ -5343,7 +5361,7 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
     }
 
     const fileTests = countTestsInContent(content);
-    const fileSkippedTests = Math.min(countSkippedTestsInContent(content), fileTests);
+    const fileSkippedTests = Math.min(countSkippedTestsForGeneratedFile(content, name), fileTests);
     summary.totalTests += fileTests;
     summary.skippedTests += fileSkippedTests;
 
@@ -7240,6 +7258,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
 
   const validateGeneratedTests = config.validateGeneratedTests !== false;
   const qualityRecoveryEvents = [];
+  let deterministicTier0Pack = null;
 
   const runValidation = async (generator) => withStageBudget(runBudget, 'validation', async () => {
     const protectedSpecFiles = [];
@@ -8216,10 +8235,10 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         }
       }
 
-      const hasQaContracts =
-        (context?.qaContracts?.filterContracts || []).length > 0 ||
-        (context?.qaContracts?.formValidationContracts || []).length > 0;
-      if (hasQaContracts && ['ALL_AGENTS_FAILED', 'GENERATION_FAILED', 'WEBAPP_TIMEOUT', 'WEBAPP_UNREACHABLE'].includes(errorCode)) {
+      const qaSummary = summarizeQaContracts(context?.qaContracts || {});
+      const hasQaContracts = Boolean(deterministicTier0Pack?.written) || Object.entries(qaSummary)
+        .some(([key, value]) => key !== 'advisoryQuestions' && Number(value || 0) > 0);
+      if (hasQaContracts && !['AUTH_REQUIRED_NO_CREDENTIALS'].includes(errorCode)) {
         try {
           const recoveredPack = ensureQaContractSpec({
             projectPath: config.projectPath,
@@ -8243,8 +8262,32 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
             reason: 'ai_generation_empty_qa_contract_rescue',
             generator: generatorName,
             partialsWrittenCount: validation.qualityAudit?.totalFiles || recoveredPack.generatedTests || 0,
-            message: 'AI generation returned no usable files; proceeding with deterministic source-derived QA contract tests.',
+            message: 'AI generation returned no usable files; proceeding with deterministic Tier-0 source-derived QA contract tests.',
           };
+          if (statusDir) {
+            recordRunDecision(statusDir, telemetryReporter, {
+              runId,
+              decisionType: 'tier0_decision',
+              phase: 'generation_tier0_rescue',
+              status: 'warning',
+              message: 'Tier-0 deterministic specs survived AI generation failure and will be used for execution.',
+              metadata: {
+                aiErrorCode: errorCode,
+                qaContractSummary: recoveredPack.qaContractSummary,
+                generatedTests: recoveredPack.generatedTests,
+                validation: {
+                  valid: validation?.valid,
+                  listedCount: validation?.listedCount,
+                  qualityAudit: validation?.qualityAudit ? {
+                    valid: validation.qualityAudit.valid,
+                    totalFiles: validation.qualityAudit.totalFiles,
+                    runnableTests: validation.qualityAudit.runnableTests,
+                    errors: validation.qualityAudit.errors,
+                  } : null,
+                },
+              },
+            });
+          }
           if (Array.isArray(error?.agentFailures) && error.agentFailures.length > 0) {
             const requestedAgents = pickAgentsForRun(config.testType, projectInfo, context);
             generationMeta.agentsRequested = requestedAgents;
@@ -8321,6 +8364,44 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
 
   const result = await tryGenerator('saas', async () => {
     const testsDir = resetGeneratedTestsDir(config.projectPath);
+    deterministicTier0Pack = ensureQaContractSpec({
+      projectPath: config.projectPath,
+      context,
+      roles: roles || [],
+      testType: config.testType,
+    });
+    generationMeta.tier0Deterministic = {
+      generatedBeforeAi: true,
+      ...deterministicTier0Pack,
+    };
+    if (deterministicTier0Pack.written) {
+      Logger.info('PipelineWorker', 'Generated Tier-0 deterministic QA contract pack before AI generation', {
+        filename: deterministicTier0Pack.filename,
+        generatedTests: deterministicTier0Pack.generatedTests,
+        qaContractSummary: deterministicTier0Pack.qaContractSummary,
+      });
+      if (statusDir) {
+        updateStatus(statusDir, 'generation_tier0_ready', {
+          runId,
+          message: `Generated ${deterministicTier0Pack.generatedTests} deterministic Tier-0 QA contract test(s).`,
+          qaContractSummary: deterministicTier0Pack.qaContractSummary,
+          qaContractQuestions: deterministicTier0Pack.qaContractQuestions,
+        }, telemetryReporter);
+        recordRunDecision(statusDir, telemetryReporter, {
+          runId,
+          decisionType: 'tier0_decision',
+          phase: 'generation_tier0_ready',
+          status: 'success',
+          message: 'Tier-0 deterministic QA contract pack was generated before AI agents.',
+          metadata: {
+            generatedTests: deterministicTier0Pack.generatedTests,
+            generatedContracts: deterministicTier0Pack.generatedContracts,
+            qaContractSummary: deterministicTier0Pack.qaContractSummary,
+            qaContractQuestions: deterministicTier0Pack.qaContractQuestions,
+          },
+        });
+      }
+    }
     const saasResult = await maybeGenerateViaSaaS({
       config,
       context,
@@ -9512,9 +9593,12 @@ async function runPipeline(config, runId) {
               },
             });
             const qaContractOnlyRescue =
-              generationMeta?.partialGenerationWarning?.reason === 'ai_generation_empty_qa_contract_rescue' &&
               qualityScan.runnableTests > 0 &&
-              (generationMeta?.qaContractPack?.generatedTests || 0) > 0 &&
+              (
+                (generationMeta?.qaContractPack?.generatedTests || 0) > 0 ||
+                (generationMeta?.tier0Deterministic?.generatedTests || 0) > 0 ||
+                generationMeta?.partialGenerationWarning?.reason === 'ai_generation_empty_qa_contract_rescue'
+              ) &&
               qualityGate.error?.code === 'INSUFFICIENT_RUNNABLE_COVERAGE';
             if (qaContractOnlyRescue) {
               const rescuedQuality = {
@@ -9525,7 +9609,7 @@ async function runPipeline(config, runId) {
                   ...((qualityGate.error.generationQuality || {}).qualityWarnings || []),
                   {
                     code: 'AI_GENERATION_UNAVAILABLE_QA_CONTRACT_RESCUE',
-                    message: 'AI generation was unavailable, but deterministic source-derived QA contract tests were valid and will run.',
+                    message: 'Deterministic Tier-0 source-derived QA contract tests are valid and will run even though AI coverage is below target.',
                     actual: qualityScan.runnableTests,
                     expected: qualityGate.error.generationQuality?.minimumUsefulRunnableFloor || null,
                     severity: 'warning',
@@ -9534,20 +9618,21 @@ async function runPipeline(config, runId) {
               };
               generationQuality = rescuedQuality;
               codebaseContext = activeGenerationContext;
-              Logger.warn('PipelineWorker', 'Executing deterministic QA contract rescue below normal useful floor', {
+              Logger.warn('PipelineWorker', 'Executing deterministic Tier-0 QA contract suite below normal useful floor', {
                 runId,
                 runnableTests: qualityScan.runnableTests,
-                qaContractTests: generationMeta.qaContractPack.generatedTests,
+                qaContractTests: generationMeta.qaContractPack?.generatedTests || generationMeta.tier0Deterministic?.generatedTests || 0,
               });
               recordRunDecision(statusDir, telemetryReporter, {
                 runId,
                 decisionType: 'final_gating_decision',
                 phase: 'generation_quality_gate',
                 status: 'warning',
-                message: 'Deterministic QA contract rescue is allowed below the normal useful floor.',
+                message: 'Tier-0 deterministic tests are allowed below the normal AI useful floor.',
                 metadata: {
                   quality: rescuedQuality,
-                  qaContractTests: generationMeta.qaContractPack.generatedTests,
+                  qaContractTests: generationMeta.qaContractPack?.generatedTests || generationMeta.tier0Deterministic?.generatedTests || 0,
+                  tier0Deterministic: generationMeta.tier0Deterministic || null,
                 },
               });
               break;

@@ -76,6 +76,7 @@ export async function GET(request: NextRequest) {
         backendPassRate: testRuns.backendPassRate,
         frontendPassRate: testRuns.frontendPassRate,
         durationMs: testRuns.durationMs,
+        findingSummary: testRuns.findingSummary,
         framework: testRuns.framework,
         source: testRuns.source,
         createdAt: testRuns.createdAt,
@@ -103,6 +104,7 @@ export async function GET(request: NextRequest) {
       duration_ms: row.durationMs,
       report_json: null,
       ai_analysis: null,
+      finding_summary: row.findingSummary ?? null,
       framework: row.framework,
       source: row.source,
       created_at: row.createdAt?.toISOString() ?? null,
@@ -127,7 +129,7 @@ export async function GET(request: NextRequest) {
       const filteredLiveRuns = liveRuns
         .filter((row) => !existingRunIds.has(String(row.run_id || '')))
         .filter((row) => (status ? row.status === status : true))
-        .map((row) => ({ ...row, report_json: null, ai_analysis: null }))
+        .map((row) => ({ ...row, report_json: null, ai_analysis: null, finding_summary: null }))
 
       if (filteredLiveRuns.length > 0) {
         mergedTotal += filteredLiveRuns.length

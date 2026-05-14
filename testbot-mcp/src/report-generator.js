@@ -420,6 +420,172 @@ class ReportGenerator {
     };
   }
 
+  stableHash(value, length = 16) {
+    return crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, length);
+  }
+
+  categoryFromCatTag(value = '') {
+    const match = String(value || '').match(/\[CAT:([^\]]+)\]/i);
+    if (!match) return null;
+    const cat = match[1].trim().toLowerCase();
+    if (cat === 'a11y' || cat === 'accessibility') return 'a11y';
+    if (cat === 'form_validation' || cat === 'api_negative' || cat === 'boundary_validation') return 'validation';
+    if (cat === 'api_auth' || cat === 'rbac' || cat === 'authz') return 'authz';
+    if (cat === 'filter_logic') return 'filter_logic';
+    if (cat === 'api_contract') {
+      if (/qac-filter|filter|query|search/i.test(value)) return 'filter_logic';
+      return 'http_contract';
+    }
+    return cat.replace(/[^a-z0-9_]+/g, '_') || null;
+  }
+
+  inferQaCategory(test = {}) {
+    const rawText = `${test.title || ''} ${test.file || ''} ${test.suite || ''}`;
+    const taggedCategory = this.categoryFromCatTag(rawText);
+    if (taggedCategory) return taggedCategory;
+    const text = rawText.toLowerCase();
+    if (/form_validation|form-validation|boundary|validation|required|string|whitespace|api_negative/.test(text)) return 'validation';
+    if (/a11y|accessib|aria|interactive/.test(text)) return 'a11y';
+    if (/rbac|authz|api_auth|forbidden|unauthorized/.test(text)) return 'authz';
+    if (/filter|query|search/.test(text)) return 'filter_logic';
+    if (/status|201|202|204|api_contract|contract/.test(text)) return 'http_contract';
+    return 'functional';
+  }
+
+  buildSkipSummary(tests = []) {
+    const skipped = (tests || []).filter((test) => this.normalizeStatus(test.status) === 'skipped');
+    const byCategory = {};
+    const byReason = {};
+    const examples = [];
+    for (const test of skipped) {
+      const category = this.inferQaCategory(test);
+      byCategory[category] = (byCategory[category] || 0) + 1;
+      const text = `${test.error || test.errorMessage || test.title || ''}`;
+      const reason = /fixture|sample|dynamic|No live fixture/i.test(text)
+        ? 'missing_fixture_or_dynamic_sample'
+        : /auth|storage|role/i.test(text)
+          ? 'missing_auth_context'
+          : /skip/i.test(text)
+            ? 'explicit_skip'
+            : 'unspecified_skip';
+      byReason[reason] = (byReason[reason] || 0) + 1;
+      if (examples.length < 8) {
+        examples.push({
+          title: this.stripAnsiAndNormalize(test.title || test.name || 'Unnamed skipped test'),
+          file: this.normalizePathForReport(test.file || ''),
+          category,
+          reason,
+        });
+      }
+    }
+    const total = skipped.length;
+    return {
+      total,
+      byCategory,
+      byReason,
+      examples,
+      status: total >= 10 || total / Math.max(1, tests.length) > 0.25 ? 'coverage_degraded' : 'ok',
+    };
+  }
+
+  severityForQaCategory(category, test = {}) {
+    const text = `${test.title || ''} ${test.file || ''} ${test.error || ''}`.toLowerCase();
+    if (category === 'authz' || /data exposure|security|admin.*users/.test(text)) return 'P0';
+    if (['http_contract', 'validation', 'filter_logic'].includes(category)) return 'P1';
+    if (category === 'a11y') return 'P2';
+    return 'P2';
+  }
+
+  buildQaTestCaseRuns({ projectPath, projectName, tests = [] }) {
+    const projectFingerprint = this.stableHash(`${projectName || ''}:${this.normalizePathForReport(projectPath || '')}`, 24);
+    return (tests || []).map((test) => {
+      const category = this.inferQaCategory(test);
+      const stableTestId = this.stableHash(`${projectFingerprint}:${test.file || ''}:${test.title || ''}`, 24);
+      const title = this.stripAnsiAndNormalize(test.title || test.name || 'Unnamed test');
+      return {
+        stableTestId,
+        projectFingerprint,
+        tier: /\[QAC:|healix-qa-contracts/i.test(`${test.title || ''} ${test.file || ''}`)
+          ? 'tier0-deterministic'
+          : 'tier1-ai-generated',
+        category,
+        title,
+        file: this.normalizePathForReport(test.file || ''),
+        status: this.normalizeStatus(test.status),
+        duration: Number(test.duration || 0),
+        sourceHash: this.stableHash(`${test.file || ''}:${title}`),
+      };
+    });
+  }
+
+  buildQaFindings({ projectPath, projectName, tests = [], classifierVerdicts = [] }) {
+    const projectFingerprint = this.stableHash(`${projectName || ''}:${this.normalizePathForReport(projectPath || '')}`, 24);
+    const findings = [];
+    const seen = new Set();
+    for (const test of tests || []) {
+      if (this.normalizeStatus(test.status) !== 'failed') continue;
+      if (test.isPipelineSynthetic || /pipeline-worker|HEALIX_ERROR/i.test(`${test.file || ''} ${test.title || ''}`)) continue;
+      const verdict = (classifierVerdicts || []).find((item) =>
+        item && (item.testName === test.title || item.title === test.title)
+      );
+      if (verdict && ['test_is_wrong', 'environment'].includes(String(verdict.verdict || ''))) continue;
+
+      const deterministicTier0 = /\[QAC:|healix-qa-contracts/i.test(`${test.title || ''} ${test.file || ''}`);
+      const classifierConfirmsAppBug = verdict && String(verdict.verdict || '') === 'app_is_wrong';
+      if (!deterministicTier0 && !classifierConfirmsAppBug) continue;
+
+      const category = this.inferQaCategory(test);
+      const severity = this.severityForQaCategory(category, test);
+      const signature = this.stableHash(`${projectFingerprint}:${category}:${test.file || ''}:${String(test.title || '').replace(/\d+/g, '#')}`, 24);
+      if (seen.has(signature)) continue;
+      seen.add(signature);
+      const errorMessage = typeof test.error === 'string'
+        ? test.error
+        : (test.error?.message || test.error?.value || test.error?.stack || null);
+      findings.push({
+        signature,
+        projectFingerprint,
+        severity,
+        category,
+        findingType: deterministicTier0 ? 'deterministic_contract' : 'app_is_wrong',
+        title: this.stripAnsiAndNormalize(test.title || 'Unnamed failed QA check'),
+        status: 'open',
+        ownerHint: this.normalizePathForReport(test.file || ''),
+        testFile: this.normalizePathForReport(test.file || ''),
+        testTitle: this.stripAnsiAndNormalize(test.title || ''),
+        reproducer: {
+          command: `npx playwright test ${this.normalizePathForReport(test.file || '')}`.trim(),
+          note: 'Generated by Healix from a failed deterministic or generated QA check.',
+        },
+        evidence: this.stripAnsiAndNormalize({
+          error: errorMessage,
+          suite: test.suite || null,
+          qacMarkers: [...String(test.title || '').matchAll(/\[QAC:([^\]]+)\]/g)].map((match) => match[1]),
+          attachments: test.artifacts || null,
+        }),
+      });
+    }
+    return findings;
+  }
+
+  summarizeQaFindings(findings = []) {
+    const bySeverity = { P0: 0, P1: 0, P2: 0, P3: 0 };
+    const byCategory = {};
+    for (const finding of findings || []) {
+      const severity = finding.severity || 'P3';
+      bySeverity[severity] = (bySeverity[severity] || 0) + 1;
+      const category = finding.category || 'unknown';
+      byCategory[category] = (byCategory[category] || 0) + 1;
+    }
+    return {
+      total: findings.length,
+      bySeverity,
+      byCategory,
+      highestSeverity: ['P0', 'P1', 'P2', 'P3'].find((severity) => bySeverity[severity] > 0) || null,
+      status: findings.length > 0 ? 'completed_with_findings' : 'completed',
+    };
+  }
+
   /**
    * Generate a test report
    */
@@ -473,6 +639,20 @@ class ReportGenerator {
     await this.copyPlaywrightHTMLReport(projectPath, reportsDir);
 
     const normalizedAiTriage = this.stripAnsiAndNormalize(aiTriage || null);
+    const normalizedTestsForFindings = testResults.tests || [];
+    const qaFindings = this.buildQaFindings({
+      projectPath,
+      projectName,
+      tests: normalizedTestsForFindings,
+      classifierVerdicts,
+    });
+    const findingSummary = this.summarizeQaFindings(qaFindings);
+    const qaTestCaseRuns = this.buildQaTestCaseRuns({
+      projectPath,
+      projectName,
+      tests: normalizedTestsForFindings,
+    });
+    const skipSummary = this.buildSkipSummary(normalizedTestsForFindings);
 
     const report = {
       metadata: {
@@ -498,6 +678,8 @@ class ReportGenerator {
         aiTriageReason: normalizedAiTriage?.aiTriageReason || null,
         aiEligibleFailures: Number(normalizedAiTriage?.aiEligibleFailures || 0),
         deterministicVerdicts: Number(normalizedAiTriage?.deterministicVerdicts || 0),
+        findingSummary,
+        skipSummary,
       },
       stats: {
         total: Number(testResults.total || 0),
@@ -525,6 +707,10 @@ class ReportGenerator {
       classifierVerdicts: Array.isArray(classifierVerdicts) ? classifierVerdicts : [],
       failureClusters: Array.isArray(failureClusters) ? failureClusters : [],
       aiTriage: normalizedAiTriage,
+      qaFindings: this.stripAnsiAndNormalize(qaFindings),
+      findingSummary: this.stripAnsiAndNormalize(findingSummary),
+      skipSummary: this.stripAnsiAndNormalize(skipSummary),
+      qaTestCaseRuns: this.stripAnsiAndNormalize(qaTestCaseRuns),
     };
 
     const reportFilename = `report-${timestamp.replace(/[:.]/g, '-')}.json`;
@@ -555,6 +741,9 @@ class ReportGenerator {
             flaky_count: report.stats.flaky || 0,
             classifier_verdicts: report.classifierVerdicts || [],
             failure_clusters: report.failureClusters || [],
+            qa_findings: report.qaFindings || [],
+            qa_test_case_runs: report.qaTestCaseRuns || [],
+            finding_summary: report.findingSummary || null,
           }),
         });
 

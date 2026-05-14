@@ -266,9 +266,11 @@ export default function HomePage() {
                               ? 'bg-red-500/10 text-red-400'
                               : test.status === 'running'
                               ? 'bg-blue-500/10 text-blue-400'
+                              : test.status === 'completed_with_findings'
+                              ? 'bg-amber-500/10 text-amber-300'
                               : 'bg-amber-500/10 text-amber-400'
                           }`}>
-                            {test.status}
+                            {test.status === 'completed_with_findings' ? 'findings' : test.status}
                           </span>
                         </td>
                         <td className="px-4 py-4">

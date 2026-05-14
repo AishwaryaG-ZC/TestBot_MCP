@@ -4,7 +4,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { motion, AnimatePresence } from 'framer-motion';
-import type { TestRun, TestFailure, FailureVerdict } from '@/lib/types/database';
+import type { TestRun, TestFailure, FailureVerdict, QaFinding, FindingSummary } from '@/lib/types/database';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -462,6 +462,116 @@ function StatusBadge({ status }: { status: string }) {
   if (s === 'skipped' || s === 'skip' || s === 'pending')
     return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-amber-500/10 text-amber-400">skipped</span>;
   return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-blue-500/10 text-blue-400">{s}</span>;
+}
+
+function runStatusLabel(status: string | null | undefined): string {
+  if (status === 'completed_with_findings') return 'completed with findings';
+  return status || 'unknown';
+}
+
+function runStatusClass(status: string | null | undefined): string {
+  if (status === 'passed') return 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400';
+  if (status === 'failed') return 'bg-red-500/10 border border-red-500/20 text-red-400';
+  if (status === 'running') return 'bg-blue-500/10 border border-blue-500/20 text-blue-400';
+  if (status === 'completed_with_findings') return 'bg-amber-500/10 border border-amber-500/25 text-amber-300';
+  return 'bg-amber-500/10 border border-amber-500/20 text-amber-400';
+}
+
+function severityClass(severity: string | null | undefined): string {
+  const s = String(severity || '').toLowerCase();
+  if (s === 'critical') return 'bg-red-500/15 border-red-500/35 text-red-200';
+  if (s === 'high') return 'bg-orange-500/15 border-orange-500/35 text-orange-200';
+  if (s === 'medium') return 'bg-amber-500/15 border-amber-500/35 text-amber-200';
+  if (s === 'low') return 'bg-blue-500/15 border-blue-500/30 text-blue-200';
+  return 'bg-white/5 border-white/10 text-[#8BA4C8]';
+}
+
+function normalizeFindingSummary(value: unknown, findings: QaFinding[]): FindingSummary | null {
+  if (value && typeof value === 'object') {
+    const summary = value as Partial<FindingSummary>;
+    return {
+      total: Number(summary.total ?? findings.length ?? 0),
+      realTotal: Number(summary.realTotal ?? findings.length ?? 0),
+      bySeverity: summary.bySeverity ?? {},
+      byStatus: summary.byStatus ?? {},
+      byCategory: summary.byCategory ?? {},
+      highestSeverity: summary.highestSeverity ?? null,
+    };
+  }
+  if (findings.length === 0) return null;
+  const bySeverity: Record<string, number> = {};
+  const byStatus: Record<string, number> = {};
+  const byCategory: Record<string, number> = {};
+  for (const finding of findings) {
+    bySeverity[finding.severity] = (bySeverity[finding.severity] || 0) + 1;
+    byStatus[finding.status] = (byStatus[finding.status] || 0) + 1;
+    const category = finding.category || 'uncategorized';
+    byCategory[category] = (byCategory[category] || 0) + 1;
+  }
+  return { total: findings.length, realTotal: findings.length, bySeverity, byStatus, byCategory, highestSeverity: null };
+}
+
+function QaFindingsSection({ summary, findings }: { summary: FindingSummary | null; findings: QaFinding[] }) {
+  if (!summary || (summary.total === 0 && findings.length === 0)) return null;
+  const severityEntries = Object.entries(summary.bySeverity || {})
+    .filter(([, count]) => Number(count) > 0)
+    .sort(([a], [b]) => {
+      const order = ['critical', 'high', 'medium', 'low', 'info'];
+      return (order.indexOf(a) === -1 ? 99 : order.indexOf(a)) - (order.indexOf(b) === -1 ? 99 : order.indexOf(b));
+    });
+  const visibleFindings = findings.slice(0, 8);
+
+  return (
+    <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.28 }} className="glass-card rounded-2xl p-5">
+      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3 mb-4">
+        <div>
+          <h2 className="text-[#F0F6FF] font-semibold text-sm">Findings</h2>
+          <p className="text-[#4A6280] text-xs mt-0.5">
+            {summary.realTotal} actionable finding{summary.realTotal === 1 ? '' : 's'} from this completed run
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {severityEntries.length > 0 ? severityEntries.map(([severity, count]) => (
+            <span key={severity} className={`px-2.5 py-1 rounded-full border text-xs font-semibold ${severityClass(severity)}`}>
+              {severity}: {count}
+            </span>
+          )) : (
+            <span className="px-2.5 py-1 rounded-full border border-white/10 bg-white/5 text-[#8BA4C8] text-xs font-semibold">
+              no severity data
+            </span>
+          )}
+        </div>
+      </div>
+
+      {visibleFindings.length > 0 && (
+        <div className="divide-y divide-white/8 border border-white/8 rounded-xl overflow-hidden">
+          {visibleFindings.map((finding) => (
+            <div key={finding.id} className="p-3 bg-white/[0.02]">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-[#F0F6FF] text-sm font-medium break-words">{finding.title}</div>
+                  <div className="text-[#4A6280] text-[11px] mt-0.5 font-mono break-words">
+                    {[finding.category, finding.test_name, finding.test_file].filter(Boolean).join(' · ')}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  <span className={`px-2 py-0.5 rounded-full border text-[11px] font-semibold ${severityClass(finding.severity)}`}>
+                    {finding.severity}
+                  </span>
+                  <span className="px-2 py-0.5 rounded-full bg-white/5 text-[#8BA4C8] text-[11px] font-semibold">
+                    {finding.status}
+                  </span>
+                </div>
+              </div>
+              {finding.recommendation && (
+                <div className="text-[#BFD4F2] text-xs mt-2 leading-relaxed break-words">{finding.recommendation}</div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </motion.div>
+  );
 }
 
 
@@ -3775,6 +3885,8 @@ export default function TestRunDetailPage() {
       .filter(([, members]) => members.length >= 3)
       .map(([clusterId, members]) => ({ clusterId, members }));
   })();
+  const qaFindings: QaFinding[] = Array.isArray(testRun.qa_findings) ? testRun.qa_findings : [];
+  const findingSummary = normalizeFindingSummary(testRun.finding_summary, qaFindings);
 
   const handleOverride = (failureId: string, verdict: FailureVerdict) => {
     setOverrides((prev) => ({ ...prev, [failureId]: verdict }));
@@ -3806,13 +3918,8 @@ export default function TestRunDetailPage() {
                 {testRun.source}
               </span>
             )}
-            <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
-              testRun.status === 'passed' ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400'
-              : testRun.status === 'failed' ? 'bg-red-500/10 border border-red-500/20 text-red-400'
-              : testRun.status === 'running' ? 'bg-blue-500/10 border border-blue-500/20 text-blue-400'
-              : 'bg-amber-500/10 border border-amber-500/20 text-amber-400'
-            }`}>
-              {testRun.status}
+            <span className={`px-3 py-1 rounded-full text-xs font-semibold ${runStatusClass(testRun.status)}`}>
+              {runStatusLabel(testRun.status)}
             </span>
           </div>
         </div>
@@ -4046,6 +4153,8 @@ export default function TestRunDetailPage() {
           </div>
         </div>
       )}
+
+      <QaFindingsSection summary={findingSummary} findings={qaFindings} />
 
       {/* Results by Section */}
       {totalTests > 0 && (() => {

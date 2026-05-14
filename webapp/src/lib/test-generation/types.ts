@@ -178,10 +178,67 @@ export interface QaFormValidationContract {
   marker?: string
 }
 
+export interface QaA11yContract {
+  id: string
+  type: 'a11y_interactive_name'
+  route: string
+  sourceFile?: string | null
+  requiresAuth?: boolean
+  runnable?: boolean
+  marker?: string
+}
+
+export interface QaStatusCodeContract {
+  id: string
+  type: 'http_status_consistency'
+  method: string
+  path: string
+  sourceFile?: string | null
+  requiredFields?: Array<{ name: string; type?: string }>
+  expectedStatuses?: number[]
+  explicitStatuses?: number[]
+  reason?: string | null
+  requiresAuth?: boolean
+  runnable?: boolean
+  marker?: string
+}
+
+export interface QaBoundaryValidationContract {
+  id: string
+  type: 'boundary_validation'
+  method: string
+  path: string
+  sourceFile?: string | null
+  requiredFields?: Array<{ name: string; type?: string }>
+  invalidCases?: string[]
+  expectedStatuses?: number[]
+  requiresAuth?: boolean
+  runnable?: boolean
+  marker?: string
+}
+
+export interface QaRbacContract {
+  id: string
+  type: 'rbac_matrix'
+  method: string
+  path: string
+  sourceFile?: string | null
+  expectedAnonymousStatuses?: number[]
+  expectedRoleStatuses?: Record<string, number[]>
+  adminOnly?: boolean
+  requiresAuth?: boolean
+  runnable?: boolean
+  marker?: string
+}
+
 export interface QaContracts {
   filterContracts?: QaFilterContract[]
   deleteStatusContracts?: QaDeleteStatusContract[]
   formValidationContracts?: QaFormValidationContract[]
+  a11yContracts?: QaA11yContract[]
+  statusCodeContracts?: QaStatusCodeContract[]
+  boundaryValidationContracts?: QaBoundaryValidationContract[]
+  rbacContracts?: QaRbacContract[]
   summary?: Record<string, number>
   questions?: Array<Record<string, unknown>>
 }
