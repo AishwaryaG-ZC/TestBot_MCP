@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { eq } from 'drizzle-orm'
 import { db } from '@/lib/db'
-import { apiKeys, profiles } from '@/lib/db/schema'
+import { apiKeys, profiles, projectWorkspaces, workspaceMembers } from '@/lib/db/schema'
 import { hashApiKey } from '@/lib/utils/api-keys'
 
 export async function POST(request: NextRequest) {
@@ -80,12 +80,33 @@ export async function POST(request: NextRequest) {
       .set({ lastUsedAt: new Date() })
       .where(eq(apiKeys.id, apiKeyRecord.id))
 
+    // W1: surface workspaces this user belongs to so the MCP can tag runs
+    // with the correct workspaceId. Additive — old clients ignore the field.
+    // Failure here is non-fatal: a user with zero workspaces is the
+    // single-developer baseline and should still validate.
+    let workspaces: Array<{ id: string; projectKey: string; role: string }> = []
+    try {
+      const rows = await db
+        .select({
+          id: projectWorkspaces.id,
+          projectKey: projectWorkspaces.projectKey,
+          role: workspaceMembers.role,
+        })
+        .from(workspaceMembers)
+        .innerJoin(projectWorkspaces, eq(projectWorkspaces.id, workspaceMembers.workspaceId))
+        .where(eq(workspaceMembers.userId, apiKeyRecord.userId))
+      workspaces = rows.map((r) => ({ id: r.id, projectKey: r.projectKey, role: r.role }))
+    } catch (err) {
+      console.error('[MCP Auth Validate] workspace lookup failed (non-fatal)', err)
+    }
+
     return NextResponse.json({
       valid: true,
       userId: apiKeyRecord.userId,
       plan: profile?.plan ?? 'starter',
       tokensRemaining: profile?.tokensRemaining ?? null,
       creditsRemaining: profile?.creditsRemaining ?? null, // kept for legacy clients; prefer tokensRemaining
+      workspaces,
     })
   } catch (error) {
     console.error('[MCP Auth Validate] Unexpected error:', error)

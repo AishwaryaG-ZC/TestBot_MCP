@@ -50,6 +50,10 @@ export async function POST(request: NextRequest) {
     const body = await request.json()
     const api_key: string = rawKey ?? body?.api_key ?? ''
     const prdText: string = typeof body?.prd === 'string' ? body.prd : ''
+    // Per-call model override — used by the MCP worker's model ladder so a
+    // 4xx on one model can be retried with the next rung. Defaults to the
+    // configured server-side model.
+    const requestedModel: string = typeof body?.model === 'string' ? body.model.trim() : ''
 
     if (!api_key) {
       logBlockedRequest({ type: 'MISSING_API_KEY', reason: 'No x-api-key header or api_key body field', endpoint: ENDPOINT })
@@ -136,9 +140,10 @@ export async function POST(request: NextRequest) {
       .set({ lastUsedAt: new Date() })
       .where(eq(apiKeys.id, apiKeyRecord.id))
 
+    const effectiveModel = resolveConfiguredOpenAIModel(requestedModel || null)
     const { parsedPRD, tokenUsage } = await parsePRD(prdText, {
       openaiApiKey: process.env.OPENAI_API_KEY,
-      model: resolveConfiguredOpenAIModel(),
+      model: effectiveModel,
     })
 
     if (tokenUsage.totalTokens > 0) {
@@ -174,8 +179,22 @@ export async function POST(request: NextRequest) {
     })
   } catch (error) {
     console.error('[parse-prd] error:', error)
+    const message = error instanceof Error ? error.message : 'Internal server error'
+    // Surface model-not-found / unsupported-parameter errors as 4xx so the
+    // MCP worker's per-task model ladder can advance to the next rung
+    // instead of hard-failing the whole pipeline.  Run vz2nys died because
+    // `gpt-5.5-mini does not exist` came back as a 500 and the ladder
+    // couldn't tell it apart from a transient server fault.
+    const lower = String(message).toLowerCase()
+    const isModelFault =
+      /model.*(not\s*found|does\s*not\s*exist|unknown|deprecated)/i.test(message) ||
+      /temperature.*not\s*supported|parameter.*unsupported|invalid.*model|unrecognized.*parameter/i.test(message) ||
+      /not_found_error|model_not_found|invalid_request_error/i.test(lower)
+    if (isModelFault) {
+      return NextResponse.json({ error: message, code: 'MODEL_FAULT' }, { status: 400 })
+    }
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
+      { error: message },
       { status: 500 },
     )
   }

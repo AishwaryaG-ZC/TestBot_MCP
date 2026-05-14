@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { workspaceCoverageRegistry, workspaceMembers } from '@/lib/db/schema'
 import { eq, and } from 'drizzle-orm'
 import { requireWorkspaceAuth } from '@/lib/workspace-auth'
+import { computeWorkspaceCoverage } from '@/lib/coverage'
 
 export const runtime = 'nodejs'
 
@@ -11,14 +12,18 @@ type TargetType = typeof VALID_TARGET_TYPES[number]
 
 /**
  * GET /api/workspaces/[id]/coverage
- * Returns distinct covered targets aggregated across all runs for this workspace.
- * Used by MCP to build the existingSuiteManifest before generation.
+ *
+ * Default (no query): MCP-style covered-targets summary.
+ * `?include=matrix` (W4): also returns the AC × tier matrix used by the
+ *   workspace coverage dashboard. Returns empty arrays / zeros when the
+ *   corpus is empty — never 500.
  */
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const auth = await requireWorkspaceAuth(request)
   if ('error' in auth) return auth.error
 
   const { id: workspaceId } = await params
+  const includeMatrix = new URL(request.url).searchParams.get('include') === 'matrix'
 
   const [membership] = await db
     .select({ role: workspaceMembers.role })
@@ -58,9 +63,20 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     }
   }
 
+  let matrix = null
+  if (includeMatrix) {
+    try {
+      matrix = await computeWorkspaceCoverage(workspaceId)
+    } catch (err) {
+      console.error('[coverage] computeWorkspaceCoverage failed', err)
+      matrix = { rows: [], totals: { acsTotal: 0, acsCovered: 0, byTier: { L0: 0, L1: 0, L2: 0, L3: 0 } } }
+    }
+  }
+
   return NextResponse.json({
     covered: { routes, apiEndpoints, categories, requirements },
     totalTargets: routes.length + apiEndpoints.length + categories.length + requirements.length,
+    ...(includeMatrix ? { matrix } : {}),
   })
 }
 

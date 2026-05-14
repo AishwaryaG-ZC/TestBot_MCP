@@ -748,6 +748,7 @@ Rules:
 
 ## Guidelines
 - Import Playwright primitives from the Healix fixture: \`import { test, expect } from './__healix-fixture'\`. Do NOT import from '@playwright/test' — the fixture wraps Playwright with splash-bypass and storageState auto-load required for auth-gated apps.
+- Playwright globals: ONLY \`test(...)\` and \`expect(...)\` are defined. To group tests use \`test.describe(...)\`. To set up/tear down use \`test.beforeEach\`/\`test.afterEach\`. NEVER use bare \`describe\`, \`it\`, \`beforeEach\`, \`afterEach\` — they are undefined in Playwright and the file will fail to load with "ReferenceError: describe is not defined".
 - Tests should be fast and reliable
 - Focus on critical paths that indicate the app is working
 - Include console error detection
@@ -850,7 +851,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks or explanations.`
 - Test both happy paths and error scenarios
 - Use accessible selectors (getByRole, getByLabel, getByText, getByTestId)
 - Add meaningful comments explaining test logic
-- Group related tests in describe blocks
+- Group related tests in \`test.describe(...)\` blocks. NEVER use bare \`describe(...)\` — it is NOT defined in Playwright and the file will fail to load with "ReferenceError: describe is not defined". Same for \`it(...)\` (use \`test(...)\` only) and \`beforeEach\`/\`afterEach\` (use \`test.beforeEach\`/\`test.afterEach\`).
 - Include proper test isolation
 - Splash / intro screens: always wait for the main content area to become interactive before asserting. If the app uses \`aria-hidden\` on \`<main>\` during a splash, use \`await page.waitForSelector('main:not([aria-hidden="true"])', { timeout: 8000 }).catch(() => {})\` after navigation. The __healix-fixture already injects sessionStorage keys to bypass known splash screens, but add the wait as a safety net.
 
@@ -950,6 +951,8 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`
     return `You are an expert API testing engineer. Generate comprehensive Playwright API tests.
 
 ## Guidelines
+- Import Playwright primitives from the Healix fixture: \`import { test, expect } from './__healix-fixture'\`.
+- Playwright globals: ONLY \`test(...)\` and \`expect(...)\` are defined. To group tests use \`test.describe(...)\`. NEVER use bare \`describe\`, \`it\`, \`beforeEach\`, \`afterEach\` — they are undefined in Playwright and the file will fail to load.
 - Use Playwright's request API for HTTP calls
 - Prefer deterministic assertions grounded in CONTEXT_JSON only
 - Test status codes, headers/content-type, and response body contracts
@@ -1019,11 +1022,12 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`
     return `You are an expert E2E testing engineer. Generate comprehensive workflow tests that simulate complete user journeys.
 
 ## Guidelines
+- Import Playwright primitives from the Healix fixture: \`import { test, expect } from './__healix-fixture'\`.
+- Playwright globals: ONLY \`test(...)\` and \`expect(...)\` are defined. Group with \`test.describe(...)\`; never bare \`describe\` or \`it\`. Use \`test.beforeEach\`/\`test.afterEach\`/\`test.afterAll\`; never bare \`beforeEach\`/\`afterEach\`/\`afterAll\` — they are undefined in Playwright and the file will fail to load.
 - Test complete flows from start to finish
 - Include both happy paths and error scenarios
 - Handle async operations and page transitions
 - Verify data persistence across steps
-- Add proper cleanup in test.afterEach/test.afterAll (never bare afterEach/afterAll — those are not defined in Playwright)
 - Use proper test isolation
 - Add detailed comments for each step
 
@@ -1109,6 +1113,8 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`
     return `You are an expert test engineer. Generate tests for error states and edge cases.
 
 ## Guidelines
+- Import Playwright primitives from the Healix fixture: \`import { test, expect } from './__healix-fixture'\`.
+- Playwright globals: ONLY \`test(...)\` and \`expect(...)\` are defined. Group with \`test.describe(...)\`; never bare \`describe\` or \`it\`. Use \`test.beforeEach\`/\`test.afterEach\`; never bare \`beforeEach\`/\`afterEach\` — they are undefined in Playwright.
 - Test error handling and user feedback
 - Verify error messages are clear and helpful
 - Test boundary conditions
@@ -2132,12 +2138,22 @@ Return JSON array only.`
     normalized = normalized.replace(/^```(?:typescript|ts|javascript|js)?\s*/i, '')
     normalized = normalized.replace(/\s*```$/i, '')
     normalized = normalized.replace(/\r\n/g, '\n')
-    // Playwright does not expose bare afterEach/beforeEach/afterAll/beforeAll globals.
-    // Replace any the AI emits with the correct test.* prefixed versions.
-    normalized = normalized.replace(/(?<![.\w])afterEach\s*\(/g, 'test.afterEach(')
-    normalized = normalized.replace(/(?<![.\w])beforeEach\s*\(/g, 'test.beforeEach(')
-    normalized = normalized.replace(/(?<![.\w])afterAll\s*\(/g, 'test.afterAll(')
-    normalized = normalized.replace(/(?<![.\w])beforeAll\s*\(/g, 'test.beforeAll(')
+    // Playwright does not expose bare afterEach/beforeEach/afterAll/beforeAll/describe/it globals.
+    // Replace any the AI emits with the correct test.* prefixed versions so the file
+    // doesn't fail to load with "ReferenceError: describe is not defined". Skip if the
+    // file imports describe/it from a known unit-test runtime (vitest/jest/mocha) — those
+    // files aren't Playwright specs and shouldn't be rewritten.
+    const isExternalRunner = /from\s+['"](?:vitest|@jest\/globals|mocha|node:test)['"]/.test(normalized)
+    if (!isExternalRunner) {
+      normalized = normalized.replace(/(?<![.\w])afterEach\s*\(/g, 'test.afterEach(')
+      normalized = normalized.replace(/(?<![.\w])beforeEach\s*\(/g, 'test.beforeEach(')
+      normalized = normalized.replace(/(?<![.\w])afterAll\s*\(/g, 'test.afterAll(')
+      normalized = normalized.replace(/(?<![.\w])beforeAll\s*\(/g, 'test.beforeAll(')
+      normalized = normalized.replace(/(?<![.\w])describe\s*\(/g, 'test.describe(')
+      // `it(` → `test(` — but be careful not to clobber `awaIt(`, `commIt(`, etc.
+      // The negative lookbehind already covers letters; allow whitespace + ; + { + }.
+      normalized = normalized.replace(/(?<![.\w])it\s*\(/g, 'test(')
+    }
     normalized = normalized.replace(/\.catch\(\s*\(\s*\)\s*=>\s*\{\s*\}\s*\)/g, '.catch(() => undefined)')
     normalized = normalized.replace(
       /(\b(?:main|section|container|card|productCard|product|page))\.getByRole\(\s*(['"])heading\2\s*,\s*\{([^}]*)\}\s*\)/gi,

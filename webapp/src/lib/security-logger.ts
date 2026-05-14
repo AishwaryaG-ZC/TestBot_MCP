@@ -12,6 +12,7 @@ type BlockedRequestType =
   | 'ABUSE_FLAG'
   | 'NO_CREDITS'
   | 'NO_TOKENS'
+  | 'WORKSPACE_NOT_MEMBER'
 
 interface BlockedRequestLog {
   type: BlockedRequestType

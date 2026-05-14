@@ -33,6 +33,7 @@ const ArtifactUploader = require('./artifact-uploader');
 const DashboardLauncher = require('./dashboard-launcher');
 const AIAnalyzer = require('./ai-providers/index');
 const WebappClient = require('./webapp-client');
+const QACorpusWriter = require('./qa-corpus-writer');
 const { startSecondaryServices, stopSecondaryServices, probeHttpReady, waitForServiceReady } = require('./multi-service-starter');
 const { runExplorationPhase, EMPTY_ARTIFACT, artifactHasUsefulContext } = require('./exploration-phase');
 const { injectCredentials, normalizeRoleLabel } = require('./credentials-injector');
@@ -46,6 +47,9 @@ const {
 const Logger = require('./logger');
 const MCPTelemetryReporter = require('./mcp-telemetry');
 const { detectProjectKey } = require('./detect-project-key');
+const TierIsolation = require('./tier-isolation');
+const ModelLadder = require('./model-ladder');
+const PrdChunked = require('./prd-chunked');
 
 // Initialize logger for the worker process
 Logger.initialize();
@@ -353,6 +357,249 @@ function maybeExpandGenerationStageBudget({ runBudget, config = {}, context = {}
   }
 
   return complexity;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W2 — corpus-aware read side.
+//
+// `resolveWorkspaceContext` derives a stable projectKey + projectFingerprint
+// from the target project (git remote, package.json fallback) and asks the
+// webapp to bind it to a workspace. Solo developers get { workspaceId: null }.
+//
+// `fetchCorpusSeed` calls /api/qa-corpus and parses the response into:
+//   { persistedTests, coveredAcTags, coveredEndpoints, lastFindingSignatures }
+// plus contractSnapshots (W1's tier-0 cache) and `raw` for diagnostics.
+//
+// Both helpers are never-throw: any failure produces a benign empty seed and a
+// warning, so a missing/down webapp can never block test generation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const EMPTY_CORPUS_SEED = Object.freeze({
+  persistedTests: [],
+  coveredAcTags: [],
+  coveredEndpoints: [],
+  lastFindingSignatures: [],
+  contractSnapshots: [],
+  raw: null,
+  workspaceId: null,
+  projectFingerprint: null,
+  status: 'empty',
+});
+
+async function resolveWorkspaceContext({ projectPath, client } = {}) {
+  const envWorkspaceId = (process.env.HEALIX_WORKSPACE_ID || '').trim() || null;
+
+  let detected = null;
+  try {
+    detected = detectProjectKey(projectPath);
+  } catch (err) {
+    Logger.warn('PipelineWorker', 'detectProjectKey threw — running in solo mode', {
+      reason: err?.message,
+    });
+  }
+  const projectKey = detected?.projectKey || null;
+  const projectFingerprint = projectKey || null;
+
+  let workspaceId = envWorkspaceId;
+  let resolution = null;
+  if (envWorkspaceId) {
+    Logger.info('PipelineWorker', 'Using HEALIX_WORKSPACE_ID override', { workspaceId: envWorkspaceId });
+    // Still attempt resolve() so we can downgrade to solo on 404 (W2-T5).
+    if (client && projectKey) {
+      try {
+        resolution = await client.resolveWorkspace({ projectKey });
+        if (resolution && resolution.found === false) {
+          Logger.warn('PipelineWorker', 'HEALIX_WORKSPACE_ID set but /api/workspaces/resolve returned 404 — running in solo mode', {
+            envWorkspaceId,
+            projectKey,
+          });
+          workspaceId = null;
+        }
+      } catch (err) {
+        Logger.warn('PipelineWorker', 'resolveWorkspace threw with env override set — keeping override', {
+          reason: err?.message,
+        });
+      }
+    }
+  } else if (client && projectKey) {
+    try {
+      resolution = await client.resolveWorkspace({ projectKey });
+      if (resolution && resolution.workspaceId && resolution.member !== false && resolution.found !== false) {
+        workspaceId = resolution.workspaceId;
+      } else if (resolution && resolution.found === false) {
+        Logger.info('PipelineWorker', 'No workspace exists for this project — running in solo mode', { projectKey });
+      }
+    } catch (err) {
+      Logger.warn('PipelineWorker', 'resolveWorkspace failed (non-blocking) — running in solo mode', {
+        reason: err?.message,
+        code: err?.code,
+      });
+    }
+  }
+
+  return {
+    workspaceId: workspaceId || null,
+    projectKey,
+    projectFingerprint,
+    gitRemote: detected?.gitRemote || null,
+    source: detected?.source || null,
+    resolution: resolution || null,
+  };
+}
+
+async function fetchCorpusSeed({ client, workspaceId, projectFingerprint } = {}) {
+  if (!client || !projectFingerprint || typeof client.fetchCorpus !== 'function') {
+    return { ...EMPTY_CORPUS_SEED, projectFingerprint: projectFingerprint || null };
+  }
+  try {
+    const seed = await client.fetchCorpus(workspaceId || null, projectFingerprint);
+    if (!seed) return { ...EMPTY_CORPUS_SEED, projectFingerprint };
+    return seed;
+  } catch (err) {
+    Logger.warn('PipelineWorker', 'fetchCorpusSeed threw (non-blocking — running as if corpus is empty)', {
+      reason: err?.message,
+      code: err?.code,
+    });
+    return { ...EMPTY_CORPUS_SEED, projectFingerprint };
+  }
+}
+
+/**
+ * Build a Set of contract IDs that the corpus already covers, so Tier-0 emit
+ * can skip regenerating tests that are already persisted.
+ *
+ * Matching:
+ *   1. Exact contract.id appears (case-insensitive) inside any persisted
+ *      tag/case_key/title blob. Catches both `[QAC:filter-get-foo]` and
+ *      `F1.S1.AC1`-style tags whose stripped form equals a contract id.
+ *   2. method+path overlap with a persisted test's metadata.{method,path}.
+ */
+function computeTier0SuppressedContractIds(qaContracts, corpusSeed) {
+  const suppressed = new Set();
+  if (!corpusSeed || !qaContracts) return suppressed;
+  const persistedTests = Array.isArray(corpusSeed.persistedTests) ? corpusSeed.persistedTests : [];
+  if (persistedTests.length === 0) return suppressed;
+
+  const lowerTagBlobs = persistedTests.map((t) => {
+    const parts = [];
+    for (const tag of t.tags || []) {
+      if (typeof tag === 'string') parts.push(tag.toLowerCase());
+    }
+    if (t.caseKey) parts.push(String(t.caseKey).toLowerCase());
+    if (t.title) parts.push(String(t.title).toLowerCase());
+    return parts.join(' | ');
+  });
+
+  const endpointKeys = new Set();
+  for (const t of persistedTests) {
+    const md = t.metadata || {};
+    const method = (md.method || md.httpMethod || '').toString().toUpperCase();
+    const path = (md.path || md.endpoint || md.route || '').toString();
+    if (method && path) endpointKeys.add(`${method} ${path}`.toLowerCase());
+  }
+
+  const buckets = [
+    'filterContracts',
+    'formValidationContracts',
+    'a11yContracts',
+    'statusCodeContracts',
+    'boundaryValidationContracts',
+    'rbacContracts',
+    'deleteStatusContracts',
+  ];
+  for (const bucket of buckets) {
+    const arr = qaContracts[bucket];
+    if (!Array.isArray(arr)) continue;
+    for (const contract of arr) {
+      const cid = (contract?.id || '').toLowerCase();
+      const method = (contract?.method || '').toString().toUpperCase();
+      const path = (contract?.path || contract?.route || '').toString();
+      const epKey = method && path ? `${method} ${path}`.toLowerCase() : null;
+      let hit = false;
+      if (cid) {
+        for (const blob of lowerTagBlobs) {
+          if (blob.includes(cid)) { hit = true; break; }
+        }
+      }
+      if (!hit && epKey && endpointKeys.has(epKey)) hit = true;
+      if (hit) suppressed.add(contract.id);
+    }
+  }
+  return suppressed;
+}
+
+/**
+ * Shallow-cloned qaContracts with each bucket pruned of suppressed ids.
+ * Never mutates the caller's tree.
+ */
+function applyCorpusSeedToQaContracts(qaContracts, suppressedIds) {
+  if (!qaContracts || !suppressedIds || suppressedIds.size === 0) return qaContracts;
+  const out = { ...qaContracts };
+  for (const bucket of Object.keys(out)) {
+    if (Array.isArray(out[bucket])) {
+      out[bucket] = out[bucket].filter((contract) => !suppressedIds.has(contract?.id));
+    }
+  }
+  return out;
+}
+
+/**
+ * Build the prompt-augmentation strings the per-agent generator carries.
+ * The webapp's prompt-builder concatenates `options.corpusGuidance` verbatim
+ * into the system prompt, so the literal `do_not_regenerate:` and
+ * `prioritize_uncovered:` substrings land in the LLM call (W2-T3 asserts).
+ */
+function buildCorpusGuidance({ corpusSeed, parsedPRD } = {}) {
+  const persistedTests = corpusSeed?.persistedTests || [];
+  const coveredAcTags = corpusSeed?.coveredAcTags || [];
+
+  const doNotRegenerate = persistedTests
+    .map((t) => t.caseKey || t.id)
+    .filter(Boolean)
+    .slice(0, 200);
+
+  const prdAcTags = collectAcTagsFromParsedPRD(parsedPRD);
+  const coveredSet = new Set(coveredAcTags.map((t) => String(t).toLowerCase()));
+  const prioritizeUncovered = prdAcTags
+    .filter((tag) => !coveredSet.has(String(tag).toLowerCase()))
+    .slice(0, 200);
+
+  const guidance =
+    `# Healix corpus guidance (W2)\n` +
+    `# The team's persisted QA corpus already includes the tests listed below.\n` +
+    `# Do not regenerate them; spend the budget on the uncovered AC tags instead.\n` +
+    `do_not_regenerate: [${doNotRegenerate.map((id) => JSON.stringify(id)).join(', ')}]\n` +
+    `prioritize_uncovered: [${prioritizeUncovered.map((tag) => JSON.stringify(tag)).join(', ')}]\n`;
+
+  return {
+    corpusGuidance: guidance,
+    doNotRegenerate,
+    prioritizeUncovered,
+  };
+}
+
+function collectAcTagsFromParsedPRD(parsedPRD) {
+  if (!parsedPRD || typeof parsedPRD !== 'object') return [];
+  const out = new Set();
+  const visit = (node) => {
+    if (!node) return;
+    if (Array.isArray(node)) { for (const child of node) visit(child); return; }
+    if (typeof node === 'object') {
+      if (typeof node.id === 'string' && /^F\d+\.S\d+\.AC\d+/i.test(node.id)) out.add(`[REQ:${node.id}]`);
+      if (typeof node.acTag === 'string') out.add(node.acTag);
+      if (typeof node.tag === 'string' && /\[REQ:/i.test(node.tag)) out.add(node.tag);
+      if (Array.isArray(node.acTags)) for (const t of node.acTags) if (typeof t === 'string') out.add(t);
+      if (Array.isArray(node.acceptanceCriteria)) for (const c of node.acceptanceCriteria) visit(c);
+      if (Array.isArray(node.stories)) for (const s of node.stories) visit(s);
+      if (Array.isArray(node.features)) for (const f of node.features) visit(f);
+      for (const key of Object.keys(node)) {
+        const v = node[key];
+        if (v && typeof v === 'object') visit(v);
+      }
+    }
+  };
+  visit(parsedPRD);
+  return [...out];
 }
 
 function resolveGenerationAgentConcurrency(config = {}, agents = []) {
@@ -1641,16 +1888,36 @@ function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason =
 
   const allFiles = fs.readdirSync(generatedDir)
     .filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name));
-  const candidates = (hardOnly
+  const rawCandidates = (hardOnly
     ? extractHardQualityFailureFileNames(qualityAudit, { projectPath })
     : extractQualityFailureFileNames(qualityAudit))
     .filter((name) => allFiles.includes(name));
+
+  // Strip Tier-0 entries up front — they are NEVER quarantine candidates,
+  // even if the quality auditor named them. Quality-audit signal against a
+  // Tier-0 spec is a codegen bug to surface, not a file to hide.
+  const tier0Skipped = [];
+  const candidates = [];
+  for (const name of rawCandidates) {
+    const sourcePath = path.join(generatedDir, name);
+    if (TierIsolation.isTier0Path(projectPath, sourcePath)) {
+      tier0Skipped.push(name);
+      Logger.warn('PipelineWorker', 'Tier-0 file is exempt from quarantine', {
+        filename: name,
+        reason,
+        source: sourcePath,
+      });
+      continue;
+    }
+    candidates.push(name);
+  }
 
   if (candidates.length === 0) {
     return {
       applied: false,
       reason: hardOnly ? 'no_hard_file_specific_failures' : 'no_file_specific_failures',
       quarantinedFiles: [],
+      tier0SkippedFiles: tier0Skipped,
     };
   }
   if (candidates.length >= allFiles.length) {
@@ -1660,6 +1927,7 @@ function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason =
       candidateFiles: candidates,
       totalFiles: allFiles.length,
       quarantinedFiles: [],
+      tier0SkippedFiles: tier0Skipped,
     };
   }
 
@@ -1688,6 +1956,7 @@ function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason =
     hardOnly,
     quarantinedFiles,
     remainingFiles: Math.max(0, allFiles.length - quarantinedFiles.length),
+    tier0SkippedFiles: tier0Skipped,
   };
 }
 
@@ -3089,6 +3358,22 @@ function safeStatusStringify(obj) {
   }, 2);
 }
 
+// Module-level run state, kept in sync by updateStatus(). The
+// process-exit hook below reads these to decide whether the worker died
+// without ever writing a terminal phase — if so, it writes one itself so
+// status.json never freezes at "generating" forever (Run mkgs4f failure).
+const TERMINAL_PHASES = new Set([
+  'tests_complete',
+  'error_reported',
+  'completed',
+  'completed-partial',
+  'pipeline_complete',
+  'aborted',
+]);
+let __activeStatusDir = null;
+let __activeRunId = null;
+let __terminalPhaseReached = false;
+
 /**
  * Write status update to disk so the caller can track progress.
  */
@@ -3103,6 +3388,9 @@ function updateStatus(statusDir, phase, data, telemetryReporter = null) {
       path.join(statusDir, 'status.json'),
       safeStatusStringify(payload)
     );
+    __activeStatusDir = statusDir;
+    if (data && data.runId) __activeRunId = data.runId;
+    if (TERMINAL_PHASES.has(String(phase))) __terminalPhaseReached = true;
     emitPipelineTelemetry(telemetryReporter, payload);
     if (__durablePhaseReporter) {
       try { __durablePhaseReporter(payload); } catch { /* non-blocking */ }
@@ -3110,6 +3398,48 @@ function updateStatus(statusDir, phase, data, telemetryReporter = null) {
   } catch (e) {
     Logger.error('PipelineWorker', 'Failed to write status', e);
   }
+}
+
+/**
+ * Synchronous emergency-status writer used by the process-exit hook.
+ * Cannot be async — the Node event loop is already winding down.
+ */
+function writeEmergencyStatus(reason) {
+  if (!__activeStatusDir) return;
+  if (__terminalPhaseReached) return;
+  try {
+    const payload = {
+      phase: 'error_reported',
+      timestamp: new Date().toISOString(),
+      runId: __activeRunId,
+      errorCode: 'WORKER_EXITED_UNEXPECTEDLY',
+      reason: String(reason || 'worker_exited_unexpectedly'),
+      message: 'Worker process exited before a terminal phase was reached. Status was rescued by the process-exit hook.',
+    };
+    fs.writeFileSync(
+      path.join(__activeStatusDir, 'status.json'),
+      safeStatusStringify(payload)
+    );
+    __terminalPhaseReached = true;
+  } catch { /* nothing more we can do */ }
+}
+
+function installWorkerExitHooks() {
+  process.on('exit', () => writeEmergencyStatus('worker_exited_unexpectedly'));
+  process.on('uncaughtException', (err) => {
+    try { Logger.error('PipelineWorker', 'uncaughtException', err); } catch { /* ignore */ }
+    writeEmergencyStatus(`uncaughtException: ${err?.message || err}`);
+    // Let Node continue its default behavior (exit non-zero); the `exit`
+    // handler above will not double-write because the flag is set.
+  });
+  process.on('SIGTERM', () => {
+    writeEmergencyStatus('worker_received_sigterm');
+    process.exit(143);
+  });
+  process.on('SIGINT', () => {
+    writeEmergencyStatus('worker_received_sigint');
+    process.exit(130);
+  });
 }
 
 function classifyErrorCode(error) {
@@ -3646,10 +3976,43 @@ function resolveFailureAnalysisProvider() {
   return { provider: null, reason: 'HEALIX_API_KEY is required for AI failure analysis' };
 }
 
+/**
+ * Wrap ensureQaContractSpec so the Tier-0 spec is ALSO persisted to
+ * `tests/healix-persistent/tier-0/`. The legacy `tests/generated/` write
+ * inside ensureQaContractSpec is preserved for backward compat — the
+ * persistent copy is the source of truth that survives Tier-1 resets and
+ * AI cleanup paths.
+ */
+function ensureQaContractSpecPersistent(args = {}) {
+  const result = ensureQaContractSpec(args);
+  if (result?.written && result?.path) {
+    try {
+      const dirs = TierIsolation.ensureTierDirs(args.projectPath);
+      const persistentPath = path.join(dirs.tier0, path.basename(result.path));
+      fs.copyFileSync(result.path, persistentPath);
+      result.persistentPath = persistentPath;
+    } catch (err) {
+      Logger.warn('PipelineWorker', 'Failed to persist Tier-0 spec', { reason: err.message });
+    }
+  }
+  return result;
+}
+
 function resetGeneratedTestsDir(projectPath) {
+  // Tier-0 specs are persistent and must survive Tier-1 (AI) resets.
+  // We reset the ephemeral Tier-1 dir, then rebuild the legacy
+  // `tests/generated/` union view from whatever Tier-0 emitted before us.
+  // The result is: AI gets a clean slate, but Playwright still sees
+  // Tier-0 specs at the legacy path the rest of the worker expects.
+  TierIsolation.ensureTierDirs(projectPath);
+  TierIsolation.resetTier1Dir(projectPath);
   const testsDir = path.join(projectPath, 'tests', 'generated');
   fs.rmSync(testsDir, { recursive: true, force: true });
   ensureDir(testsDir);
+  // Republish Tier-0 into the legacy view so QA-contract specs survive the
+  // reset and the rest of the pipeline (which still reads tests/generated)
+  // sees them.
+  try { TierIsolation.syncLegacyView(projectPath, { clear: false }); } catch { /* best effort */ }
   return testsDir;
 }
 
@@ -4439,11 +4802,27 @@ function quarantineGeneratedSpecFilesByName({ projectPath, files = [], reason = 
   const safeReason = String(reason || 'validation_salvage').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80);
   const quarantineDir = path.join(projectPath, 'tests', '.healix-quarantine', `${Date.now()}-${safeReason}`);
   const quarantinedFiles = [];
+  const tier0Skipped = [];
   for (const file of files) {
     const filename = path.basename(file?.filename || file);
     if (!GENERATED_SPEC_FILE_PATTERN.test(filename)) continue;
     const source = path.join(generatedDir, filename);
     if (!fs.existsSync(source)) continue;
+    // Tier-0 (deterministic source-derived contract specs) is the design's
+    // last-line-of-defense suite and MUST always execute. The quarantine
+    // path operates on the legacy `tests/generated/` view, so a republished
+    // Tier-0 copy can land here when a whole-batch `playwright --list`
+    // returns 0. Refuse to move it. If a Tier-0 spec truly cannot list,
+    // that is a codegen bug — fail loud upstream, do not hide it.
+    if (TierIsolation.isTier0Path(projectPath, source)) {
+      tier0Skipped.push(filename);
+      Logger.warn('PipelineWorker', 'Tier-0 file is exempt from quarantine', {
+        filename,
+        reason,
+        source,
+      });
+      continue;
+    }
     ensureDir(quarantineDir);
     let target = path.join(quarantineDir, filename);
     let suffix = 1;
@@ -4465,6 +4844,7 @@ function quarantineGeneratedSpecFilesByName({ projectPath, files = [], reason = 
     reason,
     quarantineDir: quarantinedFiles.length > 0 ? quarantineDir : null,
     quarantinedFiles,
+    tier0SkippedFiles: tier0Skipped,
   };
 }
 
@@ -4488,6 +4868,7 @@ async function salvageGeneratedTestValidation({
     quarantinedSpecFiles: [],
     invalidSpecFiles: [],
     protectedSpecFiles: Array.from(protectedSet),
+    tier0SkippedFiles: [],
     finalValidation: null,
   };
 
@@ -4507,10 +4888,35 @@ async function salvageGeneratedTestValidation({
       timeoutMs: perFileTimeout,
       testTarget: relTarget,
     });
+    const isTier0 = TierIsolation.isTier0Path(projectPath, filePath);
     if (validation?.valid && Number(validation.listedCount || 0) > 0) {
       event.keptSpecFiles.push({
         filename,
         listedCount: validation.listedCount || 0,
+        tier0: isTier0 || undefined,
+      });
+    } else if (isTier0) {
+      // Tier-0 specs are NEVER candidates for quarantine. If listing fails
+      // here, that is a codegen bug we want to surface — keep the file in
+      // place so the executor still runs (or fails loud) against it.
+      // Tier-0 files are implicitly protected even if the caller didn't
+      // explicitly add them to `protectedSpecFiles`.
+      Logger.warn('PipelineWorker', 'Tier-0 file is exempt from quarantine', {
+        filename,
+        reason: validation?.reason || 'list_failed',
+        source: filePath,
+      });
+      event.tier0SkippedFiles.push(filename);
+      event.keptSpecFiles.push({
+        filename,
+        listedCount: 0,
+        tier0: true,
+        protected: true,
+        validationWarning: {
+          reason: validation?.reason || 'validation_failed',
+          stderr: validation?.stderr || null,
+          stdout: validation?.stdout || null,
+        },
       });
     } else if (protectedSet.has(filename)) {
       event.keptSpecFiles.push({
@@ -5896,6 +6302,11 @@ async function maybeGenerateViaSaaS({
   runId = null,
   runBudget = null,
   telemetryReporter = null,
+  // W2 — pre-resolved corpus state. Optional: callers from the legacy path
+  // can omit these and the function still works exactly as before.
+  corpusGuidance = null,
+  corpusSeed = null,
+  workspaceContext = null,
 }) {
   const healixApiKey = process.env.HEALIX_API_KEY;
   if (!healixApiKey) {
@@ -5961,7 +6372,33 @@ async function maybeGenerateViaSaaS({
       maxExpansionAttempts: Number.isFinite(Number(config.maxExpansionAttempts))
         ? Math.max(0, Math.floor(Number(config.maxExpansionAttempts)))
         : 0,
+      // W2 — corpus-aware prompt augmentation. The webapp prompt-builder
+      // concatenates `corpusGuidance` (a literal string containing
+      // `do_not_regenerate:` and `prioritize_uncovered:`) into the system
+      // prompt. `doNotRegenerate` and `prioritizeUncovered` are surfaced as
+      // structured lists for any agent that wants typed access.
+      ...(corpusGuidance ? {
+        corpusGuidance: corpusGuidance.corpusGuidance,
+        doNotRegenerate: corpusGuidance.doNotRegenerate,
+        prioritizeUncovered: corpusGuidance.prioritizeUncovered,
+      } : {}),
     },
+    // W2 — bind the workspace + raw corpus seed at the top level so the
+    // webapp can correlate the generation with the read-side fetch. The
+    // webapp ignores unknown fields, so this is forward-compatible.
+    ...(workspaceContext ? {
+      workspaceId: workspaceContext.workspaceId || null,
+      projectFingerprint: workspaceContext.projectFingerprint || null,
+    } : {}),
+    ...(corpusSeed ? {
+      corpusSeedMeta: {
+        persistedTestCount: corpusSeed.persistedTests?.length || 0,
+        coveredAcTagCount: corpusSeed.coveredAcTags?.length || 0,
+        coveredEndpointCount: corpusSeed.coveredEndpoints?.length || 0,
+        lastFindingSignatureCount: corpusSeed.lastFindingSignatures?.length || 0,
+        status: corpusSeed.status || null,
+      },
+    } : {}),
   };
 
   const agents = pickAgentsForRun(config.testType, projectInfo, context);
@@ -7260,6 +7697,76 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
   const qualityRecoveryEvents = [];
   let deterministicTier0Pack = null;
 
+  // ── W2: corpus-aware bootstrap ───────────────────────────────────────────
+  // Resolve workspace + fetch the persisted QA corpus BEFORE Tier-0 emit and
+  // before the AI agent fan-out. Failures are non-blocking: empty seed +
+  // warning, pipeline proceeds exactly like first-run today.
+  let corpusBootstrap = null;
+  try {
+    if (process.env.HEALIX_API_KEY) {
+      const corpusClient = new WebappClient({ apiKey: process.env.HEALIX_API_KEY });
+      const wsCtx = await resolveWorkspaceContext({ projectPath: config.projectPath, client: corpusClient });
+      const corpusSeed = await fetchCorpusSeed({
+        client: corpusClient,
+        workspaceId: wsCtx.workspaceId,
+        projectFingerprint: wsCtx.projectFingerprint,
+      });
+      corpusBootstrap = { workspaceContext: wsCtx, corpusSeed };
+      Logger.info('PipelineWorker', 'W2 corpus bootstrap', {
+        workspaceId: wsCtx.workspaceId,
+        projectFingerprint: wsCtx.projectFingerprint ? `${wsCtx.projectFingerprint.slice(0, 12)}...` : null,
+        persistedTestCount: corpusSeed.persistedTests?.length || 0,
+        coveredAcTagCount: corpusSeed.coveredAcTags?.length || 0,
+        coveredEndpointCount: corpusSeed.coveredEndpoints?.length || 0,
+        status: corpusSeed.status,
+      });
+      generationMeta.corpusBootstrap = {
+        workspaceId: wsCtx.workspaceId,
+        projectKey: wsCtx.projectKey ? `${wsCtx.projectKey.slice(0, 12)}...` : null,
+        source: wsCtx.source,
+        seedStatus: corpusSeed.status,
+        persistedTestCount: corpusSeed.persistedTests?.length || 0,
+        coveredAcTagCount: corpusSeed.coveredAcTags?.length || 0,
+        coveredEndpointCount: corpusSeed.coveredEndpoints?.length || 0,
+      };
+    } else {
+      Logger.info('PipelineWorker', 'HEALIX_API_KEY absent — skipping W2 corpus bootstrap');
+    }
+  } catch (corpusErr) {
+    Logger.warn('PipelineWorker', 'W2 corpus bootstrap threw — continuing solo', {
+      reason: corpusErr?.message,
+    });
+    corpusBootstrap = null;
+  }
+
+  // Build the augmented context for downstream Tier-0 + agent fan-out. The
+  // original `context` object is left alone (telemetry references it).
+  let generationContext = context;
+  let corpusGuidance = null;
+  if (corpusBootstrap && corpusBootstrap.corpusSeed) {
+    const seed = corpusBootstrap.corpusSeed;
+    const suppressedIds = computeTier0SuppressedContractIds(context?.qaContracts || {}, seed);
+    if (suppressedIds.size > 0) {
+      const filteredQaContracts = applyCorpusSeedToQaContracts(context?.qaContracts || {}, suppressedIds);
+      generationContext = { ...context, qaContracts: filteredQaContracts };
+      Logger.info('PipelineWorker', 'W2 Tier-0 suppression — corpus already covers contracts', {
+        suppressedCount: suppressedIds.size,
+        suppressedIds: [...suppressedIds].slice(0, 20),
+      });
+      generationMeta.corpusBootstrap = {
+        ...(generationMeta.corpusBootstrap || {}),
+        tier0SuppressedCount: suppressedIds.size,
+        tier0SuppressedIds: [...suppressedIds].slice(0, 50),
+      };
+    }
+    corpusGuidance = buildCorpusGuidance({ corpusSeed: seed, parsedPRD });
+    generationMeta.corpusBootstrap = {
+      ...(generationMeta.corpusBootstrap || {}),
+      doNotRegenerateCount: corpusGuidance.doNotRegenerate.length,
+      prioritizeUncoveredCount: corpusGuidance.prioritizeUncovered.length,
+    };
+  }
+
   const runValidation = async (generator) => withStageBudget(runBudget, 'validation', async () => {
     const protectedSpecFiles = [];
     const validationTimeoutMs = () => Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.validation);
@@ -7375,7 +7882,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       throw error;
     };
 
-    const qaContractPack = ensureQaContractSpec({
+    const qaContractPack = ensureQaContractSpecPersistent({
       projectPath: config.projectPath,
       context,
       roles,
@@ -7835,7 +8342,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           status: 'started',
         };
         try {
-          const recoveredPack = ensureQaContractSpec({
+          const recoveredPack = ensureQaContractSpecPersistent({
             projectPath: config.projectPath,
             context,
             roles,
@@ -8240,7 +8747,12 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         .some(([key, value]) => key !== 'advisoryQuestions' && Number(value || 0) > 0);
       if (hasQaContracts && !['AUTH_REQUIRED_NO_CREDENTIALS'].includes(errorCode)) {
         try {
-          const recoveredPack = ensureQaContractSpec({
+          // Recover Tier-0 specs from the persistent dir FIRST — they may
+          // have been written before the AI tier blew up, and the
+          // resetGeneratedTestsDir wipe inside generateWithFallbackChain
+          // would otherwise have removed them from the legacy view.
+          try { TierIsolation.syncLegacyView(config.projectPath, { clear: false }); } catch { /* best effort */ }
+          const recoveredPack = ensureQaContractSpecPersistent({
             projectPath: config.projectPath,
             context,
             roles,
@@ -8364,9 +8876,11 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
 
   const result = await tryGenerator('saas', async () => {
     const testsDir = resetGeneratedTestsDir(config.projectPath);
-    deterministicTier0Pack = ensureQaContractSpec({
+    // W2: pass the corpus-filtered context so Tier-0 doesn't re-emit
+    // invariants the persisted corpus already covers.
+    deterministicTier0Pack = ensureQaContractSpecPersistent({
       projectPath: config.projectPath,
-      context,
+      context: generationContext,
       roles: roles || [],
       testType: config.testType,
     });
@@ -8404,7 +8918,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     }
     const saasResult = await maybeGenerateViaSaaS({
       config,
-      context,
+      context: generationContext,
       prdContent,
       testsDir,
       projectInfo,
@@ -8415,9 +8929,94 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       runId,
       runBudget,
       telemetryReporter,
+      // W2: corpus-aware augmentation. The webapp's prompt-builder concatenates
+      // these strings/lists into each agent's system prompt verbatim.
+      corpusGuidance: corpusGuidance || null,
+      corpusSeed: corpusBootstrap?.corpusSeed || null,
+      workspaceContext: corpusBootstrap?.workspaceContext || null,
     });
 
     if (!saasResult.generated) {
+      // E2 resilience invariant: when the AI tier produces nothing usable
+      // (webapp 4xx, OpenAI outage, agents all timed out, etc.) we must NOT
+      // abort the run — Tier-0 is the deterministic floor and is allowed to
+      // ingest on its own. The QA-contract rescue path further down can
+      // handle this too, but it depends on runValidation succeeding inside
+      // a catch block; a brittle Playwright `--list` failure there would
+      // re-throw and propagate up. So we belt-and-suspenders it here: if
+      // the Tier-0 deterministic pack is on disk, synthesize a result that
+      // looks like a partial success and let the normal post-generation
+      // flow (validation → execute → ingest) take over. This is target-
+      // agnostic — it triggers any time L0 ran but L1 produced nothing.
+      const tier0OnDisk = Boolean(deterministicTier0Pack?.written)
+        && Number(deterministicTier0Pack?.generatedTests || 0) > 0;
+      if (tier0OnDisk) {
+        try {
+          // Make sure the legacy view (tests/generated/) has the persistent
+          // Tier-0 spec re-published, in case anything in maybeGenerateViaSaaS
+          // (e.g. resetGeneratedTestsDir on a retry) wiped it. Same call the
+          // QA contract rescue path uses.
+          try { TierIsolation.syncLegacyView(config.projectPath, { clear: false }); } catch { /* best effort */ }
+          const tier0Files = listGeneratedTestFiles(config.projectPath)
+            .filter((filePath) => TierIsolation.isTier0Path(config.projectPath, filePath))
+            .map((filePath) => ({
+              path: filePath,
+              filename: path.basename(filePath),
+              type: 'qa_contract',
+            }));
+          // Fallback: if the path-filter above returned nothing (e.g. legacy
+          // view wasn't synced for some reason), accept any *.spec.ts that
+          // currently lives in the generated dir so we never silently lose
+          // the run.
+          const finalFiles = tier0Files.length > 0
+            ? tier0Files
+            : listGeneratedTestFiles(config.projectPath).map((filePath) => ({
+                path: filePath,
+                filename: path.basename(filePath),
+                type: 'qa_contract',
+              }));
+          if (finalFiles.length > 0) {
+            Logger.warn('PipelineWorker', 'AI tier produced no files; falling through to Tier-0-only execution', {
+              runId,
+              reason: saasResult.reason || 'unknown',
+              tier0Files: finalFiles.length,
+              tier0GeneratedTests: deterministicTier0Pack.generatedTests,
+            });
+            if (statusDir) {
+              recordRunDecision(statusDir, telemetryReporter, {
+                runId,
+                decisionType: 'tier0_decision',
+                phase: 'generation_fallthrough',
+                status: 'warning',
+                message: 'AI generation returned no files; proceeding with Tier-0 deterministic specs only.',
+                metadata: {
+                  reason: saasResult.reason || 'unknown',
+                  tier0Files: finalFiles.length,
+                  qaContractSummary: deterministicTier0Pack.qaContractSummary,
+                },
+              });
+            }
+            generationMeta.partialGenerationWarning = {
+              reason: 'ai_generation_empty_tier0_fallthrough',
+              generator: 'saas',
+              partialsWrittenCount: finalFiles.length,
+              message: 'AI generation returned no files; proceeding with Tier-0 deterministic specs only.',
+            };
+            return {
+              generated: finalFiles.length,
+              files: finalFiles,
+              provider: 'saas-tier0-only',
+              partial: true,
+              tier0Only: true,
+              reason: saasResult.reason || null,
+            };
+          }
+        } catch (fallthroughErr) {
+          Logger.warn('PipelineWorker', 'Tier-0 fall-through failed; re-raising original AI failure', {
+            error: fallthroughErr?.message,
+          });
+        }
+      }
       throw new Error(`Backend test generation produced no files (${saasResult.reason || 'unknown'})`);
     }
 
@@ -8707,6 +9306,625 @@ async function runWorkspacePostGenSync({ client, workspaceId, testsDir, runId, c
     }
   } catch (err) {
     Logger.warn('WorkspaceSync', 'Post-gen workspace push failed (non-blocking)', { message: err.message });
+  }
+}
+
+// =========================================================================
+// W3 — promotion / demotion engine
+//
+// The actual rules + transport live in `qa-corpus-writer.js`. The pipeline
+// builds verdicts, calls `applyPromotionRules`, then `syncCorpus`. The block
+// labelled "7b. W3 — post-execution QA corpus sync" below does the wiring.
+//
+// Idempotency: same inputs (verdicts + corpus + commit) → same payload.
+// The server detects no-change via ON CONFLICT DO UPDATE + content-hash
+// compare.
+// =========================================================================
+
+const PROMOTION_DEFAULTS = Object.freeze({
+  CONSECUTIVE_FAIL_THRESHOLD: 3,
+  MUTATION_COUNT: 3,
+  SENSITIVITY_PASS_THRESHOLD: 1 / 3,
+});
+
+function sha256Hex(input) {
+  return crypto.createHash('sha256').update(String(input || '')).digest('hex');
+}
+
+/**
+ * Stable case-key for a single test verdict. Mirrors the server's
+ * `caseKeyFor` so the same physical test produces the same key on both sides.
+ *
+ * Note: `qa-corpus-writer.caseKeyFor` is the canonical version — this thin
+ * wrapper exists only for pipeline-worker internal calls (e.g.
+ * `runCorpusSync` below) and to remain backward-compat with any external
+ * import path that already pulls this symbol.
+ */
+function caseKeyForVerdict({ projectFingerprint, title, suite, filePath }) {
+  const composite = `${projectFingerprint || ''}|${filePath || ''}|${suite || ''}|${title || ''}`;
+  return `case:${sha256Hex(composite).slice(0, 40)}`;
+}
+
+/**
+ * Pick the L0 tier-0 deterministic source (a11y, RBAC matrix, status
+ * snapshot, boundary, filter property). Reads the test file's leading
+ * comment + filename for a `[TIER0]` / `[L0]` marker.
+ */
+function isTier0Spec(testFile, content) {
+  if (testFile && /\.(?:a11y|rbac|status-snapshot|boundary|filter-property)\.spec\.(?:t|j)sx?$/.test(testFile)) {
+    return true;
+  }
+  const text = String(content || '').slice(0, 4000);
+  return /\[(?:TIER0|TIER-0|L0|DETERMINISTIC)\]/i.test(text);
+}
+
+/**
+ * Pick the target source file for a spec. Strategy:
+ *  1. The first `[SRC:<path>]` marker in the spec.
+ *  2. Fallback: the most-referenced path under services/, src/, or app/.
+ *
+ * Returns null when no plausible target is found.
+ */
+function resolveTargetSourceFile({ specContent, projectPath }) {
+  if (!projectPath) return null;
+  const refs = extractSourceRefsFromContent(specContent);
+  for (const ref of refs) {
+    const cleaned = String(ref).trim().replace(/^\.\//, '');
+    if (!cleaned) continue;
+    const candidates = [
+      path.resolve(projectPath, cleaned),
+      path.resolve(projectPath, 'src', cleaned),
+      path.resolve(projectPath, 'app', cleaned),
+      path.resolve(projectPath, 'services', cleaned),
+    ];
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+    }
+  }
+
+  // Fallback: scan the spec for path-like strings and pick the most plausible
+  // under services/ / src/ / app/.
+  const text = String(specContent || '');
+  const counts = new Map();
+  const re = /(?:^|['"`\s(])((?:services|src|app)\/[\w./-]+\.[a-z]{1,5})(?=['"`\s)])/gi;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const rel = m[1];
+    counts.set(rel, (counts.get(rel) || 0) + 1);
+  }
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  for (const [rel] of sorted) {
+    const abs = path.resolve(projectPath, rel);
+    if (fs.existsSync(abs) && fs.statSync(abs).isFile()) return abs;
+  }
+  return null;
+}
+
+/**
+ * Three deterministic source-file mutations:
+ *   1. `return null;` injected at start of a random function body.
+ *   2. A random `if (...)` line commented out.
+ *   3. A random `===` flipped to `!==`.
+ *
+ * Seed = sha256(testFileBasename) for reproducibility — same spec always
+ * yields the same mutations across runs.
+ *
+ * Returns Array<{ name, mutated }> of mutated-source candidates.
+ */
+function generateSensitivityMutations({ sourceContent, testFile }) {
+  const seedHex = sha256Hex(path.basename(testFile || 'test'));
+  // Three independent 32-bit slices of the seed → three deterministic indices.
+  const seeds = [
+    parseInt(seedHex.slice(0, 8), 16),
+    parseInt(seedHex.slice(8, 16), 16),
+    parseInt(seedHex.slice(16, 24), 16),
+  ];
+
+  const lines = String(sourceContent || '').split('\n');
+  const mutations = [];
+
+  // Mutation 1: inject `return null;` at the start of a random function body.
+  {
+    const fnLines = [];
+    const fnRe = /\b(?:function\s+\w+|const\s+\w+\s*=\s*(?:async\s*)?\([^)]*\)\s*=>|async\s+function\s+\w+|\w+\s*\([^)]*\)\s*\{)/;
+    lines.forEach((line, idx) => {
+      if (fnRe.test(line) && /\{\s*$/.test(line)) fnLines.push(idx);
+    });
+    if (fnLines.length > 0) {
+      const target = fnLines[seeds[0] % fnLines.length];
+      const copy = lines.slice();
+      const indentMatch = lines[target + 1]?.match(/^(\s*)/);
+      const indent = indentMatch ? indentMatch[1] : '  ';
+      copy.splice(target + 1, 0, `${indent}return null;`);
+      mutations.push({ name: 'return-null-injection', mutated: copy.join('\n') });
+    }
+  }
+
+  // Mutation 2: comment out a random `if (` line.
+  {
+    const ifLines = [];
+    lines.forEach((line, idx) => {
+      if (/^\s*if\s*\(/.test(line) && !/^\s*\/\//.test(line)) ifLines.push(idx);
+    });
+    if (ifLines.length > 0) {
+      const target = ifLines[seeds[1] % ifLines.length];
+      const copy = lines.slice();
+      copy[target] = `// [MUT] ${copy[target]}`;
+      mutations.push({ name: 'if-commented', mutated: copy.join('\n') });
+    }
+  }
+
+  // Mutation 3: flip a random `===` to `!==`.
+  {
+    const eqLines = [];
+    lines.forEach((line, idx) => {
+      if (/===/.test(line)) eqLines.push(idx);
+    });
+    if (eqLines.length > 0) {
+      const target = eqLines[seeds[2] % eqLines.length];
+      const copy = lines.slice();
+      copy[target] = copy[target].replace(/===/, '!==');
+      mutations.push({ name: 'eq-flipped', mutated: copy.join('\n') });
+    }
+  }
+
+  return mutations;
+}
+
+/**
+ * Run the Playwright spec against each mutated source. Returns the failure
+ * score = (failures / mutationCount). Pass threshold = >= 1/3.
+ *
+ * The runner is parameterised so tests can inject a fake. Default uses
+ * `npx playwright test --grep <name>` in the project directory.
+ */
+async function calibrateSensitivity({
+  testFile,
+  testName,
+  sourceFile,
+  projectPath,
+  runSpec,
+} = {}) {
+  if (!testFile || !sourceFile || !projectPath) {
+    return { score: null, ran: 0, failures: 0, reason: 'missing_args' };
+  }
+  if (!fs.existsSync(testFile) || !fs.existsSync(sourceFile)) {
+    return { score: null, ran: 0, failures: 0, reason: 'missing_file' };
+  }
+
+  const originalSource = fs.readFileSync(sourceFile, 'utf-8');
+  const specContent = fs.readFileSync(testFile, 'utf-8');
+  const mutations = generateSensitivityMutations({ sourceContent: originalSource, testFile });
+
+  if (mutations.length === 0) {
+    return { score: null, ran: 0, failures: 0, reason: 'no_mutations_possible' };
+  }
+
+  // Default runner — uses npx playwright test. Tests inject `runSpec`.
+  const defaultRunner = async ({ specPath, name }) => {
+    try {
+      const result = spawnSync(
+        'npx',
+        ['playwright', 'test', specPath, '--grep', name, '--reporter=line'],
+        { cwd: projectPath, timeout: 60_000, encoding: 'utf-8' }
+      );
+      return { passed: result.status === 0, stderr: result.stderr || '', stdout: result.stdout || '' };
+    } catch (err) {
+      return { passed: false, error: err.message };
+    }
+  };
+  const runner = typeof runSpec === 'function' ? runSpec : defaultRunner;
+
+  let failures = 0;
+  let ran = 0;
+  try {
+    for (const mutation of mutations) {
+      fs.writeFileSync(sourceFile, mutation.mutated, 'utf-8');
+      try {
+        const out = await runner({
+          specPath: testFile,
+          name: testName || '',
+          mutation: mutation.name,
+          projectPath,
+        });
+        ran += 1;
+        if (!out || out.passed === false) failures += 1;
+      } finally {
+        // Always restore source after each mutation — critical for safety.
+        fs.writeFileSync(sourceFile, originalSource, 'utf-8');
+      }
+    }
+  } catch (err) {
+    // Restore once more in case of unexpected error mid-iteration.
+    fs.writeFileSync(sourceFile, originalSource, 'utf-8');
+    return { score: null, ran, failures, reason: `runner_error:${err.message}` };
+  }
+
+  const score = ran > 0 ? failures / ran : 0;
+  return {
+    score,
+    ran,
+    failures,
+    passes: score >= PROMOTION_DEFAULTS.SENSITIVITY_PASS_THRESHOLD,
+    reason: null,
+  };
+}
+
+/**
+ * Apply the 4-layer promotion rules to a single verdict.
+ *
+ * Inputs:
+ *   verdict: { caseKey, title, suite, filePath, status, content?, sourceFile? }
+ *   corpus:  { existingByCaseKey, fixedCaseKeys, gitCommit, recentRunVerdicts }
+ *   - existingByCaseKey: Map<caseKey, { tier, status, lastFailures: number }>
+ *   - fixedCaseKeys: Set of caseKeys with a qa_findings row whose
+ *     fixCommitSha is an ancestor of the current commit (L2 candidates).
+ *   - gitCommit: short SHA of the current commit (for L2 pinning).
+ *   - recentRunVerdicts: Map<caseKey, Array<'passed'|'failed'>> — last N
+ *     verdicts in chronological order.
+ *
+ * Returns: { upsert?, demotion?, calibrateNeeded?: boolean }
+ *   - upsert: a NormalizedTestCase-shaped object for the corpus payload.
+ *   - demotion: { caseKey, status, reason } when this verdict triggered a
+ *     flake-quarantine or soft-delete.
+ *   - calibrateNeeded: true for L1 candidates that need sensitivity
+ *     calibration BEFORE upserting.
+ */
+function applyPromotionRules(verdict, corpus = {}, gitCommit = null) {
+  const existing = corpus.existingByCaseKey?.get?.(verdict.caseKey) || null;
+  const fixedCaseKeys = corpus.fixedCaseKeys || new Set();
+  const recent = corpus.recentRunVerdicts?.get?.(verdict.caseKey) || [];
+
+  // L0 deterministic — always present whenever its source file exists.
+  if (isTier0Spec(verdict.filePath, verdict.content)) {
+    return {
+      upsert: {
+        caseKey: verdict.caseKey,
+        title: verdict.title,
+        suite: verdict.suite || null,
+        filePath: verdict.filePath || null,
+        tier: 'L0',
+        status: 'active',
+        sensitivityScore: null,
+        content: verdict.content || null,
+      },
+      calibrateNeeded: false,
+    };
+  }
+
+  // L3 hand-written — never auto-managed. Recognized via filePath under
+  // /tests/hand-written/ or a `// [L3]` / `// [HUMAN]` marker.
+  if (
+    (verdict.filePath && /\/tests\/hand-written\//.test(verdict.filePath)) ||
+    /\[(?:L3|HUMAN)\]/i.test(String(verdict.content || '').slice(0, 4000))
+  ) {
+    return {
+      upsert: {
+        caseKey: verdict.caseKey,
+        title: verdict.title,
+        suite: verdict.suite || null,
+        filePath: verdict.filePath || null,
+        tier: 'L3',
+        status: 'active',
+        content: verdict.content || null,
+      },
+      calibrateNeeded: false,
+    };
+  }
+
+  // L2 regression — auto-pinned when a previously-failing test goes green
+  // on a known-fix commit. We mark it when the case is in `fixedCaseKeys`
+  // AND the current verdict is passed.
+  if (verdict.status === 'passed' && fixedCaseKeys.has(verdict.caseKey)) {
+    return {
+      upsert: {
+        caseKey: verdict.caseKey,
+        title: verdict.title,
+        suite: verdict.suite || null,
+        filePath: verdict.filePath || null,
+        tier: 'L2',
+        status: 'active',
+        sensitivityScore: existing?.sensitivityScore ?? null,
+        content: verdict.content || null,
+        metadata: { regressionFixCommit: gitCommit || null },
+      },
+      calibrateNeeded: false,
+    };
+  }
+
+  // ── L1 AI workflow ──────────────────────────────────────────────────────
+  // Demotion path: 3 consecutive failing runs with no source diff →
+  // flake-quarantine. We approximate "no source diff" via the verdict
+  // payload's `sourceDiff` flag (caller responsibility); when absent, the
+  // worker passes `recentRunVerdicts` only after asserting no diff.
+  const last3 = recent.slice(-PROMOTION_DEFAULTS.CONSECUTIVE_FAIL_THRESHOLD + 1).concat([verdict.status]);
+  const isConsecutiveFail =
+    last3.length >= PROMOTION_DEFAULTS.CONSECUTIVE_FAIL_THRESHOLD &&
+    last3.every((s) => s === 'failed');
+
+  if (isConsecutiveFail && existing?.status === 'active') {
+    return {
+      upsert: null,
+      demotion: {
+        caseKey: verdict.caseKey,
+        status: 'flake-quarantine',
+        reason: `${PROMOTION_DEFAULTS.CONSECUTIVE_FAIL_THRESHOLD} consecutive failing runs with no source diff`,
+      },
+      calibrateNeeded: false,
+    };
+  }
+
+  // Promotion to L1: green AND no existing dup AND sensitivity OK.
+  // Sensitivity calibration is handled OUTSIDE this function — we just flag
+  // whether it's needed.
+  if (verdict.status === 'passed' && !existing) {
+    return {
+      upsert: {
+        caseKey: verdict.caseKey,
+        title: verdict.title,
+        suite: verdict.suite || null,
+        filePath: verdict.filePath || null,
+        tier: 'L1',
+        status: 'active',
+        content: verdict.content || null,
+        // sensitivityScore will be filled in by calibrateSensitivity.
+      },
+      calibrateNeeded: true,
+    };
+  }
+
+  // Green on a previously-quarantined case → restore to active.
+  if (verdict.status === 'passed' && existing?.status === 'flake-quarantine') {
+    return {
+      upsert: {
+        caseKey: verdict.caseKey,
+        title: verdict.title,
+        suite: verdict.suite || null,
+        filePath: verdict.filePath || null,
+        tier: existing.tier || 'L1',
+        status: 'active',
+        content: verdict.content || null,
+      },
+      calibrateNeeded: false,
+    };
+  }
+
+  // Default: pass through — touch lastSeen only, preserve tier/status.
+  if (existing) {
+    return {
+      upsert: {
+        caseKey: verdict.caseKey,
+        title: verdict.title,
+        suite: verdict.suite || null,
+        filePath: verdict.filePath || null,
+        // intentionally do not set tier/status — server COALESCEs to existing.
+        content: verdict.content || null,
+      },
+      calibrateNeeded: false,
+    };
+  }
+
+  // Failing with no history — record the case but don't promote.
+  return {
+    upsert: {
+      caseKey: verdict.caseKey,
+      title: verdict.title,
+      suite: verdict.suite || null,
+      filePath: verdict.filePath || null,
+      content: verdict.content || null,
+    },
+    calibrateNeeded: false,
+  };
+}
+
+/**
+ * Resolve the worker's git commit. Best-effort — returns null on failure.
+ */
+function resolveGitCommit(projectPath) {
+  try {
+    return execSync('git rev-parse --short HEAD', {
+      cwd: projectPath,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5_000,
+    }).toString().trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build the corpus-sync payload from a list of verdicts. This is the
+ * worker-side counterpart to /api/qa-corpus/sync's expected shape.
+ *
+ * Inputs:
+ *  - verdicts:      Array<{ caseKey, title, suite, filePath, status, content, sourceFile? }>
+ *  - corpusSeed:    The seed pulled from /api/qa-corpus (W2).
+ *  - projectPath:   For sensitivity calibration mutations.
+ *  - runId:         The test_run_id, for firstSeen/lastSeen pointers.
+ *  - userId:        The contributor user id (for qa_test_versions).
+ *  - projectFingerprint
+ *  - calibrate:     Optional override for calibrateSensitivity (testing).
+ */
+async function buildCorpusSyncPayload({
+  verdicts,
+  corpusSeed,
+  projectPath,
+  runId,
+  userId,
+  projectFingerprint,
+  calibrate,
+} = {}) {
+  const calibrator = typeof calibrate === 'function' ? calibrate : calibrateSensitivity;
+  const gitCommit = resolveGitCommit(projectPath);
+
+  // Build the "existing" map from corpusSeed.persistedTests.
+  const existingByCaseKey = new Map();
+  for (const t of (corpusSeed?.persistedTests || [])) {
+    const key = t.caseKey || t.case_key;
+    if (!key) continue;
+    existingByCaseKey.set(key, {
+      tier: t.tier || null,
+      status: t.status || 'active',
+      sensitivityScore: t.sensitivityScore ?? t.sensitivity_score ?? null,
+    });
+  }
+
+  // Build the fixed-case-keys set: any caseKey in corpusSeed.fixedCaseKeys
+  // OR any qa_findings row whose status indicates a fix.
+  const fixedCaseKeys = new Set();
+  for (const ck of (corpusSeed?.fixedCaseKeys || [])) fixedCaseKeys.add(ck);
+  for (const f of (corpusSeed?.recentFindings || corpusSeed?.lastFindingSignatures || [])) {
+    if (f && (f.status === 'resolved' || f.status === 'closed' || f.status === 'fixed_at_commit') && f.caseKey) {
+      fixedCaseKeys.add(f.caseKey);
+    }
+  }
+
+  // recentRunVerdicts: caller-provided history of pass/fail per case_key.
+  const recentRunVerdicts = corpusSeed?.recentRunVerdicts instanceof Map
+    ? corpusSeed.recentRunVerdicts
+    : new Map();
+
+  const corpus = { existingByCaseKey, fixedCaseKeys, recentRunVerdicts };
+
+  const upserts = [];
+  const demotions = [];
+  for (const verdict of verdicts) {
+    const result = applyPromotionRules(verdict, corpus, gitCommit);
+    if (result.demotion) demotions.push(result.demotion);
+    if (!result.upsert) continue;
+
+    // Stamp run pointers + contributor.
+    if (runId) {
+      result.upsert.firstSeenRunId = existingByCaseKey.has(verdict.caseKey)
+        ? undefined
+        : runId;
+      result.upsert.lastSeenRunId = runId;
+    }
+    if (userId) result.upsert.contributorUserId = userId;
+
+    // L1 calibration: read source, run mutations, compute score.
+    if (result.calibrateNeeded && verdict.filePath) {
+      const sourceFile = verdict.sourceFile || resolveTargetSourceFile({
+        specContent: verdict.content || '',
+        projectPath,
+      });
+      if (sourceFile) {
+        try {
+          const calib = await calibrator({
+            testFile: verdict.filePath,
+            testName: verdict.title,
+            sourceFile,
+            projectPath,
+          });
+          if (calib && Number.isFinite(calib.score)) {
+            result.upsert.sensitivityScore = calib.score;
+            if (calib.passes === false) {
+              // Sensitivity failed — drop this L1 promotion entirely.
+              continue;
+            }
+          }
+        } catch (err) {
+          Logger.warn?.('PipelineWorker', 'calibrateSensitivity threw — dropping L1 promotion', {
+            caseKey: verdict.caseKey,
+            reason: err.message,
+          });
+          continue;
+        }
+      } else {
+        // No target source file found — we can't calibrate, so per the brief
+        // we drop the L1 promotion (sensitivity gate fails by default).
+        continue;
+      }
+    }
+
+    upserts.push(result.upsert);
+  }
+
+  return {
+    projectFingerprint,
+    testCases: upserts,
+    demotions,
+    testRunId: runId || null,
+    gitCommit,
+  };
+}
+
+/**
+ * Post-execution: write corpus + apply promotion/demotion rules.
+ * Fire-and-forget — never throws. Solo dev (no workspaceId) is a no-op.
+ */
+async function runCorpusSync({
+  client,
+  workspaceId,
+  projectFingerprint,
+  runId,
+  userId,
+  testResults,
+  corpusSeed,
+  config,
+}) {
+  // Backwards-compat: solo dev (no workspace) → skip entirely.
+  if (!client || !workspaceId || !projectFingerprint) return null;
+  if (typeof client.syncCorpus !== 'function') return null;
+
+  try {
+    const specFiles = listGeneratedTestFiles(config.projectPath);
+    const fileContentByName = new Map();
+    for (const fp of specFiles) {
+      try {
+        fileContentByName.set(path.basename(fp), { content: fs.readFileSync(fp, 'utf-8'), absPath: fp });
+      } catch { /* ignore */ }
+    }
+
+    // Build verdicts list from testResults.tests.
+    const verdicts = [];
+    for (const t of (testResults?.tests || [])) {
+      const title = String(t.title || t.name || '').trim();
+      if (!title) continue;
+      const suite = String(t.suite || '').trim() || null;
+      const fileBaseOrPath = String(t.file || t.filePath || '').trim() || null;
+      const baseName = fileBaseOrPath ? path.basename(fileBaseOrPath) : null;
+      const sourceEntry = baseName ? fileContentByName.get(baseName) : null;
+      const caseKey = caseKeyForVerdict({ projectFingerprint, title, suite, filePath: fileBaseOrPath });
+      const status =
+        t.status === 'passed' || t.status === 'pass' || t.status === 'success' ? 'passed' :
+        t.status === 'failed' || t.status === 'fail' || t.status === 'timedout' ? 'failed' :
+        'skipped';
+      verdicts.push({
+        caseKey,
+        title,
+        suite,
+        filePath: sourceEntry?.absPath || fileBaseOrPath,
+        status,
+        content: sourceEntry?.content || null,
+      });
+    }
+
+    const payload = await buildCorpusSyncPayload({
+      verdicts,
+      corpusSeed,
+      projectPath: config.projectPath,
+      runId,
+      userId: userId || null,
+      projectFingerprint,
+    });
+
+    if (payload.testCases.length === 0 && payload.demotions.length === 0) {
+      Logger.info('PipelineWorker', 'Corpus sync skipped — no promotable verdicts');
+      return null;
+    }
+
+    const result = await client.syncCorpus(workspaceId, payload);
+    Logger.info('PipelineWorker', 'Corpus sync complete', {
+      workspaceId,
+      upserts: payload.testCases.length,
+      demotions: payload.demotions.length,
+      versionsInserted: result?.versionsInserted ?? 0,
+    });
+    return result;
+  } catch (err) {
+    Logger.warn('PipelineWorker', 'runCorpusSync failed (non-blocking)', { reason: err.message });
+    return null;
   }
 }
 
@@ -9139,10 +10357,47 @@ async function runPipeline(config, runId) {
       }, telemetryReporter);
       try {
         const client = new WebappClient({ apiKey: process.env.HEALIX_API_KEY });
-        const parseResponse = await withStageBudget(runBudget, 'prdParse', () =>
-          client.parsePRD({ prdContent: combinedPrdContent })
+        // Chunked parse: split PRD by top-level `##` headings, parse each
+        // chunk separately (≤ ~1500 input tokens) so the model's 8000-token
+        // completion cap never truncates the JSON. Falls back to a
+        // deterministic regex per chunk so AC traceability is preserved
+        // even if every LLM call fails (run vz2nys repro).
+        const chunks = PrdChunked.splitByFeatureHeadings(combinedPrdContent);
+        const chunkResult = await withStageBudget(runBudget, 'prdParse', () =>
+          PrdChunked.parsePRDChunked(combinedPrdContent, {
+            parseChunkLLM: async (chunkBody, { heading }) => {
+              try {
+                const sub = await ModelLadder.runWithLadder('parse_prd', async (model) => {
+                  return await client.parsePRD({ prdContent: chunkBody, model });
+                }, {
+                  onFallback: (decision) => {
+                    Logger.warn('PipelineWorker', '[parse-prd] model ladder fallback', decision);
+                    if (statusDir) {
+                      recordRunDecision(statusDir, telemetryReporter, {
+                        runId,
+                        decisionType: 'model_ladder_decision',
+                        phase: 'parsing_prd',
+                        status: 'warning',
+                        message: `parse-prd: ${decision.model} unavailable; falling back to ${decision.nextModel || 'next'}.`,
+                        metadata: { ...decision, heading },
+                      });
+                    }
+                  },
+                });
+                return sub?.value?.parsedPRD || null;
+              } catch (err) {
+                Logger.warn('PipelineWorker', '[parse-prd] chunk LLM failed — using regex', { reason: err?.message, heading });
+                return null;
+              }
+            },
+            onChunkParsed: ({ heading, source, acCount }) => {
+              Logger.info('PipelineWorker', `[parse-prd] chunk parsed via ${source}: ${heading} (${acCount} AC)`);
+            },
+          })
         );
+        const parseResponse = { parsedPRD: chunkResult.parsedPRD, cached: false, tokenUsage: null, stats: chunkResult.stats };
         parsedPRD = parseResponse?.parsedPRD || null;
+        Logger.info('PipelineWorker', `[parse-prd] chunked stats: total=${chunkResult.stats.totalAcs} chunks=${chunkResult.stats.chunkCount} (llm=${chunkResult.stats.llmChunkCount}, regex=${chunkResult.stats.regexChunkCount})`);
         const prdTokens = parseResponse?.tokenUsage;
         if (prdTokens && prdTokens.totalTokens > 0) {
           Logger.info('PipelineWorker', '[TOKEN USAGE] parse-prd prompt=' + prdTokens.promptTokens + ' completion=' + prdTokens.completionTokens + ' total=' + prdTokens.totalTokens);
@@ -10150,6 +11405,32 @@ async function runPipeline(config, runId) {
 
     let testResults;
 
+    // Tier-0 self-heal: if some earlier path (quarantine, manual cleanup,
+    // generator reset, etc.) removed the legacy-view copy of a Tier-0 spec,
+    // re-publish it from `tests/healix-persistent/tier-0/` before Playwright
+    // runs. The design invariant is "Tier-0 must ALWAYS execute" — Playwright
+    // discovers specs from `tests/generated/`, so the legacy view must hold
+    // every Tier-0 spec at execution time. Idempotent: existing legacy copies
+    // are left in place.
+    try {
+      const heal = TierIsolation.ensureTier0InLegacyView(config.projectPath);
+      if (heal.republished.length > 0) {
+        Logger.warn('PipelineWorker', 'Republished missing Tier-0 spec(s) into legacy view before execution', {
+          republished: heal.republished,
+          alreadyPresent: heal.alreadyPresent,
+        });
+        if (statusDir) {
+          updateStatus(statusDir, 'tier0_legacy_view_repaired', {
+            runId,
+            message: `Re-published ${heal.republished.length} Tier-0 spec(s) into tests/generated before execution.`,
+            republished: heal.republished,
+          }, telemetryReporter);
+        }
+      }
+    } catch (healErr) {
+      Logger.warn('PipelineWorker', 'Tier-0 legacy view self-heal failed', { reason: healErr.message });
+    }
+
     testResults = await withStageBudget(runBudget, 'execution', async () => {
       if (!mcpParallelEnabled) {
         return playwright.runTests();
@@ -10216,6 +11497,9 @@ async function runPipeline(config, runId) {
         config,
       }).catch(() => undefined);
     }
+    // W3 corpus sync is invoked AFTER the report stage (see "7b. W3 — post-execution
+    // QA corpus sync" below) so that promotion rules see the final, finalized
+    // verdicts plus the actualRunId returned by /api/test-runs/ingest.
 
     phaseResults = testResults.phaseResults || null;
     if (generationMeta && testResults.tierBAuthPass) {
@@ -10376,6 +11660,9 @@ async function runPipeline(config, runId) {
         aiTriage,
         api_key: healixApiKey,
         dashboard_url: healixDashboardUrl,
+        // W1 — link the ingested test_run row to the team workspace so
+        // /workspace/[id]/coverage and /all-tests?workspaceId=X show it.
+        workspaceId: workspaceState?.workspaceId || config?._workspaceId || null,
       });
     });
     recordRunDecision(statusDir, telemetryReporter, {
@@ -10485,6 +11772,89 @@ async function runPipeline(config, runId) {
       }
     } else {
       Logger.info('PipelineWorker', 'No failed tests - skipping artifact upload');
+    }
+
+    // -------------------------------------------------------
+    // 7b. W3 — post-execution QA corpus sync (promotion/demotion/version)
+    // -------------------------------------------------------
+    // Build verdicts from this run's tests, apply the 4-layer promotion rules
+    // against the corpus seed fetched during pre-flight (W2), then POST the
+    // delta to /api/qa-corpus/sync. Fire-and-forget on any failure — corpus
+    // sync must never fail the user-visible pipeline.
+    try {
+      const wsCtx = corpusBootstrap?.workspaceContext || null;
+      const corpusSeed = corpusBootstrap?.corpusSeed || null;
+      const workspaceIdForSync = wsCtx?.workspaceId || workspaceState?.workspaceId || null;
+
+      if (!workspaceIdForSync) {
+        Logger.info('PipelineWorker', 'W3 corpus sync skipped (solo mode, no workspace)');
+      } else if (!durableClient) {
+        Logger.info('PipelineWorker', 'W3 corpus sync skipped (no HEALIX_API_KEY)');
+      } else {
+        const projectFingerprint = wsCtx?.projectFingerprint || null;
+        const byCaseKey = new Map();
+        for (const row of (corpusSeed?.persistedTests || [])) {
+          const key = row.caseKey || row.case_key;
+          if (key) byCaseKey.set(key, row);
+        }
+        const corpusForRules = { byCaseKey, projectFingerprint };
+
+        const verdicts = (testResults.tests || []).map((t) => {
+          const existing = byCaseKey.get(QACorpusWriter.caseKeyFor({
+            caseKey: t.caseKey || t.case_key,
+            projectFingerprint,
+            filePath: t.file || t.filePath,
+            suite: t.suite,
+            title: t.title || t.name,
+          }));
+          return QACorpusWriter.buildVerdict({
+            test: t,
+            content: null, // content version-bumps handled elsewhere; touch only here
+            projectFingerprint,
+            corpusRow: existing,
+            targetSourceFile: t.targetSourceFile || null,
+            targetSourceHash: t.targetSourceHash || null,
+            sensitivityScore: t.sensitivityScore === undefined ? null : t.sensitivityScore,
+            acTagSet: Array.isArray(t.acTagSet) ? t.acTagSet : [],
+            endpointSet: Array.isArray(t.endpointSet) ? t.endpointSet : [],
+            tier: t.tier || null,
+          });
+        });
+
+        const { upserts, demotions, regressions } = QACorpusWriter.applyPromotionRules(
+          verdicts,
+          corpusForRules,
+          {
+            workspaceId: workspaceIdForSync,
+            contributorUserId: null, // server resolves from api-key
+            runId,
+            projectFingerprint,
+          }
+        );
+
+        Logger.info('PipelineWorker', 'W3 promotion rules applied', {
+          verdicts: verdicts.length,
+          upserts: upserts.length,
+          demotions: demotions.length,
+          regressions: regressions.length,
+        });
+
+        await QACorpusWriter.syncCorpus({
+          client: durableClient,
+          workspaceId: workspaceIdForSync,
+          upserts,
+          demotions,
+          regressions,
+          contributorUserId: null,
+          runId,
+          projectFingerprint,
+        });
+      }
+    } catch (corpusErr) {
+      Logger.warn('PipelineWorker', 'W3 corpus sync failed (non-blocking)', {
+        reason: corpusErr?.message,
+        code: corpusErr?.code,
+      });
     }
 
     // -------------------------------------------------------
@@ -10749,6 +12119,9 @@ async function runPipeline(config, runId) {
         },
         api_key: healixApiKey,
         dashboard_url: healixDashboardUrl,
+        // W1 — even error_reported rows should be linked to the workspace
+        // so the dashboard shows them in the team activity stream.
+        workspaceId: workspaceState?.workspaceId || config?._workspaceId || null,
       });
       recordRunDecision(statusDir, telemetryReporter, {
         runId,
@@ -10798,6 +12171,7 @@ async function runPipeline(config, runId) {
 // Entry point: receive config via IPC from parent
 // -------------------------------------------------------
 if (require.main === module) {
+  installWorkerExitHooks();
   process.on('message', (msg) => {
     // Disconnect IPC so parent is free
     try {
@@ -10861,6 +12235,21 @@ module.exports = {
   buildCoverageRetryMetadata,
   buildRetainedSuiteRecoveryMeta,
   extractSpecSignals,
+  // W3 — re-exported from qa-corpus-writer.js for callers that import these
+  // from the pipeline-worker module. The canonical implementations live in
+  // qa-corpus-writer.js; the pipeline-worker uses them at line 11614+.
+  applyPromotionRules: QACorpusWriter.applyPromotionRules,
+  calibrateSensitivity: QACorpusWriter.calibrateSensitivity,
+  syncCorpus: QACorpusWriter.syncCorpus,
+  // W3 — pipeline-worker-internal helpers for source-file resolution and
+  // sensitivity mutation generation (used by pipeline-worker's local
+  // runCorpusSync; left exported for unit tests).
+  buildCorpusSyncPayload,
+  runCorpusSync,
+  caseKeyForVerdict,
+  resolveTargetSourceFile,
+  generateSensitivityMutations,
+  isTier0Spec,
   filterDeltaTopUpTests,
   normalizeGeneratedRouteFamily,
   summarizeMissingRoutesByFamily,
@@ -10876,6 +12265,7 @@ module.exports = {
   isBrittleGeneratedTestBlock,
   pruneGeneratedTestsByQuality,
   quarantineGeneratedSpecFiles,
+  quarantineGeneratedSpecFilesByName,
   snapshotGeneratedSpecFiles,
   restoreGeneratedSpecSnapshot,
   assessQualityRecoveryNetBenefit,
@@ -10910,4 +12300,20 @@ module.exports = {
   boundDecisionMetadata,
   pickAgentsForRun,
   rescuePartialGeneration,
+  // W2 — corpus-aware read side
+  resolveWorkspaceContext,
+  fetchCorpusSeed,
+  computeTier0SuppressedContractIds,
+  applyCorpusSeedToQaContracts,
+  buildCorpusGuidance,
+  collectAcTagsFromParsedPRD,
+  EMPTY_CORPUS_SEED,
+  // W5 — pipeline reliability helpers
+  TierIsolation,
+  ModelLadder,
+  PrdChunked,
+  ensureQaContractSpecPersistent,
+  installWorkerExitHooks,
+  writeEmergencyStatus,
+  TERMINAL_PHASES,
 };

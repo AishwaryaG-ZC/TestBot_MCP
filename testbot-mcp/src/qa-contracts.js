@@ -222,7 +222,14 @@ function inferResponseFieldFromSource(content, param) {
 
 function findProjectSourceFiles(rootDir, limit = 250) {
   const files = [];
-  const skipDirs = new Set(['node_modules', '.git', '.next', 'dist', 'build', 'coverage', 'out', 'target', 'vendor', 'public', 'static', 'assets', '.healix', 'healix-reports', 'tests']);
+  // Skip build outputs but NOT front-end source dirs that happen to live
+  // next to the backend (admin-angular/src/, frontend-next/src/ etc.).
+  // The sourceFileLooksNonAuthoritative() filter below catches anything
+  // that ends up under dist/, build/, or matches a minified hash pattern.
+  const skipDirs = new Set([
+    'node_modules', '.git', '.next', 'dist', 'build', 'coverage', 'out', 'target', 'vendor',
+    'public', 'static', 'assets', '.healix', 'healix-reports', 'tests',
+  ]);
   const exts = new Set(['.java', '.kt', '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.py', '.go', '.rb', '.php', '.cs']);
   const walk = (dir) => {
     if (files.length >= limit) return;
@@ -346,18 +353,40 @@ function sourceFileLooksNonAuthoritative(sourceFile) {
     /(?:^|\/)(?:public|static|assets|generated|gen)(?:\/|$)/i.test(normalized) ||
     /(?:^|\/)(?:package-lock|yarn\.lock|pnpm-lock)\./i.test(normalized) ||
     /\.(?:min|bundle|chunk|compiled)\.(?:mjs|cjs|jsx?|tsx?)$/i.test(normalized) ||
-    /(?:^|\/)chunk-[A-Z0-9_-]+\.(?:mjs|cjs|jsx?)$/i.test(normalized)
+    /(?:^|\/)chunk-[A-Z0-9_-]+\.(?:mjs|cjs|jsx?)$/i.test(normalized) ||
+    // Webpack / Angular emit patterns with content hashes. These tag
+    // minified output regardless of whether it lives under dist/ — run
+    // wi1d5l drew the field name `name` from one of these.
+    /(?:^|\/)main\.[0-9a-f]{8,}\.(?:mjs|cjs|js)$/i.test(normalized) ||
+    /(?:^|\/)polyfills\.[0-9a-f]{8,}\.(?:mjs|cjs|js)$/i.test(normalized) ||
+    /(?:^|\/)runtime\.[0-9a-f]{8,}\.(?:mjs|cjs|js)$/i.test(normalized) ||
+    /(?:^|\/)scripts\.[0-9a-f]{8,}\.(?:mjs|cjs|js)$/i.test(normalized) ||
+    /(?:^|\/)styles\.[0-9a-f]{8,}\.(?:mjs|cjs|js|css)$/i.test(normalized)
   );
 }
 
 function sourceAuthorityScore(filePath) {
   const normalized = String(filePath || '').replace(/\\/g, '/');
+  // Explicitly demote minified bundles and .d.ts FIRST so an Angular
+  // `main.<hash>.js` doesn't beat a `.java` source. Tiers (lower = more
+  // authoritative):
+  //   0  — canonical backend source: .java / .kt / services/*/src/
+  //   1  — Next.js / Express / pages/api route handlers
+  //   2  — controllers / handlers / route files
+  //   3  — DTO / schema / dao layer
+  //   4  — other authoritative source under src/app/lib (.ts/.js/.go)
+  //   20 — anything else
+  //   9_000 — .d.ts (type declarations only)
+  //   10_000 — minified bundles, dist/build outputs, vendored frontends
+  if (/\.d\.ts$/i.test(normalized)) return 9_000;
   if (sourceFileLooksNonAuthoritative(normalized)) return 10_000;
+  if (/\.(?:java|kt|kts)$/i.test(normalized)) return 0;
   if (/\/services\/[^/]+\/src\//i.test(normalized)) return 0;
   if (/\/src\/main\/(?:java|kotlin)\//i.test(normalized)) return 0;
   if (/(?:^|\/)(?:src\/)?app\/api\/.+\/route\.(?:tsx?|jsx?)$/i.test(normalized)) return 1;
   if (/(?:^|\/)(?:src\/)?pages\/api\//i.test(normalized)) return 1;
   if (/(?:^|\/)(?:controllers?|routes?|handlers?)\//i.test(normalized)) return 2;
+  if (/(?:^|\/)(?:dto|dtos|schemas?|entities?|models?)\//i.test(normalized)) return 3;
   if (/(?:^|\/)(?:repositories?|repos?|dao)\//i.test(normalized)) return 3;
   if (/(?:^|\/)(?:src|app|lib)\//i.test(normalized)) return 5;
   return 20;
@@ -1001,7 +1030,7 @@ function fillDynamicPath(pathname: string, value: string | number): string {
 
 function collectionPathForDynamic(pathname: string): string {
   const normalized = String(pathname);
-  if (/^\/api\/comments\/issue\/[:{]/.test(normalized)) return '/api/issues';
+  if (/^\\/api\\/comments\\/issue\\/[:{]/.test(normalized)) return '/api/issues';
   return pathname
     .replace(/(?:\\/\\{[^}]+\\}|\\/:[A-Za-z_][\\w-]*)(?:\\/.*)?$/, '') || '/';
 }

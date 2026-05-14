@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth/session'
 import { db } from '@/lib/db'
-import { testRuns } from '@/lib/db/schema'
-import { eq, and, desc, asc, count, sql } from 'drizzle-orm'
+import { testRuns, workspaceMembers, profiles } from '@/lib/db/schema'
+import { eq, and, desc, asc, count, sql, inArray } from 'drizzle-orm'
 import { getLiveRunsForUser } from '@/lib/mcp-live-runs'
 
 function compareRows(
@@ -39,6 +39,10 @@ export async function GET(request: NextRequest) {
   const order = searchParams.get('order') === 'asc' ? 'asc' : 'desc'
   const status = searchParams.get('status')
   const includeLive = searchParams.get('include_live') !== 'false'
+  // W4 team-mode filters
+  const workspaceId = searchParams.get('workspace_id')
+  const contributorId = searchParams.get('contributor_id')
+  const scope = searchParams.get('scope') // 'me' restricts to caller's runs even inside a workspace
 
   const sortColumns = {
     created_at: testRuns.createdAt,
@@ -52,7 +56,29 @@ export async function GET(request: NextRequest) {
 
   try {
     // Build where conditions
-    const conditions = [eq(testRuns.userId, user.id)]
+    const conditions = []
+
+    // Workspace mode: caller must be a member; the query is scoped to all
+    // runs whose workspace_id matches (no userId filter). Optional `scope=me`
+    // narrows back down to the caller. Optional `contributor_id` filters by
+    // an arbitrary teammate.
+    if (workspaceId) {
+      const [membership] = await db
+        .select({ role: workspaceMembers.role })
+        .from(workspaceMembers)
+        .where(and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, user.id)))
+        .limit(1)
+      if (!membership) {
+        return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+      }
+      conditions.push(eq(testRuns.workspaceId, workspaceId))
+      if (scope === 'me') conditions.push(eq(testRuns.userId, user.id))
+      else if (contributorId) conditions.push(eq(testRuns.userId, contributorId))
+    } else {
+      // Solo / legacy mode: per-user view (back-compat).
+      conditions.push(eq(testRuns.userId, user.id))
+    }
+
     if (status) conditions.push(eq(testRuns.status, status))
     const whereClause = conditions.length === 1 ? conditions[0] : and(...conditions)
 
@@ -115,10 +141,30 @@ export async function GET(request: NextRequest) {
       is_live: false,
     }))
 
+    // In workspace team mode, decorate each run with contributor identity so
+    // the team table can show "who ran it". One follow-up SELECT keeps this
+    // cheap regardless of page size.
+    if (workspaceId && mappedData.length > 0) {
+      const uniqueUserIds = Array.from(new Set(mappedData.map((r) => r.user_id).filter(Boolean) as string[]))
+      if (uniqueUserIds.length > 0) {
+        const profileRows = await db
+          .select({ id: profiles.id, email: profiles.email, fullName: profiles.fullName })
+          .from(profiles)
+          .where(inArray(profiles.id, uniqueUserIds))
+        const profileMap = new Map(profileRows.map((p) => [p.id, p]))
+        for (const r of mappedData) {
+          const p = profileMap.get(r.user_id as string)
+          ;(r as Record<string, unknown>).contributor_email = p?.email ?? null
+          ;(r as Record<string, unknown>).contributor_name = p?.fullName ?? null
+        }
+      }
+    }
+
     let mergedData: typeof mappedData = mappedData
     let mergedTotal = total ?? 0
 
-    if (includeLive && page === 1) {
+    // Live-run merging is per-user only — skip it in workspace team mode.
+    if (includeLive && page === 1 && !workspaceId) {
       const liveRuns = await getLiveRunsForUser(user.id, { windowHours: 6, limit: 300 })
       const existingRunIds = new Set(
         mappedData

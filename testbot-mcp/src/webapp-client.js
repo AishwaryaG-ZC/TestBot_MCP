@@ -841,7 +841,7 @@ class WebappClient {
     }
   }
 
-  async parsePRD({ prdContent, prdHash }) {
+  async parsePRD({ prdContent, prdHash, model }) {
     this._assertKey('/api/parse-prd');
     return this._post(
       '/api/parse-prd',
@@ -849,6 +849,9 @@ class WebappClient {
         api_key: this.apiKey,
         prd: prdContent,
         prdHash: prdHash || null,
+        // Optional model override — used by the worker's per-task model
+        // ladder so a 4xx on one model can be retried with the next rung.
+        model: model || undefined,
       },
       { timeoutMs: ENDPOINT_TIMEOUTS_MS.parsePRD }
     );
@@ -961,6 +964,111 @@ class WebappClient {
     }
   }
 
+  /**
+   * Fetch the QA corpus for a project — the read-side of W2.
+   *
+   * Returns a normalised seed of:
+   *   { persistedTests, coveredAcTags, coveredEndpoints, lastFindingSignatures,
+   *     contractSnapshots, raw }
+   *
+   * Falls through to a benign empty seed (NOT null) on 404/5xx/network errors so
+   * callers can treat the result uniformly without branching on "corpus
+   * present?". When `workspaceId` is null we still fetch a per-user corpus —
+   * the webapp scopes by api-key user, so solo developers get their own row
+   * history.
+   *
+   * Hard never-throws: solo and degraded modes share the same return shape.
+   */
+  async fetchCorpus(workspaceId, projectFingerprint) {
+    const emptySeed = {
+      persistedTests: [],
+      coveredAcTags: [],
+      coveredEndpoints: [],
+      lastFindingSignatures: [],
+      contractSnapshots: [],
+      raw: null,
+      workspaceId: workspaceId || null,
+      projectFingerprint: projectFingerprint || null,
+      status: 'empty',
+    };
+    if (!this.apiKey || !projectFingerprint) {
+      return { ...emptySeed, status: 'skipped_no_fingerprint' };
+    }
+
+    const params = new URLSearchParams();
+    params.set('projectFingerprint', projectFingerprint);
+    if (workspaceId) params.set('workspaceId', workspaceId);
+
+    let payload;
+    try {
+      payload = await this._get(`/api/qa-corpus?${params.toString()}`, { timeoutMs: 15_000 });
+    } catch (err) {
+      Logger.warn('WebappClient', 'fetchCorpus failed (non-blocking — falling through to solo mode)', {
+        workspaceId: workspaceId || null,
+        projectFingerprint,
+        code: err?.code,
+        status: err?.status,
+        message: err?.message,
+      });
+      return { ...emptySeed, status: err?.status === 404 ? 'not_found' : 'error' };
+    }
+
+    const data = payload?.data || payload || {};
+    const testCases = Array.isArray(data.test_cases) ? data.test_cases : [];
+    const snapshots = Array.isArray(data.contract_snapshots) ? data.contract_snapshots : [];
+    const findings = Array.isArray(data.findings) ? data.findings : [];
+
+    const persistedTests = testCases.map((row) => ({
+      id: row.id || null,
+      caseKey: row.case_key || row.caseKey || null,
+      title: row.title || null,
+      filePath: row.file_path || row.filePath || null,
+      testType: row.test_type || row.testType || null,
+      category: row.category || null,
+      tags: Array.isArray(row.tags) ? row.tags : [],
+      metadata: row.metadata || null,
+      source: row.source || null,
+    }));
+
+    // AC tags surface as bracketed markers in `tags[]` (e.g. "[REQ:F1.S1.AC1]"
+    // or "[QAC:...]"). Pull the bracket contents out as a flat covered set so
+    // the prompt-augmenter and the Tier-0 filter can index by string.
+    const coveredAcTagsSet = new Set();
+    const coveredEndpointsSet = new Set();
+    for (const t of persistedTests) {
+      for (const tag of t.tags) {
+        if (typeof tag !== 'string') continue;
+        const stripped = tag.trim();
+        if (!stripped) continue;
+        coveredAcTagsSet.add(stripped);
+        // also surface the bare id (without brackets) for substring matching
+        const m = stripped.match(/^\[?([A-Z]+):([^\]]+)\]?$/i);
+        if (m) coveredAcTagsSet.add(m[2]);
+      }
+      const md = t.metadata || {};
+      const method = (md.method || md.httpMethod || '').toString().toUpperCase();
+      const path = (md.path || md.endpoint || md.route || '').toString();
+      if (method && path) coveredEndpointsSet.add(`${method} ${path}`);
+      else if (path) coveredEndpointsSet.add(path);
+    }
+
+    const lastFindingSignatures = findings
+      .map((f) => f?.fingerprint || f?.signature || null)
+      .filter(Boolean);
+
+    return {
+      persistedTests,
+      coveredAcTags: [...coveredAcTagsSet],
+      coveredEndpoints: [...coveredEndpointsSet],
+      lastFindingSignatures,
+      contractSnapshots: snapshots,
+      raw: data,
+      workspaceId: workspaceId || null,
+      projectFingerprint,
+      status: 'ok',
+    };
+  }
+
   /** Pull all shared test files for a workspace. Returns [] on any error. */
   async pullWorkspaceTestFiles({ workspaceId }) {
     if (!this.apiKey || !workspaceId) return [];
@@ -997,6 +1105,73 @@ class WebappClient {
       Logger.warn('WebappClient', 'pullWorkspaceCoverage failed (non-blocking)', { code: err.code, message: err.message });
       return null;
     }
+  }
+
+  /**
+   * W3 — push the post-execution corpus upsert/demotion payload to the
+   * webapp. Used after every run that has a real workspaceId (solo dev with
+   * no workspace short-circuits and returns null — pipeline behaves as today).
+   *
+   * Idempotency: server uses ON CONFLICT (case_key) DO UPDATE so re-posting
+   * the same payload is a no-op on rows that didn't change. Versions are
+   * appended only when sha256(content) differs from the latest stored row.
+   *
+   * Retries: 3 outer attempts on 5xx with exponential backoff (0, 1s, 3s).
+   * 4xx (validation, auth) are NOT retried. Network-level errors are
+   * handled by the inner `_post` retry chain.
+   */
+  async syncCorpus(workspaceIdOrPayload, maybePayload) {
+    // Accept two shapes:
+    //   syncCorpus(workspaceId, payload)
+    //   syncCorpus(payload)            ← writer-style, workspaceId on payload
+    let workspaceId;
+    let payload;
+    if (typeof workspaceIdOrPayload === 'string' || workspaceIdOrPayload == null) {
+      workspaceId = workspaceIdOrPayload || null;
+      payload = maybePayload || {};
+    } else {
+      payload = workspaceIdOrPayload || {};
+      workspaceId = payload.workspaceId || null;
+    }
+    if (!this.apiKey) return null;
+    if (!workspaceId) {
+      // Brief: solo dev (no workspaceId) → skip corpus sync entirely.
+      return null;
+    }
+    const body = { ...(payload || {}) };
+    body.workspaceId = workspaceId;
+
+    const MAX_ATTEMPTS = 3;
+    const BACKOFF_MS = [0, 1000, 3000];
+    let lastErr = null;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      if (BACKOFF_MS[attempt] > 0) {
+        await new Promise((r) => setTimeout(r, BACKOFF_MS[attempt]));
+        Logger.warn?.('WebappClient', `Retrying /api/qa-corpus/sync (attempt ${attempt + 1}/${MAX_ATTEMPTS})`, {
+          prevError: lastErr?.message,
+        });
+      }
+      try {
+        return await this._post('/api/qa-corpus/sync', body, { timeoutMs: 60_000 });
+      } catch (err) {
+        lastErr = err;
+        // Only retry on 5xx server errors. 4xx is a deterministic validation
+        // failure — retrying won't change anything. Network-level errors are
+        // already retried by `_post`'s inner loop.
+        if (err?.code !== 'WEBAPP_SERVER_ERROR') {
+          Logger.warn('WebappClient', 'syncCorpus failed (not retrying)', {
+            code: err?.code,
+            message: err?.message,
+          });
+          return null;
+        }
+      }
+    }
+    Logger.warn('WebappClient', 'syncCorpus exhausted retries', {
+      code: lastErr?.code,
+      message: lastErr?.message,
+    });
+    return null;
   }
 
   /** Append coverage entries after test execution. Fire-and-forget safe. */

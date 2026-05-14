@@ -115,6 +115,22 @@ function buildGroups(runs: TestRun[]): TestRunGroup[] {
   }).sort((a, b) => new Date(b.latestDate).getTime() - new Date(a.latestDate).getTime());
 }
 
+interface WorkspaceOption {
+  id: string;
+  projectKey: string;
+  projectName: string;
+  role: string;
+}
+
+interface WorkspaceMember {
+  userId: string;
+  email: string;
+  fullName: string | null;
+}
+
+type TierFilter = 'all' | 'L0' | 'L1' | 'L2' | 'L3';
+type CorpusStatus = 'all' | 'active' | 'flake-quarantine' | 'soft-deleted';
+
 export default function AllTestsPage() {
   const router = useRouter();
   const [tests, setTests] = useState<TestRun[]>([]);
@@ -125,6 +141,18 @@ export default function AllTestsPage() {
   const payloadSignatureRef = useRef<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
+  // W4 — workspace selector + team filters.
+  const [workspaces, setWorkspaces] = useState<WorkspaceOption[]>([]);
+  const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
+  // null = solo mode (caller is in 0 workspaces, or chose "Personal"). The
+  // default is the user's primary workspace (first alphabetically by
+  // projectName), set as soon as `workspaces` arrives.
+  const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
+  const [members, setMembers] = useState<WorkspaceMember[]>([]);
+  const [contributorFilter, setContributorFilter] = useState<string>('all'); // 'all' | 'me' | userId
+  const [tierFilter, setTierFilter] = useState<TierFilter>('all');
+  const [corpusStatusFilter, setCorpusStatusFilter] = useState<CorpusStatus>('all');
+
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'passed' | 'failed' | 'completed_with_findings' | 'running'>('all');
@@ -133,6 +161,53 @@ export default function AllTestsPage() {
   const [page, setPage] = useState(1);
   const [groupByName, setGroupByName] = useState(false);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+
+  // Bootstrap: pull the caller's workspaces once. If they're in 0 workspaces
+  // we stay in solo mode and never show the selector — preserves the legacy
+  // /all-tests UX.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/workspaces');
+        if (!res.ok) {
+          if (!cancelled) setWorkspaceLoaded(true);
+          return;
+        }
+        const json = await res.json();
+        const list = (json.workspaces ?? []) as WorkspaceOption[];
+        // Sort alphabetically by projectName for deterministic default.
+        list.sort((a, b) => a.projectName.localeCompare(b.projectName));
+        if (cancelled) return;
+        setWorkspaces(list);
+        if (list.length > 0) setActiveWorkspaceId(list[0].id);
+        setWorkspaceLoaded(true);
+      } catch {
+        if (!cancelled) setWorkspaceLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // When the active workspace changes, fetch its members for the contributor
+  // filter dropdown. Members endpoint enforces membership server-side.
+  useEffect(() => {
+    if (!activeWorkspaceId) {
+      setMembers([]);
+      setContributorFilter('all');
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`/api/workspaces/${activeWorkspaceId}/members`);
+        if (!res.ok) return;
+        const json = await res.json();
+        if (!cancelled) setMembers(json.members ?? []);
+      } catch { /* ignore */ }
+    })();
+    return () => { cancelled = true; };
+  }, [activeWorkspaceId]);
 
   // Debounce search input
   useEffect(() => {
@@ -168,6 +243,16 @@ export default function AllTestsPage() {
 
       if (statusFilter !== 'all') {
         params.set('status', statusFilter);
+      }
+
+      // W4: workspace + contributor filters.
+      if (activeWorkspaceId) {
+        params.set('workspace_id', activeWorkspaceId);
+        if (contributorFilter === 'me') {
+          params.set('scope', 'me');
+        } else if (contributorFilter !== 'all') {
+          params.set('contributor_id', contributorFilter);
+        }
       }
 
       const res = await fetch(`/api/test-runs?${params.toString()}`, { signal: controller.signal });
@@ -221,11 +306,14 @@ export default function AllTestsPage() {
       }
       if (showLoading && !controller.signal.aborted) setLoading(false);
     }
-  }, [page, pageSize, sortBy, statusFilter, debouncedSearch]);
+  }, [page, pageSize, sortBy, statusFilter, debouncedSearch, activeWorkspaceId, contributorFilter]);
 
   useEffect(() => {
+    // Hold the first fetch until we know whether the user has any workspaces
+    // (so the initial request is correctly scoped — solo vs. team).
+    if (!workspaceLoaded) return;
     fetchTests({ showLoading: true });
-  }, [fetchTests]);
+  }, [fetchTests, workspaceLoaded]);
 
   useEffect(() => {
     const intervalMs = activeRunsPresent ? ACTIVE_REFRESH_INTERVAL_MS : IDLE_REFRESH_INTERVAL_MS;
@@ -282,6 +370,96 @@ export default function AllTestsPage() {
           New Tests
         </Link>
       </motion.div>
+
+      {/* W4 — Workspace selector + team filters. Hidden for solo users. */}
+      {workspaces.length > 0 && (
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.05 }}
+          className="glass-card rounded-2xl p-4 flex flex-wrap items-center gap-3"
+          data-testid="workspace-bar"
+        >
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] uppercase tracking-widest text-[#4A6280] font-semibold">Workspace</span>
+            <select
+              data-testid="workspace-selector"
+              value={activeWorkspaceId ?? 'solo'}
+              onChange={(e) => {
+                const v = e.target.value;
+                setActiveWorkspaceId(v === 'solo' ? null : v);
+                setContributorFilter('all');
+                setPage(1);
+              }}
+              className="input-glass px-3 py-2 text-sm rounded-xl text-[#F0F6FF] cursor-pointer"
+            >
+              {workspaces.map((w) => (
+                <option key={w.id} value={w.id}>{w.projectName}</option>
+              ))}
+              <option value="solo">Personal (my runs)</option>
+            </select>
+            {activeWorkspaceId && (
+              <Link
+                href={`/workspace/${activeWorkspaceId}`}
+                className="text-[10px] uppercase tracking-widest text-[#60A5FA] hover:text-[#F0F6FF] border border-blue-500/30 hover:border-blue-500/60 px-2 py-1.5 rounded-lg transition-colors"
+              >
+                Overview →
+              </Link>
+            )}
+          </div>
+
+          {activeWorkspaceId && (
+            <>
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] uppercase tracking-widest text-[#4A6280] font-semibold">Contributor</span>
+                <select
+                  data-testid="contributor-filter"
+                  value={contributorFilter}
+                  onChange={(e) => { setContributorFilter(e.target.value); setPage(1); }}
+                  className="input-glass px-3 py-2 text-sm rounded-xl text-[#8BA4C8] cursor-pointer"
+                >
+                  <option value="all">All teammates</option>
+                  <option value="me">Current user only</option>
+                  {members.map((m) => (
+                    <option key={m.userId} value={m.userId}>
+                      {m.fullName || m.email}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] uppercase tracking-widest text-[#4A6280] font-semibold">Tier</span>
+                <select
+                  data-testid="tier-filter"
+                  value={tierFilter}
+                  onChange={(e) => { setTierFilter(e.target.value as TierFilter); setPage(1); }}
+                  className="input-glass px-3 py-2 text-sm rounded-xl text-[#8BA4C8] cursor-pointer"
+                >
+                  <option value="all">All tiers</option>
+                  <option value="L0">L0</option>
+                  <option value="L1">L1</option>
+                  <option value="L2">L2</option>
+                  <option value="L3">L3</option>
+                </select>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] uppercase tracking-widest text-[#4A6280] font-semibold">Corpus</span>
+                <select
+                  data-testid="corpus-status-filter"
+                  value={corpusStatusFilter}
+                  onChange={(e) => { setCorpusStatusFilter(e.target.value as CorpusStatus); setPage(1); }}
+                  className="input-glass px-3 py-2 text-sm rounded-xl text-[#8BA4C8] cursor-pointer"
+                >
+                  <option value="all">All status</option>
+                  <option value="active">Active</option>
+                  <option value="flake-quarantine">Flake quarantine</option>
+                  <option value="soft-deleted">Soft-deleted</option>
+                </select>
+              </div>
+            </>
+          )}
+        </motion.div>
+      )}
 
       {/* Table */}
       <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1 }} className="glass-card rounded-2xl overflow-hidden">
@@ -377,7 +555,7 @@ export default function AllTestsPage() {
                 )}
               </div>
               {!debouncedSearch && statusFilter === 'all' && (
-                <Link href="/create-tests" className="btn-gradient text-white font-semibold px-5 py-2.5 rounded-xl text-sm">
+                <Link href="/create-tests" className="btn-gradient text-black font-semibold px-5 py-2.5 rounded-xl text-sm">
                   Create Your First Test
                 </Link>
               )}

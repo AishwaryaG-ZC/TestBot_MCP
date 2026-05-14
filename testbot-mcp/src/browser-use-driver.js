@@ -28,6 +28,53 @@ const Logger = require('./logger');
 const RUNNER_SCRIPT = path.join(__dirname, '..', 'scripts', 'browser_use_runner.py');
 const DEFAULT_TIMEOUT_MS = 180_000;
 
+// Adaptive per-step LLM timeout — sent into the Python runner via
+// HEALIX_BROWSER_USE_STEP_TIMEOUT_S. Calibration: send a 1-token ping at
+// run start, measure p50 round-trip, then per-call timeout = max(30, 3 × p50)
+// capped at 120s. Run vz2nys saw 4 consecutive 30s timeouts because the
+// reasoning model spent 20s on a single step.
+const STEP_TIMEOUT_MIN_S = 30;
+const STEP_TIMEOUT_MAX_S = 120;
+
+async function calibrateStepTimeoutS({ openaiApiKey, calibrationPromptUrl } = {}) {
+  // Cheap, dependency-free calibration: a 1-token completion request via
+  // fetch (Node 18+).  Failure / no key → return the floor.  We never
+  // block longer than 10s on calibration so a slow control plane can't
+  // burn run budget.
+  if (!openaiApiKey || typeof fetch !== 'function') return STEP_TIMEOUT_MIN_S;
+  const url = calibrationPromptUrl || 'https://api.openai.com/v1/chat/completions';
+  const samples = [];
+  const target = 2; // 2 samples → cheap p50 estimate
+  const overallDeadline = Date.now() + 10_000;
+  for (let i = 0; i < target && Date.now() < overallDeadline; i += 1) {
+    const t0 = Date.now();
+    try {
+      const ac = new AbortController();
+      const t = setTimeout(() => ac.abort(), Math.min(5_000, overallDeadline - Date.now()));
+      const res = await fetch(url, {
+        method: 'POST',
+        signal: ac.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${openaiApiKey}`,
+        },
+        body: JSON.stringify({
+          model: process.env.HEALIX_CALIBRATION_MODEL || 'gpt-4o-mini',
+          messages: [{ role: 'user', content: '1' }],
+          max_tokens: 1,
+        }),
+      });
+      clearTimeout(t);
+      if (res.ok) samples.push(Date.now() - t0);
+    } catch { /* skip sample */ }
+  }
+  if (samples.length === 0) return STEP_TIMEOUT_MIN_S;
+  samples.sort((a, b) => a - b);
+  const p50ms = samples[Math.floor(samples.length / 2)];
+  const adaptiveS = Math.max(STEP_TIMEOUT_MIN_S, Math.ceil((p50ms / 1000) * 3));
+  return Math.min(STEP_TIMEOUT_MAX_S, adaptiveS);
+}
+
 function resolvePython() {
   const configured = process.env.HEALIX_BROWSER_USE_PYTHON || process.env.BROWSER_USE_PYTHON;
   if (configured) {
@@ -93,8 +140,9 @@ function driveExploration({
   preAuthRoleCount = 0,
   totalTimeoutMs = DEFAULT_TIMEOUT_MS,
   onHeartbeat,
+  stepTimeoutS = null, // injected by tests; otherwise calibrated at runtime
 } = {}) {
-  return new Promise((resolve) => {
+  return new Promise(async (resolve) => {
     if (!targetUrl) {
       resolve({ available: false, reason: 'No targetUrl provided to browser-use driver' });
       return;
@@ -131,6 +179,19 @@ function driveExploration({
       ? allCredentials.map((c) => c.role || 'user').join(', ')
       : (credentials?.role || '');
 
+    // Adaptive step timeout — calibrated against the LLM round-trip so a
+    // reasoning model isn't killed by the hard-coded 30s default. Skipped
+    // if `stepTimeoutS` was passed in (test injection) or if calibration
+    // disabled via env.
+    let calibratedStepTimeoutS = Number(stepTimeoutS) || 0;
+    if (!calibratedStepTimeoutS && process.env.HEALIX_DISABLE_STEP_CALIBRATION !== 'true') {
+      try {
+        calibratedStepTimeoutS = await calibrateStepTimeoutS({ openaiApiKey: resolveOpenAIKeyForRunner() });
+      } catch { calibratedStepTimeoutS = STEP_TIMEOUT_MIN_S; }
+    }
+    if (!calibratedStepTimeoutS) calibratedStepTimeoutS = STEP_TIMEOUT_MIN_S;
+    Logger.info('BrowserUseDriver', `Adaptive step timeout calibrated to ${calibratedStepTimeoutS}s`);
+
     const env = {
       ...process.env,
       HEALIX_TARGET_URL: targetUrl,
@@ -138,6 +199,9 @@ function driveExploration({
       HEALIX_LOGIN_PASSWORD: credentials?.password || '',
       HEALIX_PREAUTH_VERIFIED_ROLES: String(Math.max(0, Number(preAuthRoleCount) || 0)),
       HEALIX_TOTAL_TIMEOUT_S: String(Math.max(10, Math.round(totalTimeoutMs / 1000))),
+      // Forwarded to the Python runner so each step's LLM call gets a
+      // timeout proportional to the calibrated round-trip.
+      HEALIX_BROWSER_USE_STEP_TIMEOUT_S: String(calibratedStepTimeoutS),
       HEALIX_ALL_ROLES: allRoles,
       BROWSER_USE_API_KEY: process.env.BROWSER_USE_API_KEY || process.env.HEALIX_BROWSER_USE_API_KEY || '',
       HEALIX_BROWSER_USE_API_KEY: process.env.HEALIX_BROWSER_USE_API_KEY || process.env.BROWSER_USE_API_KEY || '',
@@ -234,5 +298,8 @@ module.exports = {
   driveExploration,
   resolvePython,
   isBrowserUseInstalled,
+  calibrateStepTimeoutS,
+  STEP_TIMEOUT_MIN_S,
+  STEP_TIMEOUT_MAX_S,
   RUNNER_SCRIPT,
 };

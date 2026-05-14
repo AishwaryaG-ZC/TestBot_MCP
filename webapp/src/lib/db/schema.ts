@@ -72,6 +72,11 @@ export const testRuns = pgTable(
     userId: uuid('user_id')
       .notNull()
       .references(() => profiles.id, { onDelete: 'cascade' }),
+    // Nullable so legacy MCP clients (and any caller that doesn't yet pass a
+    // workspaceId) continue to ingest exactly as before. Set-null on workspace
+    // delete preserves the run's user-scoped history. `projectWorkspaces` is
+    // declared further down the file — Drizzle's reference callback is lazy.
+    workspaceId: uuid('workspace_id').references(() => projectWorkspaces.id, { onDelete: 'set null' }),
     creationName: text('creation_name').notNull(),
     status: text('status').default('running'),
     totalTests: integer('total_tests').default(0),
@@ -98,6 +103,7 @@ export const testRuns = pgTable(
   (table) => [
     index('test_runs_user_id_idx').on(table.userId),
     index('test_runs_created_at_idx').on(table.createdAt),
+    index('test_runs_workspace_id_idx').on(table.workspaceId),
   ]
 )
 
@@ -150,6 +156,17 @@ export const qaTestCases = pgTable(
     tags: text('tags').array().notNull().default(sql`'{}'`),
     source: text('source').notNull().default('mcp'),
     metadata: jsonb('metadata'),
+    // W1: corpus-quality fields. `sensitivityScore` is a learned flake/noise
+    // metric (0-1 or null when unknown). `tier` is the QA tier band assigned
+    // by the planner. `status` lets us soft-delete or quarantine flaky cases
+    // without destroying their history. firstSeen/lastSeen run pointers let
+    // dashboards link straight to the run that introduced / last exercised
+    // the case.
+    sensitivityScore: numeric('sensitivity_score', { precision: 4, scale: 3 }),
+    tier: text('tier'),
+    firstSeenRunId: uuid('first_seen_run_id').references(() => testRuns.id, { onDelete: 'set null' }),
+    lastSeenRunId: uuid('last_seen_run_id').references(() => testRuns.id, { onDelete: 'set null' }),
+    status: text('status').notNull().default('active'),
     firstSeenAt: timestamp('first_seen_at', { withTimezone: true }).defaultNow().notNull(),
     lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).defaultNow().notNull(),
   },
@@ -157,6 +174,49 @@ export const qaTestCases = pgTable(
     uniqueIndex('qa_test_cases_user_project_key_idx').on(table.userId, table.projectFingerprint, table.caseKey),
     index('qa_test_cases_user_project_idx').on(table.userId, table.projectFingerprint),
     index('qa_test_cases_last_seen_idx').on(table.lastSeenAt.desc()),
+    index('qa_test_cases_tier_idx').on(table.tier),
+    index('qa_test_cases_status_idx').on(table.status),
+    check(
+      'qa_test_cases_tier_check',
+      sql`tier IS NULL OR tier IN ('L0','L1','L2','L3')`
+    ),
+    check(
+      'qa_test_cases_status_check',
+      sql`status IN ('active','flake-quarantine','soft-deleted')`
+    ),
+    check(
+      'qa_test_cases_sensitivity_score_check',
+      sql`sensitivity_score IS NULL OR (sensitivity_score >= 0 AND sensitivity_score <= 1)`
+    ),
+  ]
+)
+
+/**
+ * W1: latest-write-wins-with-history. Every time we ingest a new version of
+ * a test case's content, we append a row here. `(caseKey, version)` is the
+ * natural key — version is monotonically increasing per caseKey. The latest
+ * version's content is the "current" body; older rows are kept so we can
+ * diff / blame / revert. Triggered from /api/test-runs/ingest (or future
+ * code-sync paths) — not auto-bumped on every run.
+ */
+export const qaTestVersions = pgTable(
+  'qa_test_versions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    caseKey: text('case_key').notNull(),
+    version: integer('version').notNull(),
+    content: text('content').notNull(),
+    contributorUserId: uuid('contributor_user_id')
+      .notNull()
+      .references(() => profiles.id, { onDelete: 'cascade' }),
+    runId: uuid('run_id').references(() => testRuns.id, { onDelete: 'set null' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('qa_test_versions_case_version_idx').on(table.caseKey, table.version),
+    index('qa_test_versions_case_idx').on(table.caseKey),
+    index('qa_test_versions_contributor_idx').on(table.contributorUserId),
+    index('qa_test_versions_run_idx').on(table.runId),
   ]
 )
 

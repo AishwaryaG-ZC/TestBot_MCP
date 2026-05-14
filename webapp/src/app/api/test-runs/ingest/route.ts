@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { apiKeys, testRuns, testFailures } from '@/lib/db/schema'
+import { apiKeys, testRuns, testFailures, workspaceMembers } from '@/lib/db/schema'
 import { eq, and } from 'drizzle-orm'
 import { hashApiKey } from '@/lib/utils/api-keys'
 import { checkRateLimit } from '@/lib/rate-limit'
@@ -18,6 +18,20 @@ import {
 } from '@/lib/qa-corpus'
 
 const ENDPOINT = '/api/test-runs/ingest'
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+export function pickWorkspaceId(body: Record<string, unknown>, headerValue: string | null): string | null {
+  const candidate =
+    (typeof body.workspaceId === 'string' && body.workspaceId) ||
+    (typeof body.workspace_id === 'string' && body.workspace_id) ||
+    (headerValue && headerValue.trim()) ||
+    null
+  if (!candidate) return null
+  const trimmed = String(candidate).trim()
+  if (!UUID_RE.test(trimmed)) return null
+  return trimmed
+}
 
 type AiLikeItem = {
   testName?: string
@@ -336,6 +350,40 @@ export async function POST(request: NextRequest) {
 
     const userId = apiKeyRecord.userId
 
+    // W1: resolve the workspace this run belongs to (optional). Accept it
+    // from the JSON body (workspaceId / workspace_id) OR the
+    // `x-healix-workspace-id` header. We must verify the calling user is a
+    // member of the workspace before stamping the row — otherwise a
+    // compromised api_key could pollute another team's corpus. If absent or
+    // unauthorized, we silently fall back to NULL (current behaviour).
+    const headerWorkspaceId = request.headers.get('x-healix-workspace-id')
+    const proposedWorkspaceId = pickWorkspaceId(body as Record<string, unknown>, headerWorkspaceId)
+    let workspaceIdForInsert: string | null = null
+    if (proposedWorkspaceId) {
+      const [membership] = await db
+        .select({ workspaceId: workspaceMembers.workspaceId })
+        .from(workspaceMembers)
+        .where(
+          and(
+            eq(workspaceMembers.workspaceId, proposedWorkspaceId),
+            eq(workspaceMembers.userId, userId)
+          )
+        )
+        .limit(1)
+      if (membership) {
+        workspaceIdForInsert = membership.workspaceId
+      } else {
+        // Don't 403 — that breaks backwards-compat for clients that pass an
+        // id they don't realise they're not a member of. Log + drop.
+        logBlockedRequest({
+          type: 'WORKSPACE_NOT_MEMBER',
+          user_id: userId,
+          reason: `User attempted to ingest under workspace ${proposedWorkspaceId} but is not a member`,
+          endpoint: ENDPOINT,
+        })
+      }
+    }
+
     // 3. Rate limit check
     const rateResult = await checkRateLimit({ keyHash, userId, endpoint: ENDPOINT })
     if (!rateResult.allowed) {
@@ -467,6 +515,7 @@ export async function POST(request: NextRequest) {
       .insert(testRuns)
       .values({
         userId,
+        workspaceId: workspaceIdForInsert,
         creationName: projectName,
         status: runStatus,
         totalTests: total_tests,

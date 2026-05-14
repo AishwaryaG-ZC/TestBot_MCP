@@ -6,6 +6,8 @@ import {
   persistSyncedQaCorpus,
   touchApiKeyLastUsed,
   updateRunFindingSummary,
+  prepareCorpusPromotionPayload,
+  persistCorpusPromotion,
 } from '@/lib/qa-corpus'
 
 const ENDPOINT = '/api/qa-corpus/sync'
@@ -18,6 +20,17 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function stringOrNull(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+/**
+ * Detect whether the incoming body is the W3 corpus-promotion shape
+ * (upserts/demotions/regressions arrays). Both shapes share the same endpoint
+ * so the MCP only has one URL to remember.
+ */
+function isW3PromotionPayload(body: Record<string, unknown>): boolean {
+  return Array.isArray(body.upserts)
+    || Array.isArray(body.demotions)
+    || Array.isArray(body.regressions)
 }
 
 export async function POST(request: NextRequest) {
@@ -42,6 +55,32 @@ export async function POST(request: NextRequest) {
       )
     }
 
+    // ── W3 path: corpus promotion deltas ───────────────────────────────────
+    if (isW3PromotionPayload(safeBody)) {
+      const prepared = prepareCorpusPromotionPayload(safeBody)
+      if (!prepared.projectFingerprint) {
+        return NextResponse.json({ error: 'projectFingerprint is required' }, { status: 400 })
+      }
+      const result = await persistCorpusPromotion({
+        userId: auth.userId,
+        contributorUserId: prepared.contributorUserId || auth.userId,
+        projectFingerprint: prepared.projectFingerprint,
+        runId: prepared.runId,
+        upserts: prepared.upserts,
+        demotions: prepared.demotions,
+        regressions: prepared.regressions,
+      })
+      await touchApiKeyLastUsed(auth.apiKeyId)
+      return NextResponse.json({
+        success: true,
+        mode: 'promotion',
+        projectFingerprint: prepared.projectFingerprint,
+        workspaceId: prepared.workspaceId,
+        ...result,
+      })
+    }
+
+    // ── Legacy path: full corpus sync (test_cases, findings, contracts) ────
     const prepared = prepareQaCorpusPayload(safeBody)
     if (!prepared.projectFingerprint) {
       return NextResponse.json({ error: 'projectFingerprint is required' }, { status: 400 })

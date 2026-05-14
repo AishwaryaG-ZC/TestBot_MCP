@@ -43,3 +43,5 @@ notebooks/
 
 # Local target apps cloned for Healix evaluation
 targets/
+logs/
+__pycache__/

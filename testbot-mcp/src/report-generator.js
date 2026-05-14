@@ -611,6 +611,7 @@ class ReportGenerator {
     aiTriage,
     api_key,
     dashboard_url,
+    workspaceId,
   }) {
     const timestamp = new Date().toISOString();
     const reportsDir = path.join(projectPath, 'healix-reports');
@@ -744,6 +745,12 @@ class ReportGenerator {
             qa_findings: report.qaFindings || [],
             qa_test_case_runs: report.qaTestCaseRuns || [],
             finding_summary: report.findingSummary || null,
+            // W1 — link this run to the resolved workspace so the team
+            // dashboard, coverage matrix, and activity stream include it.
+            // The /api/test-runs/ingest route accepts either body or
+            // x-healix-workspace-id header; we send body for backwards-compat.
+            workspace_id: workspaceId || null,
+            workspaceId: workspaceId || null,
           }),
         });
 
