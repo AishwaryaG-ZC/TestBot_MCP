@@ -35,14 +35,24 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-function WorkspaceCard({ ws, onRefreshInvite, onViewCoverage }: {
+function WorkspaceCard({ ws, onRefreshInvite, onViewCoverage, onDeleted }: {
   ws: Workspace;
   onRefreshInvite: (id: string) => void;
   onViewCoverage: (id: string) => void;
+  onDeleted: (id: string) => void;
 }) {
   const [members, setMembers] = useState<Member[]>([]);
   const [membersOpen, setMembersOpen] = useState(false);
   const [loadingMembers, setLoadingMembers] = useState(false);
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [addEmail, setAddEmail] = useState('');
+  const [addError, setAddError] = useState<string | null>(null);
+  const [addLoading, setAddLoading] = useState(false);
+  const [removingId, setRemovingId] = useState<string | null>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
+  const isOwner = ws.role === 'owner';
 
   const loadMembers = async () => {
     if (membersOpen) { setMembersOpen(false); return; }
@@ -57,8 +67,76 @@ function WorkspaceCard({ ws, onRefreshInvite, onViewCoverage }: {
     }
   };
 
+  const handleAddMember = async () => {
+    if (!addEmail.trim()) return;
+    setAddLoading(true);
+    setAddError(null);
+    try {
+      const res = await fetch(`/api/workspaces/${ws.id}/members`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: addEmail.trim() }),
+      });
+      const json = await res.json();
+      if (res.ok || res.status === 201) {
+        setAddEmail('');
+        setMembers((prev) => [...prev, json.member]);
+      } else {
+        setAddError(json.error || 'Failed to add member');
+      }
+    } catch {
+      setAddError('Network error');
+    } finally {
+      setAddLoading(false);
+    }
+  };
+
+  const handleRemoveMember = async (userId: string) => {
+    setRemovingId(userId);
+    try {
+      const res = await fetch(`/api/workspaces/${ws.id}/members`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId }),
+      });
+      if (res.ok) {
+        setMembers((prev) => prev.filter((m) => m.userId !== userId));
+      }
+    } catch { /* ignore */ } finally {
+      setRemovingId(null);
+    }
+  };
+
+  const handleDeleteWorkspace = async () => {
+    setDeleting(true);
+    try {
+      const res = await fetch(`/api/workspaces/${ws.id}`, { method: 'DELETE' });
+      if (res.ok) onDeleted(ws.id);
+    } catch { /* ignore */ } finally {
+      setDeleting(false);
+      setDeleteConfirm(false);
+    }
+  };
+
+  const projectKeyValue = ws.gitRemote || ws.projectName;
+
+  const mcpConfigSnippet = `"env": {
+  "HEALIX_API_KEY": "<your-api-key>",
+  "HEALIX_DASHBOARD_URL": "<dashboard-url>",
+  "HEALIX_PROJECT_KEY": "${projectKeyValue}"
+}`;
+
+  const aiAgentPrompt =
+    `Please add HEALIX_PROJECT_KEY to my Healix MCP server configuration.\n\n` +
+    `Add the following key-value pair to the "env" block of the "healix-mcp" entry in my MCP config file ` +
+    `(~/.claude/settings.json for Claude Code, ~/.cursor/mcp.json for Cursor, ` +
+    `~/.codeium/windsurf/mcp_config.json for Windsurf):\n\n` +
+    `"HEALIX_PROJECT_KEY": "${projectKeyValue}"\n\n` +
+    `This links me to the "${ws.projectName}" team workspace so Healix can share test coverage with my teammates.`;
+
   return (
     <div className="border-2 border-[#222] bg-[#0a0a0a] p-4 space-y-3">
+      {/* Header */}
       <div className="flex items-start justify-between gap-2">
         <div>
           <div className="text-white font-black font-mono text-sm uppercase tracking-wider">{ws.projectName}</div>
@@ -66,17 +144,18 @@ function WorkspaceCard({ ws, onRefreshInvite, onViewCoverage }: {
             <div className="text-[#505050] font-mono text-[11px] mt-0.5">{ws.gitRemote}</div>
           )}
         </div>
-        <span className={`text-[9px] font-mono font-black px-2 py-0.5 border ${ws.role === 'owner' ? 'border-white text-white' : 'border-[#444] text-[#888]'} uppercase tracking-wider flex-shrink-0`}>
+        <span className={`text-[9px] font-mono font-black px-2 py-0.5 border ${isOwner ? 'border-white text-white' : 'border-[#444] text-[#888]'} uppercase tracking-wider flex-shrink-0`}>
           {ws.role}
         </span>
       </div>
 
+      {/* Invite Code */}
       <div className="bg-[#050505] border border-[#1a1a1a] p-2">
         <div className="text-[9px] font-mono text-[#505050] uppercase tracking-widest mb-1">Invite Code</div>
         <div className="flex items-center gap-2">
           <code className="text-[#a0a0a0] font-mono text-xs flex-1 truncate">{ws.inviteCode}</code>
           <CopyButton text={ws.inviteCode} />
-          {ws.role === 'owner' && (
+          {isOwner && (
             <button
               onClick={() => onRefreshInvite(ws.id)}
               className="text-[10px] font-mono font-bold text-[#505050] hover:text-white border border-[#333] hover:border-[#666] px-2 py-0.5 transition-colors"
@@ -87,13 +166,32 @@ function WorkspaceCard({ ws, onRefreshInvite, onViewCoverage }: {
         </div>
       </div>
 
-      <div className="flex gap-2">
+      {/* Project Key */}
+      <div className="bg-[#050505] border border-[#1a1a1a] p-2">
+        <div className="text-[9px] font-mono text-[#505050] uppercase tracking-widest mb-1">Project Key</div>
+        <div className="flex items-center gap-2">
+          <code className="text-[#a0a0a0] font-mono text-xs flex-1 truncate">{projectKeyValue}</code>
+          <CopyButton text={projectKeyValue} />
+        </div>
+        <div className="text-[9px] font-mono text-[#333] mt-1">
+          Teammates without git access need this to link their MCP config.
+        </div>
+      </div>
+
+      {/* Action buttons */}
+      <div className="flex gap-2 flex-wrap">
         <button
           onClick={loadMembers}
           disabled={loadingMembers}
           className="flex-1 text-[10px] font-mono font-bold uppercase tracking-widest border border-[#333] hover:border-[#666] text-[#888] hover:text-white py-1.5 transition-colors disabled:opacity-40"
         >
           {loadingMembers ? '...' : membersOpen ? 'HIDE MEMBERS' : 'MEMBERS'}
+        </button>
+        <button
+          onClick={() => setSetupOpen((v) => !v)}
+          className="flex-1 text-[10px] font-mono font-bold uppercase tracking-widest border border-[#333] hover:border-[#666] text-[#888] hover:text-white py-1.5 transition-colors"
+        >
+          {setupOpen ? 'HIDE SETUP' : 'SETUP INSTRUCTIONS'}
         </button>
         <button
           onClick={() => onViewCoverage(ws.id)}
@@ -103,22 +201,127 @@ function WorkspaceCard({ ws, onRefreshInvite, onViewCoverage }: {
         </button>
       </div>
 
+      {/* Setup Instructions */}
+      {setupOpen && (
+        <div className="border-t border-[#1a1a1a] pt-3 space-y-3">
+          <div className="text-[9px] font-mono text-[#505050] uppercase tracking-widest font-black">Setup for Teammates</div>
+          <p className="text-[10px] font-mono text-[#505050]">
+            Teammates who have the repo cloned are auto-identified via git remote — no extra config needed.
+            For teammates using a zip or without git access, share these instructions:
+          </p>
+          <div>
+            <div className="text-[9px] font-mono text-[#505050] uppercase tracking-widest mb-1">Step 1 — Join the workspace</div>
+            <div className="text-[10px] font-mono text-[#505050]">
+              Share your invite code: <code className="text-[#a0a0a0]">{ws.inviteCode}</code>
+            </div>
+          </div>
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <div className="text-[9px] font-mono text-[#505050] uppercase tracking-widest">Step 2 — Add project key to MCP config</div>
+              <CopyButton text={mcpConfigSnippet} />
+            </div>
+            <pre className="bg-black border border-[#1a1a1a] text-[#a0a0a0] font-mono text-[10px] p-3 overflow-x-auto whitespace-pre">{mcpConfigSnippet}</pre>
+          </div>
+          <div>
+            <div className="flex items-center justify-between mb-1">
+              <div className="text-[9px] font-mono text-[#505050] uppercase tracking-widest">Or — paste this into your AI chat agent</div>
+              <CopyButton text={aiAgentPrompt} />
+            </div>
+            <pre className="bg-black border border-[#1a1a1a] text-[#606060] font-mono text-[10px] p-3 overflow-x-auto whitespace-pre-wrap">{aiAgentPrompt}</pre>
+          </div>
+        </div>
+      )}
+
+      {/* Members list */}
       {membersOpen && (
-        <div className="border-t border-[#1a1a1a] pt-3 space-y-1.5">
+        <div className="border-t border-[#1a1a1a] pt-3 space-y-2">
           {members.length === 0 ? (
             <div className="text-[#505050] font-mono text-xs">No members found</div>
           ) : (
             members.map((m) => (
               <div key={m.userId} className="flex items-center justify-between gap-2">
-                <div>
-                  <div className="text-white font-mono text-[11px]">{m.fullName || m.email}</div>
-                  {m.fullName && <div className="text-[#505050] font-mono text-[10px]">{m.email}</div>}
+                <div className="min-w-0">
+                  <div className="text-white font-mono text-[11px] truncate">{m.fullName || m.email}</div>
+                  {m.fullName && <div className="text-[#505050] font-mono text-[10px] truncate">{m.email}</div>}
                 </div>
-                <span className={`text-[9px] font-mono px-1.5 py-0.5 border ${m.role === 'owner' ? 'border-white text-white' : 'border-[#333] text-[#505050]'} uppercase`}>
-                  {m.role}
-                </span>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  <span className={`text-[9px] font-mono px-1.5 py-0.5 border ${m.role === 'owner' ? 'border-white text-white' : 'border-[#333] text-[#505050]'} uppercase`}>
+                    {m.role}
+                  </span>
+                  {isOwner && m.role !== 'owner' && (
+                    <button
+                      onClick={() => handleRemoveMember(m.userId)}
+                      disabled={removingId === m.userId}
+                      className="text-[9px] font-mono font-bold text-red-600 hover:text-red-400 border border-red-900 hover:border-red-600 px-1.5 py-0.5 transition-colors disabled:opacity-40"
+                    >
+                      {removingId === m.userId ? '...' : 'REMOVE'}
+                    </button>
+                  )}
+                </div>
               </div>
             ))
+          )}
+
+          {/* Add member (owner only) */}
+          {isOwner && (
+            <div className="pt-2 border-t border-[#1a1a1a] space-y-1.5">
+              <div className="text-[9px] font-mono text-[#505050] uppercase tracking-widest">Add Member by Email</div>
+              <div className="flex gap-2">
+                <input
+                  type="email"
+                  value={addEmail}
+                  onChange={(e) => { setAddEmail(e.target.value); setAddError(null); }}
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleAddMember(); }}
+                  placeholder="teammate@example.com"
+                  className="flex-1 bg-black border border-[#333] focus:border-white text-white font-mono text-xs px-3 py-1.5 outline-none min-w-0"
+                />
+                <button
+                  onClick={handleAddMember}
+                  disabled={addLoading || !addEmail.trim()}
+                  className="text-[10px] font-mono font-bold uppercase tracking-widest border border-[#555] hover:border-white text-[#888] hover:text-white px-3 py-1.5 transition-colors disabled:opacity-40 flex-shrink-0"
+                >
+                  {addLoading ? '...' : 'ADD'}
+                </button>
+              </div>
+              {addError && (
+                <div className="text-red-400 font-mono text-[10px]">{addError}</div>
+              )}
+            </div>
+          )}
+
+          {/* Delete workspace (owner only) */}
+          {isOwner && (
+            <div className="pt-3 border-t border-[#1a1a1a]">
+              {!deleteConfirm ? (
+                <button
+                  onClick={() => setDeleteConfirm(true)}
+                  className="text-[10px] font-mono font-bold uppercase tracking-widest border border-red-900 hover:border-red-500 text-red-700 hover:text-red-400 px-3 py-1.5 transition-colors w-full"
+                >
+                  DELETE WORKSPACE
+                </button>
+              ) : (
+                <div className="space-y-2">
+                  <div className="text-[10px] font-mono text-red-400">
+                    This permanently deletes the workspace, all shared test files, and coverage history. Cannot be undone.
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={handleDeleteWorkspace}
+                      disabled={deleting}
+                      className="flex-1 text-[10px] font-mono font-bold uppercase tracking-widest border border-red-500 bg-red-950 text-red-400 hover:bg-red-900 px-3 py-1.5 transition-colors disabled:opacity-40"
+                    >
+                      {deleting ? 'DELETING...' : 'YES, DELETE'}
+                    </button>
+                    <button
+                      onClick={() => setDeleteConfirm(false)}
+                      className="flex-1 text-[10px] font-mono font-bold uppercase tracking-widest border border-[#333] text-[#888] hover:text-white px-3 py-1.5 transition-colors"
+                    >
+                      CANCEL
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
           )}
         </div>
       )}
@@ -353,6 +556,7 @@ export default function WorkspacePage() {
               ws={ws}
               onRefreshInvite={handleRefreshInvite}
               onViewCoverage={(id) => setCoverageWorkspaceId(id)}
+              onDeleted={(id) => setWorkspaces((prev) => prev.filter((w) => w.id !== id))}
             />
           ))}
         </div>
