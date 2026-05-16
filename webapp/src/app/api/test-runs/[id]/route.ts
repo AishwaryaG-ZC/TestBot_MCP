@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth/session'
 import { db } from '@/lib/db'
-import { testRuns, testFailures, generationJobs } from '@/lib/db/schema'
+import { testRuns, testFailures, generationJobs, projectWorkspaces } from '@/lib/db/schema'
 import { eq, and, desc, sql } from 'drizzle-orm'
 import { extractRunIdFromReport, getLiveRunsForUser } from '@/lib/mcp-live-runs'
 import { loadQaFindingsForRun } from '@/lib/qa-corpus'
@@ -204,6 +204,24 @@ export async function GET(
       loadQaFindingsForRun(row.id, user.id),
       loadLatestGenerationJob(row.id, user.id),
     ])
+
+    // CL3-C — look up the run's workspace projectKey so the dashboard can
+    // fetch the latest canonical-suite for (workspace, projectKey). Cheap
+    // single-row lookup; nullable when the run is solo.
+    let workspaceProjectKey: string | null = null
+    if (row.workspaceId) {
+      try {
+        const [ws] = await db
+          .select({ projectKey: projectWorkspaces.projectKey })
+          .from(projectWorkspaces)
+          .where(eq(projectWorkspaces.id, row.workspaceId))
+          .limit(1)
+        workspaceProjectKey = ws?.projectKey ?? null
+      } catch {
+        workspaceProjectKey = null
+      }
+    }
+
     const data = {
       id: row.id,
       user_id: row.userId,
@@ -232,6 +250,10 @@ export async function GET(
       current_phase: null,
       error_code: null,
       is_live: false,
+      // CL3-C exposes workspace + project_key so the run page can fetch the
+      // latest canonical-suite directly.
+      workspace_id: row.workspaceId ?? null,
+      project_key: workspaceProjectKey,
       generationJob,
     }
 

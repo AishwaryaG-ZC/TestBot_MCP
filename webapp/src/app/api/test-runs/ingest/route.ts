@@ -284,6 +284,14 @@ export async function POST(request: NextRequest) {
       contract_snapshot,
       qaContracts,
       qa_contracts,
+      parent_test_run_id,
+      parentTestRunId,
+      existing_test_run_id,
+      existingTestRunId,
+      run_status,
+      runStatus: bodyRunStatus,
+      failure_breakdown,
+      failureBreakdown: bodyFailureBreakdown,
     } = body as {
       api_key?: string
       creation_name?: string
@@ -310,6 +318,14 @@ export async function POST(request: NextRequest) {
       contract_snapshot?: unknown
       qaContracts?: unknown
       qa_contracts?: unknown
+      parent_test_run_id?: unknown
+      parentTestRunId?: unknown
+      existing_test_run_id?: unknown
+      existingTestRunId?: unknown
+      run_status?: unknown
+      runStatus?: unknown
+      failure_breakdown?: unknown
+      failureBreakdown?: unknown
     }
     const finalApiKey: string = rawKey ?? api_key ?? ''
 
@@ -470,7 +486,7 @@ export async function POST(request: NextRequest) {
         ...(report?.metadata || {}),
         ...(normalizedRunId ? { runId: normalizedRunId } : {}),
       },
-    }
+    } as Record<string, unknown>
     const aiAnalysisPayload = buildAiAnalysisPayload(report)
     // Accept tierResults at top-level (preferred) or nested inside report for
     // MCP clients that roll it into the report blob.
@@ -504,37 +520,113 @@ export async function POST(request: NextRequest) {
       qa_contracts,
     })
 
+    // CL3-B — the worker can override the run status to mark "QA cycle
+    // complete" (graceful exit: only real bugs remained, pass rate plateaued).
+    // It also accepts the value from `report.runStatus` for callers that
+    // bundle it inside the report blob. The only override value currently
+    // honored is 'qa_cycle_complete'; anything else falls back to inference.
+    const explicitRunStatus =
+      (typeof run_status === 'string' && run_status.trim().length > 0 && run_status.trim())
+      || (typeof bodyRunStatus === 'string' && bodyRunStatus.trim().length > 0 && bodyRunStatus.trim())
+      || ((report as unknown as { runStatus?: string })?.runStatus)
+      || null
+    const allowedOverrides = new Set(['qa_cycle_complete'])
     const runStatus = pipelineErrorPayload
       ? 'error'
-      : hasRealFindings(qaCorpusPayload.findingSummary)
-        ? 'completed_with_findings'
-        : status
+      : (explicitRunStatus && allowedOverrides.has(String(explicitRunStatus)))
+        ? String(explicitRunStatus)
+        : hasRealFindings(qaCorpusPayload.findingSummary)
+          ? 'completed_with_findings'
+          : status
 
-    // Insert test run
-    const [testRun] = await db
-      .insert(testRuns)
-      .values({
-        userId,
-        workspaceId: workspaceIdForInsert,
-        creationName: projectName,
-        status: runStatus,
-        totalTests: total_tests,
-        passedTests: passed_tests,
-        failedTests: failed_tests,
-        skippedTests: skipped_tests,
-        durationMs: duration_ms,
-        backendPassRate: backend_pass_rate,
-        frontendPassRate: frontend_pass_rate,
-        reportJson: reportWithRunId,
-        aiAnalysis: aiAnalysisPayload,
-        coverageMetrics: coverageMetricsPayload,
-        tierResults: tierResultsPayload,
-        pipelineError: pipelineErrorPayload,
-        findingSummary: qaCorpusPayload.findingSummary,
-        source: 'mcp',
-        projectPath: project_path || null,
-      })
-      .returning({ id: testRuns.id })
+    // CL3-A — failure breakdown sent by the worker (or bundled in report).
+    // Persisted onto the report row so the dashboard can read it without
+    // requiring a schema migration (CL3-C handles a richer canonical store).
+    const failureBreakdownPayload =
+      (failure_breakdown && typeof failure_breakdown === 'object' ? failure_breakdown : null)
+      || (bodyFailureBreakdown && typeof bodyFailureBreakdown === 'object' ? bodyFailureBreakdown : null)
+      || ((report as unknown as { failureBreakdown?: unknown })?.failureBreakdown
+        && typeof (report as unknown as { failureBreakdown?: unknown }).failureBreakdown === 'object'
+          ? (report as unknown as { failureBreakdown?: unknown }).failureBreakdown
+          : null)
+      || null
+    if (failureBreakdownPayload) {
+      reportWithRunId.failureBreakdown = failureBreakdownPayload
+    }
+
+    // WS-2: accept parent_test_run_id (or camelCase). Validate it's a UUID;
+    // we do NOT verify ownership/membership here because the parent FK lives
+    // in the same userId scope (the MCP can only insert under its own
+    // api_key's userId). The schema's ON DELETE SET NULL prevents orphan
+    // dangling references.
+    const parentRunIdRaw =
+      typeof parent_test_run_id === 'string' && parent_test_run_id.trim().length > 0
+        ? parent_test_run_id.trim()
+        : typeof parentTestRunId === 'string' && parentTestRunId.trim().length > 0
+          ? parentTestRunId.trim()
+          : null
+    const parentRunIdForInsert = parentRunIdRaw && UUID_RE.test(parentRunIdRaw) ? parentRunIdRaw : null
+
+    // WS-LIVE — if the worker pre-created a live test_runs row at pipeline
+    // start (POST /api/test-runs/start) and now reports back the same id,
+    // UPDATE that row instead of inserting a duplicate. The live row already
+    // has phase telemetry attached; we just need to overwrite the placeholder
+    // counters + payload with the real results.
+    const existingIdRaw =
+      typeof existing_test_run_id === 'string' && existing_test_run_id.trim().length > 0
+        ? existing_test_run_id.trim()
+        : typeof existingTestRunId === 'string' && existingTestRunId.trim().length > 0
+          ? existingTestRunId.trim()
+          : null
+    const existingId = existingIdRaw && UUID_RE.test(existingIdRaw) ? existingIdRaw : null
+
+    let testRun: { id: string }
+    const valuesForRow = {
+      workspaceId: workspaceIdForInsert,
+      parentRunId: parentRunIdForInsert,
+      creationName: projectName,
+      status: runStatus,
+      totalTests: total_tests,
+      passedTests: passed_tests,
+      failedTests: failed_tests,
+      skippedTests: skipped_tests,
+      durationMs: duration_ms,
+      backendPassRate: backend_pass_rate,
+      frontendPassRate: frontend_pass_rate,
+      reportJson: reportWithRunId,
+      aiAnalysis: aiAnalysisPayload,
+      coverageMetrics: coverageMetricsPayload,
+      tierResults: tierResultsPayload,
+      pipelineError: pipelineErrorPayload,
+      findingSummary: qaCorpusPayload.findingSummary,
+      source: 'mcp' as const,
+      projectPath: project_path || null,
+    }
+
+    if (existingId) {
+      const updated = await db
+        .update(testRuns)
+        .set({ ...valuesForRow, updatedAt: new Date() })
+        .where(and(eq(testRuns.id, existingId), eq(testRuns.userId, userId)))
+        .returning({ id: testRuns.id })
+      if (updated.length > 0) {
+        testRun = updated[0]
+      } else {
+        // Fall through to insert if the live row was deleted or belongs to a
+        // different user (shouldn't happen — defense in depth).
+        const inserted = await db
+          .insert(testRuns)
+          .values({ userId, ...valuesForRow })
+          .returning({ id: testRuns.id })
+        testRun = inserted[0]
+      }
+    } else {
+      const inserted = await db
+        .insert(testRuns)
+        .values({ userId, ...valuesForRow })
+        .returning({ id: testRuns.id })
+      testRun = inserted[0]
+    }
 
     try {
       await persistPreparedQaCorpus({

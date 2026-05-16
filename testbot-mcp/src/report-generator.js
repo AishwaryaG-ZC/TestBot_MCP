@@ -612,6 +612,8 @@ class ReportGenerator {
     api_key,
     dashboard_url,
     workspaceId,
+    parentTestRunId,
+    existingTestRunId,
   }) {
     const timestamp = new Date().toISOString();
     const reportsDir = path.join(projectPath, 'healix-reports');
@@ -672,6 +674,12 @@ class ReportGenerator {
         qaContractCoverage: this.stripAnsiAndNormalize(generationMeta?.qaContractCoverage || null),
         qaContractWarnings: this.stripAnsiAndNormalize(generationMeta?.qaContractWarnings || []),
         qaContractQuestions: this.stripAnsiAndNormalize(generationMeta?.qaContractQuestions || []),
+        // WS-5: AC coverage scorecard — computed by pipeline-worker after
+        // each Playwright run by scanning `[REQ:...]` tags in test titles.
+        acCoverage: this.stripAnsiAndNormalize(generationMeta?.acCoverage || null),
+        // WS-6: bug-detection scorecard — present when KNOWN_BUGS.md was
+        // parsed at the project root.
+        bugScorecard: this.stripAnsiAndNormalize(generationMeta?.bugScorecard || null),
         fallbackUsed: Boolean(fallbackUsed),
         routeAccessSummary: this.stripAnsiAndNormalize(routeAccessSummary || generationMeta?.routeAccessSummary || null),
         aiTriage: normalizedAiTriage,
@@ -712,6 +720,16 @@ class ReportGenerator {
       findingSummary: this.stripAnsiAndNormalize(findingSummary),
       skipSummary: this.stripAnsiAndNormalize(skipSummary),
       qaTestCaseRuns: this.stripAnsiAndNormalize(qaTestCaseRuns),
+      // WS-5 / WS-6: top-level surfacing so the dashboard can read
+      // `testRun.report?.acCoverage` / `testRun.report?.bugScorecard`
+      // without spelunking through generationMeta.
+      acCoverage: this.stripAnsiAndNormalize(generationMeta?.acCoverage || null),
+      bugScorecard: this.stripAnsiAndNormalize(generationMeta?.bugScorecard || null),
+      // CL3-A / CL3-B — top-level breakdown + optional runStatus override.
+      // `runStatus` is null in normal terminations; only set to
+      // 'qa_cycle_complete' when the iteration controller graduates the run.
+      failureBreakdown: this.stripAnsiAndNormalize(generationMeta?.failureBreakdown || null),
+      runStatus: generationMeta?.runStatus || null,
     };
 
     const reportFilename = `report-${timestamp.replace(/[:.]/g, '-')}.json`;
@@ -745,12 +763,30 @@ class ReportGenerator {
             qa_findings: report.qaFindings || [],
             qa_test_case_runs: report.qaTestCaseRuns || [],
             finding_summary: report.findingSummary || null,
+            // CL3-B — when the iteration controller exits with
+            // `stop_qa_cycle_complete`, the worker stamps
+            // `report.runStatus = 'qa_cycle_complete'`. The ingest route
+            // honors it instead of inferring from pass/fail counts.
+            run_status: report.runStatus || null,
+            // CL3-A — broadcast the failure classification breakdown so the
+            // dashboard can render "5 real bugs / 12 ungrounded tests / 1 env".
+            failure_breakdown: report.failureBreakdown || null,
             // W1 — link this run to the resolved workspace so the team
             // dashboard, coverage matrix, and activity stream include it.
             // The /api/test-runs/ingest route accepts either body or
             // x-healix-workspace-id header; we send body for backwards-compat.
             workspace_id: workspaceId || null,
             workspaceId: workspaceId || null,
+            // WS-2 — if this is a top-up run, populate parent_run_id on the
+            // child test_runs row so the dashboard can render the parent →
+            // children tree.
+            parent_test_run_id: parentTestRunId || null,
+            parentTestRunId: parentTestRunId || null,
+            // WS-LIVE — if pipeline-worker pre-created a stub test_runs row,
+            // tell the ingest route to UPDATE that row instead of inserting
+            // a duplicate. The live phase telemetry stays attached.
+            existing_test_run_id: existingTestRunId || null,
+            existingTestRunId: existingTestRunId || null,
           }),
         });
 

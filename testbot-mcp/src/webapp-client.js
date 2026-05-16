@@ -1069,6 +1069,43 @@ class WebappClient {
     };
   }
 
+  /**
+   * WS-1: fetch the workspace_project_settings row for (workspaceId, projectKey).
+   *
+   * Returns:
+   *   - { settings, status: 'ok' }       when row exists and the caller is a member
+   *   - { settings: null, status: 'not_found' }    on 404 (no row yet)
+   *   - { settings: null, status: 'forbidden' }    on 403 (not a member)
+   *   - { settings: null, status: 'error', reason } on any other failure
+   *
+   * Never throws — the launcher must always be able to fall through to the
+   * normal config-form path. The settings object carries decrypted creds
+   * (from the server's PUT-time encryption) — DO NOT log or echo them.
+   */
+  async getWorkspaceProjectSettings({ workspaceId, projectKey } = {}) {
+    if (!this.apiKey) return { settings: null, status: 'no_api_key' };
+    if (!workspaceId || !projectKey) {
+      return { settings: null, status: 'missing_args' };
+    }
+    try {
+      const params = new URLSearchParams({ projectKey });
+      const data = await this._get(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/settings?${params.toString()}`,
+        { timeoutMs: 10_000 }
+      );
+      return { settings: data || null, status: 'ok' };
+    } catch (err) {
+      if (err.status === 404) return { settings: null, status: 'not_found' };
+      if (err.status === 403) return { settings: null, status: 'forbidden' };
+      Logger.warn('WebappClient', 'getWorkspaceProjectSettings failed (non-blocking)', {
+        code: err.code,
+        status: err.status,
+        message: err.message,
+      });
+      return { settings: null, status: 'error', reason: err.message };
+    }
+  }
+
   /** Pull all shared test files for a workspace. Returns [] on any error. */
   async pullWorkspaceTestFiles({ workspaceId }) {
     if (!this.apiKey || !workspaceId) return [];
@@ -1217,6 +1254,84 @@ class WebappClient {
         message: err?.message,
       });
       return null;
+    }
+  }
+
+  /**
+   * Convenience wrapper used by the Claude-local adapter. Posts an
+   * `awaiting_user_question` phase event into mcpTelemetryEvents so the
+   * dashboard's SSE stream picks it up and renders the QuestionModal.
+   * The actual blocking + answer routing happens in the ask-user MCP server
+   * via `pollPendingAnswer` below.
+   */
+  async postRunQuestion({ runId, questionId, question, options, confidence, source = 'claude-local' } = {}) {
+    return this.reportPhase({
+      runId,
+      phase: 'awaiting_user_question',
+      metadata: { questionId, question, options: options || [], confidence: confidence ?? null, source },
+    });
+  }
+
+  /**
+   * Long-poll the webapp for a user's answer to a pipeline question. The
+   * server holds the request up to `serverWaitMs` (default 30s) before
+   * returning 204. We do a short client-side retry loop with exponential
+   * backoff so a single `pollPendingAnswer` call blocks until the user
+   * answers OR the caller times out.
+   *
+   * @param {Object}  args
+   * @param {string}  args.runId            Required.
+   * @param {string}  args.questionId       Required.
+   * @param {number}  [args.timeoutMs]      Overall client-side cap; default no cap (block until answer).
+   * @param {number}  [args.pollIntervalMs] Backoff seed; default 1000.
+   * @returns {Promise<string|null>}        The answer string, or null if timed out.
+   */
+  async pollPendingAnswer({ runId, questionId, timeoutMs, pollIntervalMs = 1000 } = {}) {
+    if (!runId || !questionId) return null;
+    const deadline = Number.isFinite(timeoutMs) ? Date.now() + timeoutMs : null;
+    let attempt = 0;
+    while (true) {
+      if (deadline && Date.now() >= deadline) return null;
+      try {
+        const url = `/api/test-runs/${encodeURIComponent(runId)}/pending-answer?questionId=${encodeURIComponent(questionId)}`;
+        const result = await this._get(url, { timeoutMs: 35_000 });
+        if (result && typeof result.answer === 'string') return result.answer;
+        // 204 from server → no answer yet, fall through to sleep + retry.
+      } catch (err) {
+        // 204 surfaces as a non-error empty result from _get in most stacks;
+        // any other error we treat as transient and back off.
+        Logger.warn('WebappClient', 'pollPendingAnswer transient error', {
+          runId, questionId, code: err?.code, message: err?.message,
+        });
+      }
+      attempt += 1;
+      const delay = Math.min(pollIntervalMs * Math.pow(1.5, attempt - 1), 30_000);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+
+  /**
+   * Long-poll for a user-issued resume signal (e.g. after `claude login`).
+   * Same shape as pollPendingAnswer but resolves to `{ reason }` or null.
+   */
+  async pollPendingResume({ runId, timeoutMs, pollIntervalMs = 2000 } = {}) {
+    if (!runId) return null;
+    const deadline = Number.isFinite(timeoutMs) ? Date.now() + timeoutMs : null;
+    let attempt = 0;
+    while (true) {
+      if (deadline && Date.now() >= deadline) return null;
+      try {
+        const url = `/api/test-runs/${encodeURIComponent(runId)}/pending-resume`;
+        const result = await this._get(url, { timeoutMs: 35_000 });
+        if (result && typeof result.reason === 'string') return result;
+      } catch (err) {
+        Logger.warn('WebappClient', 'pollPendingResume transient error', {
+          runId, code: err?.code, message: err?.message,
+        });
+      }
+      attempt += 1;
+      const delay = Math.min(pollIntervalMs * Math.pow(1.5, attempt - 1), 30_000);
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
 }

@@ -50,6 +50,12 @@ const { detectProjectKey } = require('./detect-project-key');
 const TierIsolation = require('./tier-isolation');
 const ModelLadder = require('./model-ladder');
 const PrdChunked = require('./prd-chunked');
+const ClaudeLocal = require('./adapters/claude-local');
+const BugScorecard = require('./bug-scorecard');
+const CanonicalSuiteArchive = require('./canonical-suite-archive');
+const CanonicalSuiteManifest = require('./canonical-suite-manifest');
+const SourceFingerprint = require('./source-fingerprint');
+const FailureClassifier = require('./failure-classifier');
 
 // Initialize logger for the worker process
 Logger.initialize();
@@ -600,6 +606,97 @@ function collectAcTagsFromParsedPRD(parsedPRD) {
   };
   visit(parsedPRD);
   return [...out];
+}
+
+// ── WS-5: AC coverage scoring helpers ────────────────────────────────────────
+// Tag regex shared with the prompt directive ("[REQ:F<f>.S<s>.AC<n>]"). The
+// inner pattern matches `F\d+.S\d+.AC\d+` exactly; case-sensitive on purpose
+// so `[req:f1.s1.ac1]` does NOT count toward coverage.
+const AC_TAG_REGEX = /\[REQ:([A-Z]\d+\.[A-Z]\d+\.[A-Z]+\d+)\]/g;
+
+/**
+ * Flatten parsedPRD into a list of canonical AC IDs. Reuses the same shape
+ * the prompt-builder hands Claude in the "Acceptance criteria to cover"
+ * checklist so the coverage scorer compares apples to apples.
+ */
+function collectCanonicalAcIds(parsedPRD) {
+  if (!parsedPRD || !Array.isArray(parsedPRD.features)) return [];
+  const out = [];
+  const seen = new Set();
+  parsedPRD.features.forEach((feature, fIdx) => {
+    const fRaw = feature?.id || feature?.featureId || feature?.tag || '';
+    const fMatch = /F(\d+)/i.exec(String(fRaw));
+    const fNum = fMatch ? Number(fMatch[1]) : (fIdx + 1);
+    const stories = Array.isArray(feature?.userStories) ? feature.userStories : [];
+    stories.forEach((story, sIdx) => {
+      const sRaw = story?.id || story?.storyId || story?.tag || '';
+      const sMatch = /S(\d+)/i.exec(String(sRaw));
+      const sNum = sMatch ? Number(sMatch[1]) : (sIdx + 1);
+      const acs = Array.isArray(story?.acceptanceCriteria) ? story.acceptanceCriteria : [];
+      acs.forEach((ac, aIdx) => {
+        const raw = (ac && typeof ac === 'object' && (ac.tag || ac.id)) || '';
+        const full = /F(\d+)\.S(\d+)\.AC(\d+)/i.exec(String(raw));
+        let id;
+        if (full) {
+          id = `F${full[1]}.S${full[2]}.AC${full[3]}`;
+        } else {
+          const acOnly = /AC(\d+)/i.exec(String(raw));
+          const acNum = acOnly ? Number(acOnly[1]) : (aIdx + 1);
+          id = `F${fNum}.S${sNum}.AC${acNum}`;
+        }
+        if (!seen.has(id)) {
+          seen.add(id);
+          out.push(id);
+        }
+      });
+    });
+  });
+  return out;
+}
+
+/**
+ * Score AC coverage from a Playwright result set.
+ *
+ * Inputs:
+ *   - testResults.tests[*].title (or .name) — scanned for `[REQ:<id>]` tags.
+ *   - allAcIds: canonical IDs from parsedPRD (universe of targets).
+ *
+ * Returns:
+ *   {
+ *     covered:   string[]  // IDs hit by a PASSING test
+ *     attempted: string[]  // IDs hit by ANY test (passing or failing)
+ *     uncovered: string[]  // IDs not hit by any test
+ *     totalAcTags: number,
+ *     ratio:     number,   // covered / totalAcTags
+ *   }
+ */
+function computeAcCoverage({ testResults, allAcIds }) {
+  const universe = Array.isArray(allAcIds) ? allAcIds : [];
+  const tests = Array.isArray(testResults?.tests) ? testResults.tests : [];
+  const attempted = new Set();
+  const covered = new Set();
+  for (const t of tests) {
+    const title = String(t?.title || t?.name || '');
+    if (!title) continue;
+    AC_TAG_REGEX.lastIndex = 0;
+    let m;
+    while ((m = AC_TAG_REGEX.exec(title)) !== null) {
+      const id = m[1];
+      attempted.add(id);
+      const status = String(t?.status || '').toLowerCase();
+      if (status === 'passed' || status === 'pass') covered.add(id);
+    }
+  }
+  const totalAcTags = universe.length;
+  const uncovered = universe.filter((id) => !attempted.has(id));
+  const ratio = totalAcTags > 0 ? covered.size / totalAcTags : 0;
+  return {
+    covered: [...covered],
+    attempted: [...attempted],
+    uncovered,
+    totalAcTags,
+    ratio,
+  };
 }
 
 function resolveGenerationAgentConcurrency(config = {}, agents = []) {
@@ -8062,6 +8159,37 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         return null;
       };
 
+      // CL2-A — for claude-local generation, the quality audit becomes
+      // advisory: we still compute + log the audit, but we NEVER quarantine
+      // Claude's specs. Trust Claude's output and let Playwright's --list be
+      // the only hard gate. Quarantine here was the root cause of the V1 #2
+      // collapse (4 of 5 strong specs silently dropped before execution).
+      const isClaudeLocalGen = String(generator || '').startsWith('claude-local')
+        || String(generator || '').includes('claude-local');
+      if (isClaudeLocalGen) {
+        Logger.info('PipelineWorker', '[CL2-A] Quality audit advisory for claude-local — no quarantine', {
+          generator,
+          totalFiles: qualityAudit.totalFiles,
+          riskyFiles: qualityAudit.riskyFiles?.length || 0,
+          ungroundedUiFiles: qualityAudit.ungroundedUiFiles?.length || 0,
+          missingSourceReferenceFiles: qualityAudit.missingSourceReferenceFiles?.length || 0,
+        });
+        if (statusDir && (qualityAudit.riskyFiles?.length || qualityAudit.ungroundedUiFiles?.length)) {
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'quality_audit_advisory',
+            phase: 'generation_quality_advisory',
+            status: 'info',
+            message: 'Quality audit found issues — advisory only for claude-local (no quarantine).',
+            metadata: {
+              riskyFiles: qualityAudit.riskyFiles,
+              ungroundedUiFiles: qualityAudit.ungroundedUiFiles,
+              missingSourceReferenceFiles: qualityAudit.missingSourceReferenceFiles,
+            },
+          });
+        }
+        return { ...validation, qualityAudit };
+      }
       const pruning = pruneGeneratedTestsByQuality({
         projectPath: config.projectPath,
         qualityAudit,
@@ -8874,7 +9002,106 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     }
   };
 
-  const result = await tryGenerator('saas', async () => {
+  // ── Generator selection ─────────────────────────────────────────────────
+  // Default to claude-local (subscription-driven Claude Code subprocess).
+  // Opt out by setting HEALIX_GENERATOR=saas or config.generationMode='saas'.
+  // The Tier-0 deterministic pack is generated up-front by BOTH paths.
+  const requestedGenerator = (config.generationMode === 'saas' || process.env.HEALIX_GENERATOR === 'saas')
+    ? 'saas'
+    : 'claude-local';
+
+  const claudeLocalGenerator = async () => {
+    const testsDir = resetGeneratedTestsDir(config.projectPath);
+    deterministicTier0Pack = ensureQaContractSpecPersistent({
+      projectPath: config.projectPath,
+      context: generationContext,
+      roles: roles || [],
+      testType: config.testType,
+    });
+    generationMeta.tier0Deterministic = {
+      generatedBeforeAi: true,
+      ...deterministicTier0Pack,
+    };
+    if (deterministicTier0Pack.written && statusDir) {
+      updateStatus(statusDir, 'generation_tier0_ready', {
+        runId,
+        message: `Generated ${deterministicTier0Pack.generatedTests} deterministic Tier-0 QA contract test(s).`,
+        qaContractSummary: deterministicTier0Pack.qaContractSummary,
+        qaContractQuestions: deterministicTier0Pack.qaContractQuestions,
+      }, telemetryReporter);
+    }
+
+    // Tier-1 ephemeral dir is where Claude writes its specs. The deterministic
+    // Tier-0 pack stays in the persistent dir (tier-isolation handles publish).
+    const tier1Dir = TierIsolation.ensureTierDirs(config.projectPath).tier1;
+
+    const adapterClient = new WebappClient({ apiKey: process.env.HEALIX_API_KEY });
+    const claudeResult = await ClaudeLocal.runClaudeGeneration({
+      context: generationContext,
+      projectPath: config.projectPath,
+      testsDir: tier1Dir,
+      prdContent: prdContent || '',
+      parsedPRD: parsedPRD || null,
+      explorationArtifact: explorationArtifact || null,
+      roles: roles || [],
+      projectInfo,
+      runId,
+      statusDir,
+      client: adapterClient,
+      workspaceContext: corpusBootstrap?.workspaceContext || null,
+      corpusSeed: corpusBootstrap?.corpusSeed || null,
+      corpusGuidance: corpusGuidance || null,
+      iterationNumber: 1,
+      feedback: null,
+      sessionId: null,
+      telemetryReporter,
+    });
+
+    if (claudeResult.status === 'awaiting_user_login') {
+      const err = new Error(`Claude Code login required: ${claudeResult.reason || 'unknown'}`);
+      err.code = 'CLAUDE_LOGIN_REQUIRED';
+      err.adapterResult = claudeResult;
+      throw err;
+    }
+    if (claudeResult.status === 'awaiting_user_question') {
+      // Surface upward — the worker's post-execute iteration loop will block
+      // on the answer poll, NOT generateWithFallbackChain. For now we treat
+      // it as a soft pause that produced zero files; the outer iteration
+      // loop reinvokes once the answer comes in.
+      const err = new Error('Claude pipeline paused on awaiting_user_question');
+      err.code = 'CLAUDE_AWAITING_USER_QUESTION';
+      err.adapterResult = claudeResult;
+      throw err;
+    }
+
+    // Synchronise legacy view (tests/generated) so validation + execution see
+    // both Tier-0 + Tier-1 files in one directory.
+    try { TierIsolation.syncLegacyView(config.projectPath, { clear: false }); } catch { /* best-effort */ }
+
+    return {
+      generated: claudeResult.generated,
+      files: claudeResult.files,
+      provider: 'claude-local',
+      claudeSessionId: claudeResult.sessionId,
+      claudeUsage: claudeResult.usage,
+      claudeSummary: claudeResult.summary,
+      // WS-3: surface Claude's self-DONE marker so the iteration loop in the
+      // pipeline-worker can short-circuit on the very first controller call.
+      claudeSelfDone: claudeResult.selfDone === true,
+      generationMeta: {
+        provider: 'claude-local',
+        selectedGenerator: 'claude-local',
+        iterations: [claudeResult.generationMeta],
+        selfDone: claudeResult.selfDone === true,
+        // CL2-B — top-level mirror of the session id so the topup route can
+        // grab it from `report.generationMeta.claudeSessionId` without
+        // walking iterations[].
+        claudeSessionId: claudeResult.sessionId || null,
+      },
+    };
+  };
+
+  const saasGenerator = async () => {
     const testsDir = resetGeneratedTestsDir(config.projectPath);
     // W2: pass the corpus-filtered context so Tier-0 doesn't re-emit
     // invariants the persisted corpus already covers.
@@ -9021,7 +9248,18 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     }
 
     return saasResult;
-  });
+  };
+
+  // ── Dispatch ──────────────────────────────────────────────────────────
+  // claude-local is the default; saas is the legacy fallback path. If
+  // claude-local pauses on awaiting_user_question / login, the error surfaces
+  // here and `result` ends up null; the existing failure branch below will
+  // emit a proper diagnostics blob and the worker's outer iteration loop
+  // (added below) handles the awaiting_user_* phases.
+  Logger.info('PipelineWorker', 'Generation dispatch', { requestedGenerator });
+  const result = requestedGenerator === 'claude-local'
+    ? await tryGenerator('claude-local', claudeLocalGenerator)
+    : await tryGenerator('saas', saasGenerator);
 
   generationMeta.finishedAt = new Date().toISOString();
 
@@ -9968,6 +10206,216 @@ async function runWorkspaceCoveragePush({ client, workspaceId, runId, testResult
   }
 }
 
+// ── CL3-C: canonical-suite snapshot helpers ───────────────────────────────
+// After a terminal run we package every accepted spec (Tier-0 + the Tier-1
+// specs that either passed OR caught a REAL finding) into a versioned zip,
+// build a per-file manifest with REQ tags and last status, and POST it to
+// /api/workspaces/{id}/canonical-suite. Solo runs (no workspaceId) skip.
+
+const {
+  extractReqTagsFromContent,
+  countTestBlocksInContent,
+  lastStatusForFile,
+} = CanonicalSuiteManifest;
+
+/**
+ * Walk Tier-0 + Tier-1 directories and produce the list of accepted spec
+ * files we want to persist. Accepted = (Tier-0 always) OR (Tier-1 that passed
+ * AND/OR is classified as catching a REAL finding).
+ *
+ * Returns { files: [{ path: zipRelPath, content: string, fileName, relPath,
+ *                     lastStatus, testsInFile, requirementsCovered, classification }] }
+ */
+function collectAcceptedSuiteFiles({ projectPath, testResults, failureBreakdown }) {
+  const tier0Dir = path.join(projectPath, 'tests', 'healix-persistent', 'tier-0');
+  const tier1Dir = path.join(projectPath, 'tests', 'healix-ephemeral', 'tier-1');
+  const accepted = [];
+
+  const readSpecsFromDir = (dir, tierLabel) => {
+    if (!fs.existsSync(dir)) return [];
+    const out = [];
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    for (const ent of entries) {
+      if (!ent.isFile()) continue;
+      if (!GENERATED_SPEC_FILE_PATTERN.test(ent.name)) continue;
+      const abs = path.join(dir, ent.name);
+      let content = '';
+      try { content = fs.readFileSync(abs, 'utf-8'); } catch { continue; }
+      out.push({ abs, fileName: ent.name, tier: tierLabel, content });
+    }
+    return out;
+  };
+
+  // Tier-0 specs are always accepted.
+  for (const spec of readSpecsFromDir(tier0Dir, 'tier-0')) {
+    accepted.push(spec);
+  }
+
+  // Tier-1 specs: accept those that have at least one passing test OR that
+  // had at least one REAL finding attributed to the file. The
+  // failureBreakdown map (per-file classification) is optional — if absent,
+  // we fall back to "include any tier-1 file with at least one pass".
+  const failureByFile = failureBreakdown && typeof failureBreakdown === 'object'
+    ? failureBreakdown.byFile || null
+    : null;
+  for (const spec of readSpecsFromDir(tier1Dir, 'tier-1')) {
+    const status = lastStatusForFile(testResults, spec.fileName);
+    const fileClass = failureByFile && typeof failureByFile === 'object'
+      ? failureByFile[spec.fileName]
+      : null;
+    const hasRealFinding = !!(fileClass && fileClass.real && fileClass.real > 0);
+    if (status === 'passed' || status === 'mixed' || hasRealFinding) {
+      accepted.push(spec);
+    }
+  }
+
+  // Build entries with zip-relative paths.
+  return accepted.map((spec) => {
+    const relPath = path.relative(projectPath, spec.abs).split(path.sep).join('/');
+    const lastStatus = lastStatusForFile(testResults, spec.fileName);
+    return {
+      path: relPath, // path inside the zip
+      content: spec.content,
+      fileName: spec.fileName,
+      relPath,
+      tier: spec.tier,
+      lastStatus,
+      testsInFile: countTestBlocksInContent(spec.content),
+      requirementsCovered: extractReqTagsFromContent(spec.content),
+      classification: spec.tier, // best-effort: tier label is its classification
+    };
+  });
+}
+
+/**
+ * CL3-C — snapshot the accepted suite into the DB. Fire-and-forget on error.
+ */
+async function snapshotCanonicalSuite({
+  client,
+  workspaceId,
+  projectKey,
+  projectPath,
+  sourceRunId,
+  testResults,
+  bugScorecard,
+  failureBreakdown,
+  acCoverageRatio,
+} = {}) {
+  if (!client || !workspaceId || !projectKey) {
+    Logger.info('CanonicalSuite', 'Skipping snapshot — no workspace/project key', {
+      hasClient: !!client, hasWorkspace: !!workspaceId, hasProjectKey: !!projectKey,
+    });
+    return null;
+  }
+
+  const entries = collectAcceptedSuiteFiles({ projectPath, testResults, failureBreakdown });
+  if (entries.length === 0) {
+    Logger.warn('CanonicalSuite', 'No accepted specs to snapshot', { workspaceId, projectKey });
+    return null;
+  }
+
+  let archive;
+  try {
+    archive = CanonicalSuiteArchive.buildSuiteArchive({
+      files: entries.map((e) => ({ path: e.path, content: e.content })),
+    });
+  } catch (err) {
+    Logger.warn('CanonicalSuite', 'Failed to build suite archive', { reason: err?.message });
+    return null;
+  }
+
+  const manifest = entries.map((e) => ({
+    filename: e.fileName,
+    relPath: e.relPath,
+    requirementsCovered: e.requirementsCovered,
+    classification: e.classification,
+    lastStatus: e.lastStatus,
+    testsInFile: e.testsInFile,
+  }));
+
+  const total = testResults?.total || 0;
+  const passed = testResults?.passed || 0;
+
+  try {
+    const resp = await client._post(
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/canonical-suite`,
+      {
+        projectKey,
+        sourceRunId: sourceRunId || null,
+        suite_manifest: manifest,
+        suite_archive_b64: archive.archiveB64,
+        total_tests: total,
+        passing_tests: passed,
+        ac_coverage_ratio: Number.isFinite(acCoverageRatio) ? acCoverageRatio : null,
+        bug_scorecard: bugScorecard || null,
+      },
+      { timeoutMs: 60_000 }
+    );
+    Logger.info('CanonicalSuite', 'Snapshot persisted', {
+      workspaceId,
+      projectKey,
+      version: resp?.version,
+      files: entries.length,
+      archiveBytes: archive.archiveBytes,
+    });
+    return resp;
+  } catch (err) {
+    Logger.warn('CanonicalSuite', 'Snapshot POST failed (non-blocking)', {
+      reason: err?.message,
+      code: err?.code,
+    });
+    return null;
+  }
+}
+
+/**
+ * CL3-D — compute and POST source-file fingerprints. Fire-and-forget.
+ */
+async function captureSourceFingerprints({
+  client,
+  workspaceId,
+  projectKey,
+  projectPath,
+  sourceRunId,
+} = {}) {
+  if (!client || !workspaceId || !projectKey || !projectPath) return null;
+  try {
+    const { fingerprints, scanned, skipped } = SourceFingerprint.computeFingerprints(projectPath);
+    if (fingerprints.length === 0) {
+      Logger.info('SourceFingerprint', 'No fingerprintable files', { workspaceId, projectKey });
+      return null;
+    }
+    const resp = await client._post(
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/source-fingerprints`,
+      {
+        projectKey,
+        sourceRunId: sourceRunId || null,
+        fingerprints,
+      },
+      { timeoutMs: 30_000 }
+    );
+    Logger.info('SourceFingerprint', 'Fingerprints persisted', {
+      workspaceId,
+      projectKey,
+      scanned,
+      skipped,
+      inserted: resp?.inserted ?? fingerprints.length,
+    });
+    return resp;
+  } catch (err) {
+    Logger.warn('SourceFingerprint', 'Fingerprint POST failed (non-blocking)', {
+      reason: err?.message,
+      code: err?.code,
+    });
+    return null;
+  }
+}
+
 /**
  * Main pipeline function.
  */
@@ -9992,10 +10440,33 @@ async function runPipeline(config, runId) {
   const durableClient = process.env.HEALIX_API_KEY
     ? new WebappClient({ apiKey: process.env.HEALIX_API_KEY })
     : null;
+  // WS-LIVE — pre-create a test_runs row so the dashboard renders THIS run
+  // live (no more "Test run not found" until ingest). The returned testRunId
+  // is propagated through every reportPhase call so test_runs.current_phase
+  // updates in real time and the run-detail SSE stream filters work.
+  let liveTestRunId = null;
   if (durableClient) {
+    try {
+      const startResp = await durableClient._post('/api/test-runs/start', {
+        api_key: process.env.HEALIX_API_KEY,
+        run_id: runId,
+        creation_name: config.projectName || (config.projectPath ? path.basename(config.projectPath) : 'Healix run'),
+        project_path: config.projectPath,
+        framework: config.framework || null,
+        source: 'mcp',
+        initial_phase: 'started',
+      }, { timeoutMs: 8_000 });
+      liveTestRunId = startResp?.test_run_id || null;
+      if (liveTestRunId) {
+        Logger.info('PipelineWorker', 'WS-LIVE pre-created test_run row', { liveTestRunId, runId });
+      }
+    } catch (err) {
+      Logger.warn('PipelineWorker', 'WS-LIVE start failed (non-blocking)', { reason: err?.message });
+    }
     setDurablePhaseReporter((payload) => {
       durableClient.reportPhase({
         runId,
+        testRunId: liveTestRunId,
         phase: payload.phase,
         metadata: { message: payload.message, errorCode: payload.errorCode || null },
       }).catch(() => undefined);
@@ -10003,6 +10474,7 @@ async function runPipeline(config, runId) {
     setStageBudgetReporter(({ stage, consumedMs, capMs, success }) => {
       durableClient.reportPhase({
         runId,
+        testRunId: liveTestRunId,
         phase: `stage:${stage}`,
         stageBudget: { stage, consumedMs, capMs },
         metadata: { success },
@@ -10030,6 +10502,12 @@ async function runPipeline(config, runId) {
   let routeAccessSummary = null;
   const aiOnlyEnforced = strictAIEnabled(config);
   let workspaceState = null; // populated by pre-flight if shared workspace found
+  // CL-C — hoisted bridge between the `if (config.generateTests) { ... }`
+  // block (where generationResult and its context vars live) and the
+  // iteration loop further down. Captured at the end of the generation
+  // step so the iteration loop can re-invoke the adapter with the same
+  // context + the Claude session id.
+  let claudeLocalCtx = null;
 
   updateStatus(statusDir, 'started', {
     runId,
@@ -10043,6 +10521,29 @@ async function runPipeline(config, runId) {
     project: config.projectName,
     budgetMs: runBudget.totalMs,
   });
+
+  // ── WS-2: top-up shortcut ──────────────────────────────────────────────────
+  // When this worker is invoked by POST /api/test-runs/[id]/topup, the config
+  // carries parentSessionId + parentTestRunId. The parent already did the
+  // exploration + PRD parse + Tier-0 codegen + at least one iteration; we
+  // skip all of that and jump straight into the iteration loop with the
+  // parent's Claude session id and a feedback markdown built from the
+  // parent's failures. The ingest call later attaches parent_test_run_id so
+  // /api/test-runs/ingest can populate the FK.
+  const isTopUp = !!(config && config.parentSessionId && config.parentTestRunId);
+  if (isTopUp) {
+    updateStatus(statusDir, 'topup_started', {
+      runId,
+      parentTestRunId: config.parentTestRunId,
+      parentIteration: typeof config.parentIteration === 'number' ? config.parentIteration : 1,
+      message: 'Top-up: skipping exploration + PRD parse + Tier-0, resuming Claude session.',
+    }, telemetryReporter);
+    Logger.info('PipelineWorker', 'WS-2 top-up shortcut engaged', {
+      parentTestRunId: config.parentTestRunId,
+      parentIteration: config.parentIteration || 1,
+      hasFeedback: typeof config.parentFeedback === 'string' && config.parentFeedback.length > 0,
+    });
+  }
 
   try {
     // -------------------------------------------------------
@@ -10741,7 +11242,11 @@ async function runPipeline(config, runId) {
     // -------------------------------------------------------
     // 4. Generate tests
     // -------------------------------------------------------
-    if (config.generateTests) {
+    // WS-2: when this run is a top-up of a parent, skip the entire generation
+    // block. The parent already produced Tier-0 + Tier-1 specs on disk; the
+    // iteration loop's pre-execution Claude regen call (further down) will
+    // append new specs using the parent's Claude session id + feedback.
+    if (config.generateTests && !isTopUp) {
       const rolesForGeneration = attachCredentialFixturesToRoles(roles, config.testCredentials);
       const generationComplexity = maybeExpandGenerationStageBudget({
         runBudget,
@@ -11083,6 +11588,23 @@ async function runPipeline(config, runId) {
           });
         });
       }
+
+      // CL-C — hoist the values the iteration loop needs out of this block
+      // scope. Captured AFTER generation so generationResult is populated.
+      claudeLocalCtx = {
+        selectedGenerator: generationMeta?.selectedGenerator || generationResult?.provider || null,
+        claudeSessionId: generationResult?.claudeSessionId || null,
+        context: activeGenerationContext,
+        prdContent: combinedPrdContent,
+        parsedPRD,
+        explorationArtifact,
+        roles: rolesForGeneration,
+        // WS-3: pass the initial generation's self-DONE flag through so the
+        // iteration-loop's first decide() call can honour it without needing
+        // a re-invocation.
+        selfDone: generationResult?.claudeSelfDone === true
+          || generationResult?.generationMeta?.selfDone === true,
+      };
     }
 
     // -------------------------------------------------------
@@ -11431,60 +11953,381 @@ async function runPipeline(config, runId) {
       Logger.warn('PipelineWorker', 'Tier-0 legacy view self-heal failed', { reason: healErr.message });
     }
 
-    testResults = await withStageBudget(runBudget, 'execution', async () => {
-      if (!mcpParallelEnabled) {
-        return playwright.runTests();
-      }
+    // ── WS-2: seed Claude-local context for top-up runs ─────────────────────
+    // The parent already populated tests/generated/. We re-invoke Claude with
+    // the parent's session id + feedback BEFORE the first execution so the
+    // new specs are on disk by the time Playwright runs.
+    if (isTopUp) {
+      claudeLocalCtx = {
+        selectedGenerator: 'claude-local',
+        claudeSessionId: config.parentSessionId,
+        context: codebaseContext || {},
+        prdContent: '',
+        parsedPRD: null,
+        explorationArtifact: null,
+        roles: roles || [],
+        selfDone: false,
+      };
+      generationMeta = generationMeta || {};
+      generationMeta.selectedGenerator = 'claude-local';
+      generationMeta.claudeSessionId = config.parentSessionId;
+      generationMeta.parentTestRunId = config.parentTestRunId;
+      generationMeta.parentIteration = config.parentIteration || 1;
 
-      Logger.info('PipelineWorker', 'Parallel execution enabled: direct + Playwright MCP');
-      const playwrightMCPIntegration = new PlaywrightMCPIntegration({
-        projectPath: config.projectPath,
-        baseURL: config.baseURL,
-        mcpPackageName: config.playwrightMcp?.mcpPackageName,
-        mcpVersion: config.playwrightMcp?.mcpVersion,
-        noInstall: config.playwrightMcp?.noInstall,
-      });
-
-      const [directOutcome, mcpOutcome] = await Promise.allSettled([
-        playwright.runTests(),
-        playwrightMCPIntegration.runTests(),
-      ]);
-
-      if (directOutcome.status === 'rejected' && mcpOutcome.status === 'rejected') {
-        throw new Error(`Both test runners failed: direct=${directOutcome.reason?.message} mcp=${mcpOutcome.reason?.message}`);
-      }
-
-      if (directOutcome.status === 'fulfilled' && mcpOutcome.status === 'fulfilled') {
-        const merger = new ResultsMerger({
+      // Pre-loop Claude regen: feed the parent feedback once before the first
+      // Playwright run so the iteration loop sees a fresh suite.
+      try {
+        const seededIter = (config.parentIteration || 1) + 1;
+        const topupAdapterClient = new WebappClient({ apiKey: process.env.HEALIX_API_KEY });
+        const topupRegen = await ClaudeLocal.runClaudeGeneration({
+          context: claudeLocalCtx.context,
           projectPath: config.projectPath,
-          dedupeStrategy: config.resultMerge?.dedupeStrategy,
+          testsDir: TierIsolation.ensureTierDirs(config.projectPath).tier1,
+          prdContent: '',
+          parsedPRD: null,
+          explorationArtifact: null,
+          roles: claudeLocalCtx.roles,
+          projectInfo,
+          runId,
+          statusDir,
+          client: topupAdapterClient,
+          workspaceContext: workspaceState?.workspaceId ? { workspaceId: workspaceState.workspaceId } : null,
+          corpusSeed: null,
+          corpusGuidance: null,
+          iterationNumber: seededIter,
+          feedback: config.parentFeedback || '',
+          sessionId: config.parentSessionId,
+          telemetryReporter,
+          // CL3-D — focus areas shipped by /api/test-runs/[id]/topup
+          topupFocus: config.topupFocus || null,
+          _skipPreflight: true,
         });
-        return merger.mergeResults(directOutcome.value, mcpOutcome.value);
-      }
-
-      if (directOutcome.status === 'fulfilled') {
-        Logger.warn('PipelineWorker', 'Playwright MCP execution failed; using direct results only', {
-          reason: mcpOutcome.reason?.message,
+        if (topupRegen?.status === 'ok') {
+          claudeLocalCtx.claudeSessionId = topupRegen.sessionId || claudeLocalCtx.claudeSessionId;
+          try { TierIsolation.syncLegacyView(config.projectPath, { clear: false }); } catch { /* best-effort */ }
+        } else {
+          Logger.warn('PipelineWorker', 'Top-up pre-loop Claude regen returned non-ok status; continuing with existing suite', {
+            status: topupRegen?.status,
+          });
+        }
+      } catch (topupErr) {
+        Logger.warn('PipelineWorker', 'Top-up pre-loop Claude regen threw; continuing with existing suite', {
+          reason: topupErr?.message,
         });
-        return directOutcome.value;
       }
-
-      Logger.warn('PipelineWorker', 'Direct execution failed; using Playwright MCP results only', {
-        reason: directOutcome.reason?.message,
-      });
-      return mcpOutcome.value;
-    });
-    if (progressFlushTimer) {
-      clearTimeout(progressFlushTimer);
-      progressFlushTimer = null;
     }
-    flushProgress();
 
-    Logger.info('PipelineWorker', 'Tests completed', {
-      total: testResults.total,
-      passed: testResults.passed,
-      failed: testResults.failed,
-    });
+    // ── Iteration loop (Claude-local only) ──────────────────────────────────
+    // The execute → measure → maybe-regenerate cycle. For claude-local runs
+    // we let Claude iterate: after each Playwright run, if pass rate is below
+    // target AND iteration controller says continue, we re-invoke the adapter
+    // with feedback (failed tests + uncovered ACs) and re-execute. saas runs
+    // are single-pass like today.
+    const isClaudeLocalRun = (claudeLocalCtx?.selectedGenerator === 'claude-local')
+      || (generationMeta?.selectedGenerator === 'claude-local');
+    let claudeSessionId = claudeLocalCtx?.claudeSessionId || null;
+    let claudeIteration = isTopUp ? ((config.parentIteration || 1) + 1) : 1;
+    let previousPassRate = 0;
+    let noProgressCounter = 0;
+    let claudeIterationDecisions = [];
+    // CL3-B: track the final iteration verdict so we can map
+    // `stop_qa_cycle_complete` → runStatus=qa_cycle_complete on the report.
+    let claudeLocalFinalVerdict = null;
+    // WS-3: Claude's self-DONE flag is captured per-iteration from the adapter's
+    // return shape. Seed it from generationResult so iter-1's DONE (set during
+    // claudeLocalGenerator() at the top of the run) is honoured by the very
+    // first iteration-controller call.
+    let claudeSelfDone = Boolean(claudeLocalCtx?.selfDone)
+      || Boolean(generationMeta?.iterations?.[0]?.selfDone);
+    const claudeMaxIterations = Math.max(
+      1,
+      Number.parseInt(process.env.HEALIX_CLAUDE_MAX_ITERATIONS || '', 10) || 5
+    );
+    // WS-5: AC coverage scoring state — recomputed every loop after Playwright
+    // finishes. The final value is stamped onto the report payload so the
+    // dashboard can render an "AC Coverage" card.
+    let acCoverage = null;
+    // WS-5: canonical AC IDs the prompt told Claude to cover (universe).
+    const allAcIds = collectCanonicalAcIds(claudeLocalCtx?.parsedPRD || parsedPRD);
+    let previousUncoveredCount = null;
+
+    while (true) {
+      testResults = await withStageBudget(runBudget, 'execution', async () => {
+        if (!mcpParallelEnabled) {
+          return playwright.runTests();
+        }
+
+        Logger.info('PipelineWorker', 'Parallel execution enabled: direct + Playwright MCP');
+        const playwrightMCPIntegration = new PlaywrightMCPIntegration({
+          projectPath: config.projectPath,
+          baseURL: config.baseURL,
+          mcpPackageName: config.playwrightMcp?.mcpPackageName,
+          mcpVersion: config.playwrightMcp?.mcpVersion,
+          noInstall: config.playwrightMcp?.noInstall,
+        });
+
+        const [directOutcome, mcpOutcome] = await Promise.allSettled([
+          playwright.runTests(),
+          playwrightMCPIntegration.runTests(),
+        ]);
+
+        if (directOutcome.status === 'rejected' && mcpOutcome.status === 'rejected') {
+          throw new Error(`Both test runners failed: direct=${directOutcome.reason?.message} mcp=${mcpOutcome.reason?.message}`);
+        }
+
+        if (directOutcome.status === 'fulfilled' && mcpOutcome.status === 'fulfilled') {
+          const merger = new ResultsMerger({
+            projectPath: config.projectPath,
+            dedupeStrategy: config.resultMerge?.dedupeStrategy,
+          });
+          return merger.mergeResults(directOutcome.value, mcpOutcome.value);
+        }
+
+        if (directOutcome.status === 'fulfilled') {
+          Logger.warn('PipelineWorker', 'Playwright MCP execution failed; using direct results only', {
+            reason: mcpOutcome.reason?.message,
+          });
+          return directOutcome.value;
+        }
+
+        Logger.warn('PipelineWorker', 'Direct execution failed; using Playwright MCP results only', {
+          reason: directOutcome.reason?.message,
+        });
+        return mcpOutcome.value;
+      });
+      if (progressFlushTimer) {
+        clearTimeout(progressFlushTimer);
+        progressFlushTimer = null;
+      }
+      flushProgress();
+
+      Logger.info('PipelineWorker', 'Tests completed', {
+        iteration: claudeIteration,
+        total: testResults.total,
+        passed: testResults.passed,
+        failed: testResults.failed,
+      });
+
+      // CL3-A — classify each failure as real | bad | env BEFORE the iteration
+      // decision so the dashboard can show "found 5 real bugs" and the
+      // feedback builder can split rewrite vs investigate.
+      try {
+        const classifierContext = {
+          explorationArtifact: claudeLocalCtx?.explorationArtifact || explorationArtifact || null,
+          parsedPRD: claudeLocalCtx?.parsedPRD || parsedPRD || null,
+          apiContracts: (typeof codebaseContext !== 'undefined' && codebaseContext?.qaContracts) || null,
+          knownRoutes: [
+            ...((claudeLocalCtx?.explorationArtifact || explorationArtifact)?.pages || []).map(p => p?.path || p?.url).filter(Boolean),
+            ...((claudeLocalCtx?.explorationArtifact || explorationArtifact)?.routes || []).map(r => r?.path || r?.url || r).filter(Boolean),
+          ],
+          knownTexts: ((claudeLocalCtx?.explorationArtifact || explorationArtifact)?.assertableText) || [],
+        };
+        const classifiedFailures = FailureClassifier.classifyFailures(testResults.failures || [], classifierContext);
+        const failureBreakdown = FailureClassifier.summarizeBreakdown(classifiedFailures);
+        testResults.failures = classifiedFailures;
+        testResults.failureBreakdown = failureBreakdown;
+        if (generationMeta) generationMeta.failureBreakdown = failureBreakdown;
+        Logger.info('PipelineWorker', 'Failure classification complete', {
+          iteration: claudeIteration,
+          ...failureBreakdown,
+        });
+      } catch (classifyErr) {
+        Logger.warn('PipelineWorker', 'Failure classifier threw; continuing without breakdown', {
+          reason: classifyErr?.message,
+        });
+      }
+
+      if (!isClaudeLocalRun) break;
+
+      const passRate = testResults.total > 0 ? testResults.passed / testResults.total : 0;
+
+      // WS-5: compute real AC coverage from test titles BEFORE deciding
+      // whether to continue. `acCoverage.uncovered.length` and
+      // `acCoverage.totalAcTags` replace the placeholder `0/1` that
+      // previously short-circuited the iteration controller.
+      acCoverage = computeAcCoverage({ testResults, allAcIds });
+      const uncoveredAcIds = Array.isArray(acCoverage?.uncovered) ? acCoverage.uncovered : [];
+      const totalAcTags = Number.isFinite(acCoverage?.totalAcTags) ? acCoverage.totalAcTags : 0;
+
+      const decision = ClaudeLocal.IterationController.decide({
+        passRate,
+        previousPassRate,
+        iteration: claudeIteration,
+        uncoveredAcTagsCount: uncoveredAcIds.length,
+        previousUncoveredCount,
+        totalAcTags,
+        noProgressCounter,
+        selfDone: claudeSelfDone,
+        maxIterations: claudeMaxIterations,
+        // CL3-B — let the controller detect "QA cycle complete" when only
+        // real bugs remain and the pass rate has plateaued.
+        failureBreakdown: testResults.failureBreakdown || null,
+      });
+      claudeIterationDecisions.push({
+        iteration: claudeIteration,
+        passRate,
+        decision,
+        coverageRatio: acCoverage?.ratio || 0,
+        uncoveredCount: uncoveredAcIds.length,
+        totalAcTags,
+        selfDone: claudeSelfDone,
+      });
+      Logger.info('PipelineWorker', 'Claude-local iteration decision', {
+        iteration: claudeIteration,
+        passRate,
+        decision: decision?.decision || decision,
+      });
+      updateStatus(statusDir, 'claude_local_iteration_decision', {
+        runId,
+        message: `Iteration ${claudeIteration}: ${(passRate * 100).toFixed(1)}% — ${decision?.decision || decision}`,
+        iteration: claudeIteration,
+        passRate,
+        decision: decision?.decision || decision,
+      }, telemetryReporter);
+
+      const verdict = decision?.decision || decision;
+      claudeLocalFinalVerdict = verdict;
+      if (verdict !== 'continue') break;
+
+      // Build feedback Markdown and re-invoke the adapter for iteration N+1.
+      // WS-5: pass the real uncovered AC list (was always empty before).
+      // CL3-A: pass the classification splits so the feedback section
+      // distinguishes "tests to REWRITE" from "REAL findings to investigate".
+      const _allFailures = testResults.failures || [];
+      const _real = _allFailures.filter(f => f?.classification === 'real');
+      const _bad = _allFailures.filter(f => f?.classification === 'bad');
+      const _env = _allFailures.filter(f => f?.classification === 'env');
+      const feedback = ClaudeLocal.FeedbackBuilder.build({
+        iteration: claudeIteration + 1,
+        passRate,
+        previousPassRate,
+        failedTests: _allFailures.slice(0, 12),
+        realFailures: _real.slice(0, 12),
+        badFailures: _bad.slice(0, 12),
+        envFailures: _env.slice(0, 12),
+        failureBreakdown: testResults.failureBreakdown || null,
+        uncoveredAcTags: uncoveredAcIds,
+      });
+      const adapterClient = new WebappClient({ apiKey: process.env.HEALIX_API_KEY });
+      let reGen;
+      try {
+        reGen = await ClaudeLocal.runClaudeGeneration({
+          context: claudeLocalCtx?.context || {},
+          projectPath: config.projectPath,
+          testsDir: TierIsolation.ensureTierDirs(config.projectPath).tier1,
+          prdContent: claudeLocalCtx?.prdContent || '',
+          parsedPRD: claudeLocalCtx?.parsedPRD || null,
+          explorationArtifact: claudeLocalCtx?.explorationArtifact || null,
+          roles: claudeLocalCtx?.roles || [],
+          projectInfo,
+          runId,
+          statusDir,
+          client: adapterClient,
+          workspaceContext: workspaceState?.workspaceId ? { workspaceId: workspaceState.workspaceId } : null,
+          corpusSeed: null,
+          corpusGuidance: null,
+          iterationNumber: claudeIteration + 1,
+          feedback,
+          sessionId: claudeSessionId,
+          telemetryReporter,
+          // CL3-D — propagate top-up focus across iterations of a top-up run.
+          topupFocus: config.topupFocus || null,
+          _skipPreflight: true, // session is warm — no need to re-probe
+        });
+      } catch (reGenErr) {
+        Logger.warn('PipelineWorker', 'Claude-local re-invocation threw — stopping iteration', {
+          iteration: claudeIteration + 1,
+          message: reGenErr?.message,
+        });
+        break;
+      }
+
+      if (reGen?.status !== 'ok') {
+        Logger.warn('PipelineWorker', 'Claude-local re-invocation paused — stopping iteration', {
+          iteration: claudeIteration + 1,
+          status: reGen?.status,
+        });
+        break;
+      }
+
+      claudeSessionId = reGen.sessionId || claudeSessionId;
+      // CL2-B — append per-iteration meta (with sessionId) so the topup route
+      // sees the latest session id, not just iteration 1's.
+      if (Array.isArray(generationMeta?.iterations)) {
+        generationMeta.iterations.push(reGen.generationMeta || { iteration: claudeIteration + 1, sessionId: reGen.sessionId });
+      } else if (generationMeta) {
+        generationMeta.iterations = [reGen.generationMeta || { iteration: claudeIteration + 1, sessionId: reGen.sessionId }];
+      }
+      if (generationMeta) generationMeta.claudeSessionId = claudeSessionId;
+      // WS-3: pick up the self-DONE flag from the latest generation so the
+      // next iteration-controller call sees it.
+      claudeSelfDone = Boolean(reGen.selfDone || reGen.generationMeta?.selfDone);
+      // Re-publish Tier-0 + Tier-1 to legacy view so Playwright sees the new specs.
+      try { TierIsolation.syncLegacyView(config.projectPath, { clear: false }); } catch { /* best-effort */ }
+      if (passRate <= previousPassRate + 0.02) noProgressCounter += 1;
+      else noProgressCounter = 0;
+      previousPassRate = passRate;
+      previousUncoveredCount = uncoveredAcIds.length;
+      claudeIteration += 1;
+    }
+
+    // Stash iteration history on generationMeta for the dashboard.
+    if (Array.isArray(claudeIterationDecisions) && claudeIterationDecisions.length > 0) {
+      generationMeta = generationMeta || {};
+      generationMeta.claudeLocalIterations = claudeIterationDecisions;
+      generationMeta.claudeLocalFinalIteration = claudeIteration;
+      generationMeta.claudeLocalFinalVerdict = claudeLocalFinalVerdict || null;
+    }
+    // CL3-B: when the iteration loop terminated with "qa_cycle_complete",
+    // propagate a runStatus override the report-generator can hand to ingest.
+    if (claudeLocalFinalVerdict === 'stop_qa_cycle_complete') {
+      generationMeta = generationMeta || {};
+      generationMeta.runStatus = 'qa_cycle_complete';
+    }
+
+    // WS-5: when the iteration loop did not run (saas, or no claude-local
+    // context), we still want a coverage signal on the report so the
+    // dashboard card always renders something meaningful.
+    if (!acCoverage && allAcIds.length > 0) {
+      acCoverage = computeAcCoverage({ testResults, allAcIds });
+    }
+    if (acCoverage) {
+      generationMeta = generationMeta || {};
+      generationMeta.acCoverage = acCoverage;
+    }
+
+    // WS-6: bug-detection scorecard. Reads KNOWN_BUGS.md from the project root
+    // (if present) and scores which planted bugs the suite caught vs missed.
+    // Best-effort — failures here must not derail report generation.
+    let bugScorecard = null;
+    try {
+      const knownBugsPath = path.join(config.projectPath, 'KNOWN_BUGS.md');
+      if (fs.existsSync(knownBugsPath)) {
+        const md = fs.readFileSync(knownBugsPath, 'utf-8');
+        const knownBugs = BugScorecard.parseKnownBugs(md);
+        if (knownBugs.length > 0) {
+          const scored = BugScorecard.scoreBugs({ knownBugs, testResults });
+          bugScorecard = {
+            knownBugs: knownBugs.map((b) => ({ id: b.id, title: b.title, category: b.category })),
+            caught: scored.caught,
+            missed: scored.missed,
+            total: scored.total,
+            score: scored.score,
+          };
+          generationMeta = generationMeta || {};
+          generationMeta.bugScorecard = bugScorecard;
+          updateStatus(statusDir, 'bug_scorecard_computed', {
+            runId,
+            caught: scored.caught.length,
+            total: scored.total,
+            score: scored.score,
+            message: `Bug scorecard: ${scored.caught.length}/${scored.total} planted bugs caught.`,
+          }, telemetryReporter);
+        }
+      }
+    } catch (bugErr) {
+      Logger.warn('PipelineWorker', 'Bug scorecard failed (non-blocking)', { reason: bugErr?.message });
+    }
 
     // Workspace post-execution: push coverage registry (fire-and-forget)
     if (workspaceState?.workspaceId) {
@@ -11663,6 +12506,12 @@ async function runPipeline(config, runId) {
         // W1 — link the ingested test_run row to the team workspace so
         // /workspace/[id]/coverage and /all-tests?workspaceId=X show it.
         workspaceId: workspaceState?.workspaceId || config?._workspaceId || null,
+        // WS-2 — when this is a top-up of another run, attach the parent so
+        // /api/test-runs/ingest can populate test_runs.parent_run_id.
+        parentTestRunId: config?.parentTestRunId || null,
+        // WS-LIVE — if we pre-created a stub test_runs row at pipeline start,
+        // tell ingest to UPDATE that row rather than insert a duplicate.
+        existingTestRunId: liveTestRunId || null,
       });
     });
     recordRunDecision(statusDir, telemetryReporter, {
@@ -11854,6 +12703,57 @@ async function runPipeline(config, runId) {
       Logger.warn('PipelineWorker', 'W3 corpus sync failed (non-blocking)', {
         reason: corpusErr?.message,
         code: corpusErr?.code,
+      });
+    }
+
+    // -------------------------------------------------------
+    // 7c. CL3-C: snapshot canonical suite + CL3-D fingerprints
+    // -------------------------------------------------------
+    // Persist the accepted test suite (Tier-0 + passing/REAL Tier-1) into the
+    // DB as a versioned archive, and capture source-file fingerprints so a
+    // later top-up run can diff what changed. Both helpers no-op for solo
+    // runs (no workspaceId) and never throw.
+    try {
+      const cl3WorkspaceId = workspaceState?.workspaceId || null;
+      const cl3ProjectKey = workspaceState?.identity?.projectKey
+        || corpusBootstrap?.workspaceContext?.projectKey
+        || null;
+      const cl3SourceRunId = report?.actualRunId || liveTestRunId || null;
+      const cl3FailureBreakdown = (generationMeta && generationMeta.failureBreakdown) || null;
+      const cl3AcCoverageRatio = Number.isFinite(requirementsCoverage?.acCoverageRatio)
+        ? requirementsCoverage.acCoverageRatio
+        : (Number.isFinite(requirementsCoverage?.coverageRatio)
+            ? requirementsCoverage.coverageRatio
+            : null);
+
+      if (cl3WorkspaceId && cl3ProjectKey && durableClient) {
+        await snapshotCanonicalSuite({
+          client: durableClient,
+          workspaceId: cl3WorkspaceId,
+          projectKey: cl3ProjectKey,
+          projectPath: config.projectPath,
+          sourceRunId: cl3SourceRunId,
+          testResults,
+          bugScorecard: generationMeta?.bugScorecard || null,
+          failureBreakdown: cl3FailureBreakdown,
+          acCoverageRatio: cl3AcCoverageRatio,
+        });
+        await captureSourceFingerprints({
+          client: durableClient,
+          workspaceId: cl3WorkspaceId,
+          projectKey: cl3ProjectKey,
+          projectPath: config.projectPath,
+          sourceRunId: cl3SourceRunId,
+        });
+      } else {
+        Logger.info('PipelineWorker', 'CL3 snapshot skipped (solo run or no project key)', {
+          hasWorkspace: !!cl3WorkspaceId,
+          hasProjectKey: !!cl3ProjectKey,
+        });
+      }
+    } catch (cl3Err) {
+      Logger.warn('PipelineWorker', 'CL3 snapshot/fingerprint failed (non-blocking)', {
+        reason: cl3Err?.message,
       });
     }
 
@@ -12122,6 +13022,10 @@ async function runPipeline(config, runId) {
         // W1 — even error_reported rows should be linked to the workspace
         // so the dashboard shows them in the team activity stream.
         workspaceId: workspaceState?.workspaceId || config?._workspaceId || null,
+        // WS-2 — preserve parent linkage even on failed top-up runs.
+        parentTestRunId: config?.parentTestRunId || null,
+        // WS-LIVE — also reconcile the pre-created live row on error paths.
+        existingTestRunId: liveTestRunId || null,
       });
       recordRunDecision(statusDir, telemetryReporter, {
         runId,

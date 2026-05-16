@@ -10,6 +10,18 @@ const { URL } = require('url');
 const { z } = require('zod');
 const Logger = require('./logger');
 
+let _WebappClient = null;
+function getWebappClient() {
+  if (!_WebappClient) _WebappClient = require('./webapp-client');
+  return _WebappClient;
+}
+
+let _detectProjectKey = null;
+function getDetectProjectKey() {
+  if (!_detectProjectKey) _detectProjectKey = require('./detect-project-key').detectProjectKey;
+  return _detectProjectKey;
+}
+
 const SUPPORTED_PRD_CONTENT_TYPES = new Set([
   'text/plain',
   'text/markdown',
@@ -126,6 +138,163 @@ class ConfigUILauncher {
   async launch(projectInfo = {}) {
     const { waitForConfig } = await this.launchNonBlocking(projectInfo);
     return waitForConfig;
+  }
+
+  /**
+   * WS-1: workspace_project_settings pre-fetch.
+   *
+   * Before opening the config form, look up saved defaults for this
+   * (workspaceId, projectKey). Three outcomes:
+   *
+   *   1. row exists AND row.autoApply === true
+   *        → return a synthetic "submission" matching the form's POST shape,
+   *          plus { autoApplied: true, settings, source: 'workspace_settings' }.
+   *          Caller short-circuits — never opens the browser.
+   *
+   *   2. row exists AND row.autoApply === false
+   *        → return { autoApplied: false, prefill: {…field values…} } so the
+   *          caller can pass it into launchNonBlocking() and the HTML form is
+   *          rendered with these values pre-populated server-side. (For v1 we
+   *          just pass through to the browser as defaults via projectInfo
+   *          fields — the form already reads them.)
+   *
+   *   3. row missing OR fetch failed
+   *        → return { autoApplied: false, prefill: null }. Caller behaves as
+   *          today (empty form).
+   *
+   * IMPORTANT: never log decrypted credentials. The "settings" object carries
+   * them — we strip them from any log output below.
+   *
+   * Args:
+   *   projectPath: filesystem path for projectKey detection.
+   *   workspaceId: pre-resolved workspace UUID (caller resolves via
+   *                client.resolveWorkspace upstream — passing null short-
+   *                circuits to "no settings").
+   *   client: an instance of WebappClient (caller supplies; we don't
+   *           instantiate one here because the caller already has
+   *           HEALIX_API_KEY context).
+   */
+  async prefetchAndMaybeAutoApply({ projectPath, workspaceId, client } = {}) {
+    if (!workspaceId) {
+      return { autoApplied: false, prefill: null, status: 'no_workspace' };
+    }
+    if (!client || typeof client.getWorkspaceProjectSettings !== 'function') {
+      return { autoApplied: false, prefill: null, status: 'no_client' };
+    }
+    let projectKey = process.env.HEALIX_PROJECT_KEY || null;
+    if (!projectKey && projectPath) {
+      try {
+        const detected = getDetectProjectKey()(projectPath);
+        projectKey = detected?.projectKey || null;
+      } catch (err) {
+        Logger.warn('ConfigUILauncher', 'detectProjectKey threw — skipping auto-apply', {
+          reason: err?.message,
+        });
+      }
+    }
+    if (!projectKey) {
+      return { autoApplied: false, prefill: null, status: 'no_project_key' };
+    }
+
+    let lookup;
+    try {
+      lookup = await client.getWorkspaceProjectSettings({ workspaceId, projectKey });
+    } catch (err) {
+      // Defensive — getWorkspaceProjectSettings is documented as never-throws,
+      // but if a future refactor regresses we still degrade gracefully.
+      Logger.warn('ConfigUILauncher', 'Settings fetch threw — falling through to form', {
+        reason: err?.message,
+      });
+      return { autoApplied: false, prefill: null, status: 'fetch_threw' };
+    }
+
+    if (lookup.status !== 'ok' || !lookup.settings) {
+      return { autoApplied: false, prefill: null, status: lookup.status, projectKey };
+    }
+
+    const s = lookup.settings;
+    // Coerce DB row into the same shape the form POST produces. We keep the
+    // schema strictly aligned with CONFIG_UI_PAYLOAD_SCHEMA so downstream
+    // validation passes the same way for both auto-applied + form-submitted
+    // configs.
+    const credentialsArray = Array.isArray(s.credentials)
+      ? s.credentials
+          .filter((c) => c && typeof c === 'object')
+          .map((c) => ({
+            role: typeof c.role === 'string' ? c.role : '',
+            username: typeof c.username === 'string' ? c.username : '',
+            password: typeof c.password === 'string' ? c.password : '',
+          }))
+          .filter((c) => c.role || c.username || c.password)
+      : [];
+
+    const prdText =
+      typeof s.defaultPrd === 'string' && s.defaultPrd.trim().length > 0
+        ? s.defaultPrd
+        : null;
+
+    const submission = {
+      testType: ['frontend', 'backend', 'both'].includes(s.defaultTestType)
+        ? s.defaultTestType
+        : 'both',
+      baseURL: s.defaultBaseUrl || 'http://localhost:3000',
+      startCommand: s.defaultStartCommand || 'npm run dev',
+      generateTests: true,
+      openDashboard: true,
+      credentials: credentialsArray.length > 0 ? credentialsArray : undefined,
+      prd: prdText
+        ? {
+            name: `${s.projectName || projectKey || 'project'}-prd.md`,
+            contentType: 'text/markdown',
+            textContent: prdText,
+          }
+        : null,
+      prdFiles: prdText
+        ? [
+            {
+              name: `${s.projectName || projectKey || 'project'}-prd.md`,
+              contentType: 'text/markdown',
+              textContent: prdText,
+            },
+          ]
+        : null,
+    };
+    // Side-car: defaultPort + parsedPRD are NOT part of CONFIG_UI_PAYLOAD_SCHEMA,
+    // so we attach them via non-enumerable side channels the launcher caller
+    // can use when overlaying form defaults. The pipeline-worker re-parses PRDs
+    // from text anyway, so parsedPRD here is for future skipping work.
+    submission.__defaultPort = typeof s.defaultPort === 'number' ? s.defaultPort : null;
+    submission.__parsedPRD = s.defaultAcs || null;
+
+    if (!s.autoApply) {
+      return {
+        autoApplied: false,
+        prefill: submission,
+        settings: s,
+        projectKey,
+        status: 'ok_no_autoapply',
+      };
+    }
+
+    // Auto-apply path — caller can return early with this submission and skip
+    // the browser. Logs only non-sensitive metadata.
+    Logger.info('ConfigUILauncher', 'Auto-applying saved workspace settings (skipping config form)', {
+      workspaceId,
+      projectKey,
+      projectName: s.projectName || null,
+      hasCredentials: credentialsArray.length > 0,
+      credentialRoles: credentialsArray.map((c) => c.role).filter(Boolean),
+      hasPrd: !!prdText,
+      defaultTestType: submission.testType,
+    });
+
+    return {
+      autoApplied: true,
+      submission,
+      settings: s,
+      projectKey,
+      status: 'auto_applied',
+    };
   }
 
   buildConfigURL(projectInfo = {}) {

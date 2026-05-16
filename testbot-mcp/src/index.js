@@ -34,6 +34,8 @@ const ReportGenerator = require('./report-generator');
 const DashboardLauncher = require('./dashboard-launcher');
 const ConfigUILauncher = require('./config-ui-launcher');
 const MCPTelemetryReporter = require('./mcp-telemetry');
+const WebappClient = require('./webapp-client');
+const { detectProjectKey: _detectProjectKeyMod } = require('./detect-project-key');
 
 const CREDENTIAL_SCHEMA = z.object({
   role: z.string().max(100).optional(),
@@ -1840,14 +1842,143 @@ Return the JSON structure above based on what you find in the codebase.
         // Always open the browser for the config form — headless controls
         // Playwright test execution, not the config UI itself.
         const configUILauncher = this.createConfigUILauncher({ headless, autoOpenBrowser: true });
+
+        // WS-1: workspace settings auto-apply pre-flight.
+        // If the user has saved settings for (workspaceId, projectKey) and
+        // marked autoApply=true, skip the browser form entirely — synthesize
+        // a submission from the row and feed it directly into the
+        // continuePipelineAfterConfig path. Otherwise fall through to the
+        // browser form (with pre-fill in a future iteration).
+        const settingsClient = process.env.HEALIX_API_KEY
+          ? new WebappClient({ apiKey: process.env.HEALIX_API_KEY })
+          : null;
+        let resolvedWorkspaceId = process.env.HEALIX_WORKSPACE_ID || null;
+        if (!resolvedWorkspaceId && settingsClient) {
+          try {
+            const detected = _detectProjectKeyMod(baseConfig.projectPath);
+            const pk = detected?.projectKey || null;
+            if (pk) {
+              const resolution = await settingsClient.resolveWorkspace({ projectKey: pk });
+              if (resolution && resolution.workspaceId && resolution.member !== false && resolution.found !== false) {
+                resolvedWorkspaceId = resolution.workspaceId;
+              }
+            }
+          } catch (resolveErr) {
+            Logger.warn('Index', 'Workspace resolution for settings pre-fetch failed (non-blocking)', {
+              reason: resolveErr?.message,
+            });
+          }
+        }
+
+        const autoApplyResult = await configUILauncher.prefetchAndMaybeAutoApply({
+          projectPath: baseConfig.projectPath,
+          workspaceId: resolvedWorkspaceId,
+          client: settingsClient,
+        });
+
+        if (autoApplyResult.autoApplied && autoApplyResult.submission) {
+          // No browser. Synthesize a pre-resolved promise so the existing
+          // continuePipelineAfterConfig flow runs identically to a real
+          // submission. Cancel the launcher's port-bound server since we
+          // never opened the form.
+          try { configUILauncher.cancel(); } catch (_) { /* never opened */ }
+          configUrl = null;
+          const safeSettings = autoApplyResult.settings
+            ? {
+                projectKey: autoApplyResult.projectKey,
+                projectName: autoApplyResult.settings.projectName || null,
+                defaultTestType: autoApplyResult.settings.defaultTestType || null,
+                defaultBaseUrl: autoApplyResult.settings.defaultBaseUrl || null,
+                defaultStartCommand: autoApplyResult.settings.defaultStartCommand || null,
+                defaultPort: autoApplyResult.settings.defaultPort ?? null,
+                hasCredentials: !!autoApplyResult.settings.hasCredentials,
+                hasPrd: !!(autoApplyResult.settings.defaultPrd && autoApplyResult.settings.defaultPrd.length > 0),
+                autoApply: !!autoApplyResult.settings.autoApply,
+                updatedAt: autoApplyResult.settings.updatedAt || null,
+              }
+            : null;
+          waitForConfig = Promise.resolve(autoApplyResult.submission);
+          this.writeRunStatus(statusFile, {
+            runId,
+            phase: 'config_auto_applied',
+            message: 'Auto-applied saved workspace settings — skipping config UI.',
+            project: baseConfig.projectName,
+            workspaceId: resolvedWorkspaceId,
+            settings: safeSettings,
+            aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
+          });
+          this.emitTelemetry({
+            toolName: 'healix_test_my_app',
+            eventType: 'config_ui',
+            runId,
+            phase: 'config_auto_applied',
+            status: 'success',
+            success: true,
+            message: 'Saved workspace settings auto-applied; config form skipped',
+            metadata: {
+              workspaceId: resolvedWorkspaceId,
+              ...safeSettings,
+            },
+          });
+          process.stderr.write(
+            `[HEALIX] Auto-applied saved workspace settings (project ${autoApplyResult.projectKey || 'unknown'}). Skipping config form.\n`
+          );
+
+          // Fire pipeline continuation in the background — same shape as the
+          // browser-submission branch below.
+          this.continuePipelineAfterConfig({ waitForConfig, runId, statusFile, statusDir, baseConfig })
+            .finally(() => { this._activeConfigUILauncher = null; })
+            .catch((err) => {
+              Logger.error('Index', `Pipeline failure for run ${runId}`, { error: err?.message, code: err?.code });
+              try {
+                this.writeRunStatus(statusFile, {
+                  runId,
+                  phase: 'error',
+                  message: err?.message || 'Pipeline failed',
+                  error: err?.message || String(err),
+                  errorCode: err?.code || 'PIPELINE_FAILED',
+                  project: baseConfig.projectName,
+                });
+              } catch (_) {}
+              process.stderr.write(`[HEALIX] Pipeline failed for run ${runId}: ${err?.message || err}\n`);
+            });
+
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({
+                  success: true,
+                  runId,
+                  project: baseConfig.projectName,
+                  phase: 'config_auto_applied',
+                  configUrl: null,
+                  statusFile,
+                  message: `Healix auto-applied your saved workspace settings — testing has started. Poll healix_check_run_status for progress.`,
+                  agentInstructions: [
+                    `The test pipeline is running in the BACKGROUND. This tool returned immediately; no tests have completed yet.`,
+                    `You MUST now call healix_check_run_status with { runId: "${runId}" } every ~15 seconds until the response has isTerminal:true.`,
+                    `Do NOT hand control back to the user, summarize, or declare the task done while isTerminal is false.`,
+                  ].join(' '),
+                }, null, 2),
+              },
+            ],
+          };
+        }
+
+        // WS-1: when autoApply is false but a settings row exists, use it to
+        // seed the form fields via projectInfo. The form reads baseURL,
+        // startCommand, testType, port from the URL query string today, so
+        // overlaying them here just pre-fills the form for the user.
+        const prefill = autoApplyResult?.prefill || null;
         const launchResult = await configUILauncher.launchNonBlocking({
           projectPath: baseConfig.projectPath,
           projectName: baseConfig.projectName,
           framework: this.detectFramework(context),
-          baseURL: baseConfig.baseURL,
-          port: String(baseConfig.port),
-          startCommand: baseConfig.startCommand,
-          testType: baseConfig.testType,
+          baseURL: prefill?.baseURL || baseConfig.baseURL,
+          port: String(prefill?.__defaultPort != null ? prefill.__defaultPort : baseConfig.port),
+          startCommand: prefill?.startCommand || baseConfig.startCommand,
+          testType: prefill?.testType || baseConfig.testType,
           generateTests: baseConfig.generateTests,
           openDashboard: baseConfig.openDashboard,
           strictAIGeneration: baseConfig.strictAIGeneration !== false,

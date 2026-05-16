@@ -77,6 +77,11 @@ export const testRuns = pgTable(
     // delete preserves the run's user-scoped history. `projectWorkspaces` is
     // declared further down the file — Drizzle's reference callback is lazy.
     workspaceId: uuid('workspace_id').references(() => projectWorkspaces.id, { onDelete: 'set null' }),
+    // WS-2: when this run was spawned by clicking "Top up coverage" on
+    // another run, parent_run_id points at that run so the dashboard can
+    // render a parent → children tree. ON DELETE SET NULL — losing the
+    // parent must not nuke the child top-up history.
+    parentRunId: uuid('parent_run_id'),
     creationName: text('creation_name').notNull(),
     status: text('status').default('running'),
     totalTests: integer('total_tests').default(0),
@@ -104,6 +109,7 @@ export const testRuns = pgTable(
     index('test_runs_user_id_idx').on(table.userId),
     index('test_runs_created_at_idx').on(table.createdAt),
     index('test_runs_workspace_id_idx').on(table.workspaceId),
+    index('test_runs_parent_idx').on(table.parentRunId),
   ]
 )
 
@@ -767,5 +773,167 @@ export const payments = pgTable(
       'payments_status_check',
       sql`status IN ('pending','succeeded','failed','refunded')`
     ),
+  ]
+)
+
+// ── CL-B (Claude-local adapter): pending answer + resume queues ───────────────
+// Two single-use queues that mediate between the dashboard (writer) and the
+// MCP worker (consumer). Distinct from `mcpTelemetryEvents` because rows have a
+// consume-once lifecycle: written by user, polled by worker, marked consumed.
+//
+// runPendingAnswers — user-supplied answer to Claude's `ask_user_question`
+// tool. Keyed by (runId, questionId). Worker long-polls
+// `/api/test-runs/[id]/pending-answer?questionId=X` and marks `consumedAt` in
+// the same tx that returns the answer.
+//
+// runPendingResumes — user clicks "Resume run" after fixing a `claude login`
+// failure. Worker long-polls `/api/test-runs/[id]/pending-resume` and marks
+// `consumedAt` on read.
+
+export const runPendingAnswers = pgTable(
+  'run_pending_answers',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    runId: uuid('run_id')
+      .notNull()
+      .references(() => testRuns.id, { onDelete: 'cascade' }),
+    questionId: text('question_id').notNull(),
+    answer: text('answer').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    consumedAt: timestamp('consumed_at', { withTimezone: true }),
+  },
+  (table) => [
+    index('run_pending_answers_run_question_idx').on(table.runId, table.questionId),
+  ]
+)
+
+export const runPendingResumes = pgTable(
+  'run_pending_resumes',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    runId: uuid('run_id')
+      .notNull()
+      .references(() => testRuns.id, { onDelete: 'cascade' }),
+    reason: text('reason').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    consumedAt: timestamp('consumed_at', { withTimezone: true }),
+  },
+  (table) => [
+    index('run_pending_resumes_run_idx').on(table.runId),
+  ]
+)
+
+// ── WS-1: workspace project settings ───────────────────────────────────────
+// Per-workspace, per-project saved defaults so subsequent MCP runs against
+// the same repo don't need the user to re-enter credentials / PRD / start
+// command. One row per (workspaceId, projectKey). `autoApply=true` makes the
+// config-ui-launcher in the MCP skip the browser form entirely.
+//
+// Credentials live as a JSON array `[{role,username,password}]` encrypted
+// with AES-256-GCM (`webapp/src/lib/crypto-aes.ts`). We persist:
+//   - credentialsEncrypted (base64 ciphertext)
+//   - credentialsIv        (base64 12-byte IV)
+//   - credentialsTag       (base64 16-byte GCM auth tag)
+// PRD stays plaintext (project metadata, not a secret); the parsed AC tree
+// is cached as JSONB so the worker can skip /api/parse-prd on auto-apply.
+
+export const workspaceProjectSettings = pgTable(
+  'workspace_project_settings',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => projectWorkspaces.id, { onDelete: 'cascade' }),
+    projectKey: text('project_key').notNull(),
+    projectName: text('project_name'),
+    defaultStartCommand: text('default_start_command'),
+    defaultBaseUrl: text('default_base_url'),
+    defaultPort: integer('default_port'),
+    defaultTestType: text('default_test_type'),
+    defaultPrd: text('default_prd'),
+    defaultAcs: jsonb('default_acs'),
+    credentialsEncrypted: text('credentials_encrypted'),
+    credentialsIv: text('credentials_iv'),
+    credentialsTag: text('credentials_tag'),
+    autoApply: boolean('auto_apply').notNull().default(true),
+    createdBy: uuid('created_by')
+      .notNull()
+      .references(() => profiles.id),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('ws_project_settings_unique').on(table.workspaceId, table.projectKey),
+    index('ws_project_settings_workspace_idx').on(table.workspaceId),
+  ]
+)
+
+// ── CL3-C: persistent canonical test-suite snapshots ────────────────────────
+// Every terminal pipeline run snapshots the accepted test suite (Tier-0 +
+// passing/REAL-finding Tier-1 specs) into a versioned, downloadable archive.
+// `version` is monotonic per (workspace_id, project_key) and is computed
+// server-side at insert time. The base64-encoded zip lives in the DB so the
+// dashboard can stream a download with no filesystem dependency. The manifest
+// is per-file metadata (REQ tags, classification, last status, # tests).
+
+export type CanonicalSuiteManifestEntry = {
+  filename: string
+  relPath?: string
+  requirementsCovered?: string[]
+  classification?: string | null
+  lastStatus?: 'passed' | 'failed' | 'mixed' | 'unknown'
+  testsInFile?: number
+}
+
+export type CanonicalSuiteBugScorecard = Record<string, unknown>
+
+export const projectCanonicalSuites = pgTable(
+  'project_canonical_suites',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => projectWorkspaces.id, { onDelete: 'cascade' }),
+    projectKey: text('project_key').notNull(),
+    sourceRunId: uuid('source_run_id').references(() => testRuns.id, { onDelete: 'set null' }),
+    version: integer('version').notNull(),
+    suiteManifest: jsonb('suite_manifest').$type<CanonicalSuiteManifestEntry[]>().notNull(),
+    suiteArchiveB64: text('suite_archive_b64').notNull(),
+    archiveBytes: integer('archive_bytes').notNull(),
+    totalTests: integer('total_tests').notNull(),
+    passingTests: integer('passing_tests').notNull(),
+    acCoverageRatio: numeric('ac_coverage_ratio', { precision: 4, scale: 3 }),
+    bugScorecard: jsonb('bug_scorecard').$type<CanonicalSuiteBugScorecard>(),
+    createdBy: uuid('created_by').references(() => profiles.id),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('canonical_suites_lookup').on(table.workspaceId, table.projectKey, table.version.desc()),
+  ]
+)
+
+// ── CL3-D: source-file fingerprints for top-up diff ─────────────────────────
+// After every terminal run we walk the project for routes/controllers/schemas/
+// pages, sha256 each, and persist the (file_path, content_sha) pairs scoped
+// to (workspace_id, project_key, source_run_id). A subsequent top-up run reads
+// the parent's fingerprints, recomputes the current ones, and diffs them to
+// produce changedFiles[] / newFiles[] / removedFiles[] which the worker's
+// top-up prompt-builder uses to focus generation on what changed.
+
+export const projectSourceFingerprints = pgTable(
+  'project_source_fingerprints',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => projectWorkspaces.id, { onDelete: 'cascade' }),
+    projectKey: text('project_key').notNull(),
+    sourceRunId: uuid('source_run_id').references(() => testRuns.id, { onDelete: 'set null' }),
+    filePath: text('file_path').notNull(),
+    contentSha: text('content_sha').notNull(),
+    fileKind: text('file_kind'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('src_fingerprints_lookup').on(table.workspaceId, table.projectKey, table.sourceRunId),
   ]
 )

@@ -136,6 +136,10 @@ export interface TestRun {
   current_phase?: string | null
   error_code?: string | null
   is_live?: boolean
+  // CL3-C — surfaced so the run-detail page can fetch the latest canonical
+  // suite for (workspace, projectKey) and show the download card.
+  workspace_id?: string | null
+  project_key?: string | null
 }
 
 export interface ImportSession {

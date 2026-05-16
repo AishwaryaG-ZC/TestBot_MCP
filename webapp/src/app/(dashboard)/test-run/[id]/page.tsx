@@ -5,6 +5,19 @@ import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { TestRun, TestFailure, FailureVerdict, QaFinding, FindingSummary } from '@/lib/types/database';
+import QuestionModal from '@/components/run-detail/QuestionModal';
+import LoginPausedBanner from '@/components/run-detail/LoginPausedBanner';
+import TopUpButton from '@/components/run-detail/TopUpButton';
+import {
+  buildIterationLabel,
+  fileEditIcon,
+  previewAssistantMessage,
+  type ClaudeAssistantMessageMeta,
+  type ClaudeFileEditedMeta,
+  type ClaudeIterationStartedMeta,
+  type ClaudeAwaitingUserQuestionMeta,
+  type ClaudeAwaitingUserLoginMeta,
+} from '@/components/run-detail/liveTimelineEvents';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -222,12 +235,51 @@ interface GenerationMetaShape {
   [key: string]: unknown;
 }
 
+// WS-5 / WS-6: AC coverage + bug scorecard payloads stamped onto the report
+// by the MCP pipeline-worker. Both fields are top-level on the report (also
+// duplicated under metadata.generationMeta for legacy clients).
+interface AcCoverage {
+  covered?: string[];
+  attempted?: string[];
+  uncovered?: string[];
+  totalAcTags?: number;
+  ratio?: number;
+}
+
+interface BugScorecardEntry {
+  bugId: string;
+  evidenceTest?: string;
+  evidenceFile?: string;
+  matchKind?: string;
+}
+
+interface BugScorecard {
+  knownBugs?: Array<{ id: string; title?: string; category?: string }>;
+  caught?: BugScorecardEntry[];
+  missed?: string[];
+  total?: number;
+  score?: number;
+}
+
+// CL3-A: Failure classification breakdown. Lives at `report.failureBreakdown`
+// (preferred) and also `report.metadata.generationMeta.failureBreakdown` for
+// legacy runs.
+interface FailureBreakdown {
+  real?: number;
+  bad?: number;
+  env?: number;
+  total?: number;
+  byBucket?: Record<string, number>;
+}
+
 interface ReportJson {
   metadata?: {
     projectPath?: string;
     runId?: string;
     run_id?: string;
     generationMeta?: GenerationMetaShape | null;
+    acCoverage?: AcCoverage | null;
+    bugScorecard?: BugScorecard | null;
     live?: {
       isLive?: boolean;
       phase?: string;
@@ -239,6 +291,13 @@ interface ReportJson {
       hasLiveTests?: boolean;
     };
   };
+  acCoverage?: AcCoverage | null;
+  bugScorecard?: BugScorecard | null;
+  // CL3-A: top-level failure classification breakdown.
+  failureBreakdown?: FailureBreakdown | null;
+  // CL3-B: when the iteration controller exits cleanly because only real
+  // bugs remained, the worker stamps this as 'qa_cycle_complete'.
+  runStatus?: string | null;
   tests?: ReportTest[];
   results?: ReportTest[];
   summary?: { total?: number; passed?: number; failed?: number; skipped?: number };
@@ -466,6 +525,7 @@ function StatusBadge({ status }: { status: string }) {
 
 function runStatusLabel(status: string | null | undefined): string {
   if (status === 'completed_with_findings') return 'completed with findings';
+  if (status === 'qa_cycle_complete') return 'QA cycle complete';
   return status || 'unknown';
 }
 
@@ -474,6 +534,7 @@ function runStatusClass(status: string | null | undefined): string {
   if (status === 'failed') return 'bg-red-500/10 border border-red-500/20 text-red-400';
   if (status === 'running') return 'bg-blue-500/10 border border-blue-500/20 text-blue-400';
   if (status === 'completed_with_findings') return 'bg-amber-500/10 border border-amber-500/25 text-amber-300';
+  if (status === 'qa_cycle_complete') return 'bg-emerald-500/10 border border-emerald-500/25 text-emerald-300';
   return 'bg-amber-500/10 border border-amber-500/20 text-amber-400';
 }
 
@@ -1800,6 +1861,100 @@ function DecisionEventDetails({ ev }: { ev: LiveEvent }) {
   );
 }
 
+// ─── CL-B (Claude-local) event card — used inside LiveTimeline ──────────────
+// Renders an `assistant_message` / `file_edited` / `iteration_started` event
+// as a dedicated card. The two pause events (`awaiting_user_question`,
+// `awaiting_user_login`) render an in-page banner/modal instead and are
+// surfaced via dedicated wrappers near the top of the run-detail page.
+function ClaudeEventCard({ ev }: { ev: LiveEvent }) {
+  const meta = (ev.metadata ?? {}) as Record<string, unknown>;
+  const eventType = ev.eventType ?? '';
+  const [expanded, setExpanded] = useState(false);
+
+  if (eventType === 'assistant_message') {
+    const m = meta as unknown as ClaudeAssistantMessageMeta;
+    const message = typeof m.message === 'string' ? m.message : '';
+    const { preview, isTruncated } = previewAssistantMessage(message);
+    const display = expanded ? message : preview;
+    return (
+      <div
+        data-testid="claude-assistant-card"
+        className="rounded-lg border border-blue-400/25 bg-blue-500/[0.06] px-3 py-2"
+      >
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] font-semibold uppercase tracking-wide text-blue-200">
+            Claude
+          </span>
+          {typeof m.iteration === 'number' && (
+            <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] font-mono text-[#8BA4C8]">
+              iter {m.iteration}
+            </span>
+          )}
+        </div>
+        <div className="mt-1 whitespace-pre-wrap text-xs text-[#D8E8FF]">{display}</div>
+        {isTruncated && (
+          <button
+            type="button"
+            data-testid="claude-assistant-expand"
+            onClick={() => setExpanded((v) => !v)}
+            className="mt-1 text-[10px] font-semibold text-blue-300 hover:text-blue-200"
+          >
+            {expanded ? 'Show less' : 'Show more'}
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  if (eventType === 'file_edited') {
+    const m = meta as unknown as ClaudeFileEditedMeta;
+    const action = m.action === 'create' ? 'create' : 'edit';
+    const icon = fileEditIcon(action);
+    return (
+      <div
+        data-testid="claude-file-card"
+        className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-1.5"
+      >
+        <span
+          className={`flex h-5 w-5 items-center justify-center rounded ${
+            action === 'create'
+              ? 'bg-emerald-500/15 text-emerald-300'
+              : 'bg-blue-500/15 text-blue-300'
+          } text-xs font-mono`}
+        >
+          {icon}
+        </span>
+        <span className="font-mono text-[11px] text-[#D8E8FF]">{m.path}</span>
+        {typeof m.iteration === 'number' && (
+          <span className="ml-auto rounded bg-white/10 px-1.5 py-0.5 text-[10px] font-mono text-[#8BA4C8]">
+            iter {m.iteration}
+          </span>
+        )}
+        {typeof m.lineCount === 'number' && (
+          <span className="text-[10px] font-mono text-[#4A6280]">{m.lineCount} ln</span>
+        )}
+      </div>
+    );
+  }
+
+  if (eventType === 'iteration_started') {
+    const m = meta as unknown as ClaudeIterationStartedMeta;
+    const label = buildIterationLabel(m);
+    return (
+      <div
+        data-testid="claude-iteration-divider"
+        className="flex items-center gap-2 py-1 text-xs font-semibold text-[#FDE68A]"
+      >
+        <span className="h-px flex-1 bg-amber-400/30" />
+        <span>{label}</span>
+        <span className="h-px flex-1 bg-amber-400/30" />
+      </div>
+    );
+  }
+
+  return null;
+}
+
 function LiveTimeline({ events, liveFiles, pipelineEnded }: {
   events: LiveEvent[];
   liveFiles: string[];
@@ -1829,11 +1984,32 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
   const decisionEvents = visibleEvents.filter(isDecisionEvent);
   const phaseEvents = visibleEvents.filter((e) => !isDecisionEvent(e));
   // Deduplicate non-decision phases only; decision events carry unique gate data.
+  // Claude-local (CL-B) telemetry events are also exempted from dedup because
+  // each one carries unique payload (one assistant message, one file edit, one
+  // iteration boundary). They render via `<ClaudeEventCard>` below.
+  const CLAUDE_EVENT_TYPES = new Set([
+    'assistant_message',
+    'file_edited',
+    'iteration_started',
+    // The two pause events are surfaced via top-of-page banner/modal, not the
+    // inline timeline — but we still let them through so the user has a record.
+    'awaiting_user_question',
+    'awaiting_user_login',
+  ]);
   const phaseMap = new Map<string, LiveEvent>();
+  const undedupedClaudeEvents: LiveEvent[] = [];
   for (const e of phaseEvents) {
+    if (e.eventType && CLAUDE_EVENT_TYPES.has(e.eventType)) {
+      undedupedClaudeEvents.push(e);
+      continue;
+    }
     phaseMap.set(e.phase ?? '__unknown__', e);
   }
-  const displayEvents = [...Array.from(phaseMap.values()), ...decisionEvents].sort((a, b) => {
+  const displayEvents = [
+    ...Array.from(phaseMap.values()),
+    ...undedupedClaudeEvents,
+    ...decisionEvents,
+  ].sort((a, b) => {
     const at = a.occurredAt ? new Date(a.occurredAt).getTime() : 0;
     const bt = b.occurredAt ? new Date(b.occurredAt).getTime() : 0;
     return at - bt;
@@ -1868,6 +2044,16 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
         const isTerminal = TERMINAL_PHASES.has((ev.phase || '').toLowerCase());
         const isTestsGen = ev.eventType === 'tests_generated';
         const isDecision = isDecisionEvent(ev);
+        const isClaudeEvent =
+          ev.eventType === 'assistant_message' ||
+          ev.eventType === 'file_edited' ||
+          ev.eventType === 'iteration_started';
+        // The two pause events surface via the top-of-page banner/modal — but
+        // we still want a timeline breadcrumb. Render their `message` field as
+        // a normal phase row.
+        const isPauseEvent =
+          ev.eventType === 'awaiting_user_question' ||
+          ev.eventType === 'awaiting_user_login';
         const isGeneratingPhase = (ev.phase || '').toLowerCase() === 'generating';
         // Show files: prefer tests_generated event if present, else generating phase
         const showFiles = liveFiles.length > 0 && (hasTestsGenEvent ? isTestsGen : isGeneratingPhase);
@@ -1883,6 +2069,24 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
               ? `${elapsedSec}s`
               : `${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s`;
           }
+        }
+
+        // CL-B: dedicated cards for Claude-local events. We still render the
+        // timeline rail (icon + connector) so the visual flow is unbroken.
+        if (isClaudeEvent) {
+          return (
+            <div key={ev.id} className="flex gap-3 group">
+              <div className="flex flex-col items-center">
+                <PhaseIcon phase="done" isLast={false} />
+                {i < displayEvents.length - 1 && (
+                  <div className="w-px h-full min-h-[16px] bg-white/10 mt-0.5" />
+                )}
+              </div>
+              <div className="pb-3 flex-1 min-w-0">
+                <ClaudeEventCard ev={ev} />
+              </div>
+            </div>
+          );
         }
 
         return (
@@ -1905,8 +2109,10 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
             </div>
             <div className="pb-3 flex-1 min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
-                <span className={`text-xs font-semibold ${isDecision ? 'text-[#FDE68A]' : 'text-[#F0F6FF]'}`}>
-                  {isDecision ? decisionTypeLabel(ev.metadata?.decisionType || ev.phase) : phaseLabel(ev.phase)}
+                <span className={`text-xs font-semibold ${isDecision ? 'text-[#FDE68A]' : isPauseEvent ? 'text-[#FDE68A]' : 'text-[#F0F6FF]'}`}>
+                  {isPauseEvent
+                    ? (ev.eventType === 'awaiting_user_question' ? 'Awaiting your answer' : 'Awaiting login')
+                    : isDecision ? decisionTypeLabel(ev.metadata?.decisionType || ev.phase) : phaseLabel(ev.phase)}
                 </span>
                 {time && <span className="text-[#4A6280] text-[10px] font-mono">{time}</span>}
                 {ev.durationMs != null && ev.durationMs > 0 && (
@@ -2215,6 +2421,497 @@ function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
           </ul>
         </div>
       )}
+    </motion.div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// WS-5: AC Coverage card
+// Surfaces the AC coverage ratio computed by the MCP pipeline-worker after
+// scanning test titles for `[REQ:F<f>.S<s>.AC<n>]` tags. Covered = at least
+// one passing test; attempted = any test (passing or failing); uncovered =
+// IDs in the parsed PRD that no test mentioned.
+// ────────────────────────────────────────────────────────────────────────
+function AcCoverageCard({ coverage }: { coverage: AcCoverage }) {
+  const [open, setOpen] = useState(false);
+  const total = coverage.totalAcTags ?? 0;
+  const coveredList = coverage.covered ?? [];
+  const uncoveredList = coverage.uncovered ?? [];
+  const attemptedList = coverage.attempted ?? [];
+  const ratio = total > 0 ? (coverage.ratio ?? coveredList.length / total) : 0;
+  const pct = Math.round(ratio * 100);
+  const tone =
+    pct >= 80 ? 'text-emerald-400 border-emerald-500/30 bg-emerald-500/5'
+    : pct >= 50 ? 'text-amber-400 border-amber-500/30 bg-amber-500/5'
+    : 'text-red-400 border-red-500/30 bg-red-500/5';
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      className={`glass-card rounded-2xl border ${tone} overflow-hidden`}
+    >
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="w-full px-5 py-4 flex items-center justify-between gap-4 text-left hover:bg-white/[0.02] transition-colors"
+      >
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-lg bg-white/5 border border-white/10 flex items-center justify-center">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M9 11l3 3L22 4" />
+              <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+            </svg>
+          </div>
+          <div>
+            <div className="text-[#F0F6FF] font-semibold text-sm">AC Coverage</div>
+            <div className="text-[#8DA0BC]/80 text-xs font-mono">
+              {coveredList.length} / {total} covered ({pct}%) · {attemptedList.length} attempted
+            </div>
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          <span className={`text-2xl font-bold ${tone.split(' ')[0]}`}>{pct}%</span>
+          <svg
+            width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+            className={`text-[#4A6280] transition-transform ${open ? 'rotate-180' : ''}`}
+          >
+            <polyline points="6 9 12 15 18 9" />
+          </svg>
+        </div>
+      </button>
+      <AnimatePresence initial={false}>
+        {open && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            style={{ overflow: 'hidden' }}
+            className="border-t border-white/8"
+          >
+            <div className="px-5 py-4 grid sm:grid-cols-2 gap-4">
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-emerald-400/80 font-semibold mb-2">
+                  Covered ({coveredList.length})
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {coveredList.length === 0 ? (
+                    <span className="text-[#4A6280] text-xs">(none)</span>
+                  ) : (
+                    coveredList.map((id) => (
+                      <span key={id} className="px-1.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300/90 text-[10px] font-mono">
+                        {id}
+                      </span>
+                    ))
+                  )}
+                </div>
+              </div>
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-red-400/80 font-semibold mb-2">
+                  Uncovered ({uncoveredList.length})
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {uncoveredList.length === 0 ? (
+                    <span className="text-[#4A6280] text-xs">(none)</span>
+                  ) : (
+                    uncoveredList.map((id) => (
+                      <span key={id} className="px-1.5 py-0.5 rounded bg-red-500/10 border border-red-500/30 text-red-300/90 text-[10px] font-mono">
+                        {id}
+                      </span>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </motion.div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// WS-6: Bug Detection Scorecard card
+// Surfaces caught vs missed planted bugs from KNOWN_BUGS.md. Green dot =
+// caught with evidence, red dot = missed.
+// ────────────────────────────────────────────────────────────────────────
+function BugScorecardCard({ scorecard }: { scorecard: BugScorecard }) {
+  const [open, setOpen] = useState(false);
+  const total = scorecard.total ?? 0;
+  const caught = scorecard.caught ?? [];
+  const missed = scorecard.missed ?? [];
+  const knownBugs = scorecard.knownBugs ?? [];
+  const score = scorecard.score ?? 0;
+  const pct = Math.round(score * 100);
+  const tone =
+    pct >= 80 ? 'text-emerald-400 border-emerald-500/30 bg-emerald-500/5'
+    : pct >= 50 ? 'text-amber-400 border-amber-500/30 bg-amber-500/5'
+    : 'text-red-400 border-red-500/30 bg-red-500/5';
+
+  const caughtIndex = new Map<string, BugScorecardEntry>();
+  for (const c of caught) caughtIndex.set(c.bugId, c);
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      className={`glass-card rounded-2xl border ${tone} overflow-hidden`}
+    >
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="w-full px-5 py-4 flex items-center justify-between gap-4 text-left hover:bg-white/[0.02] transition-colors"
+      >
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-lg bg-white/5 border border-white/10 flex items-center justify-center">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M8 2v4M16 2v4M3 10h18M5 6h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z" />
+            </svg>
+          </div>
+          <div>
+            <div className="text-[#F0F6FF] font-semibold text-sm">Bug Detection Scorecard</div>
+            <div className="text-[#8DA0BC]/80 text-xs font-mono">
+              {caught.length} / {total} planted bugs caught
+            </div>
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          <span className={`text-2xl font-bold ${tone.split(' ')[0]}`}>{pct}%</span>
+          <svg
+            width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+            className={`text-[#4A6280] transition-transform ${open ? 'rotate-180' : ''}`}
+          >
+            <polyline points="6 9 12 15 18 9" />
+          </svg>
+        </div>
+      </button>
+      <AnimatePresence initial={false}>
+        {open && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            style={{ overflow: 'hidden' }}
+            className="border-t border-white/8"
+          >
+            <ul className="px-5 py-4 space-y-2">
+              {knownBugs.length === 0 ? (
+                <li className="text-[#4A6280] text-xs">No planted bugs parsed.</li>
+              ) : knownBugs.map((bug) => {
+                const evidence = caughtIndex.get(bug.id);
+                const wasCaught = Boolean(evidence);
+                return (
+                  <li key={bug.id} className="flex items-start gap-3">
+                    <span
+                      className={`flex-shrink-0 mt-1 w-2 h-2 rounded-full ${wasCaught ? 'bg-emerald-400' : 'bg-red-400'}`}
+                      aria-label={wasCaught ? 'caught' : 'missed'}
+                    />
+                    <div className="flex-1">
+                      <div className="text-[#F0F6FF] text-xs font-medium">
+                        <span className="font-mono">{bug.id}</span>
+                        {bug.title ? <span className="text-[#8DA0BC]/70"> — {bug.title}</span> : null}
+                      </div>
+                      {bug.category && (
+                        <div className="text-[#4A6280] text-[10px] font-mono">{bug.category}</div>
+                      )}
+                      {evidence?.evidenceTest && (
+                        <div className="text-emerald-300/80 text-[10px] mt-0.5">
+                          ✓ caught by: <span className="font-mono">{evidence.evidenceTest}</span>
+                          {evidence.matchKind ? <span className="text-[#4A6280]"> ({evidence.matchKind})</span> : null}
+                        </div>
+                      )}
+                    </div>
+                  </li>
+                );
+              })}
+              {missed.length > 0 && knownBugs.length === 0 && (
+                <li className="text-[#4A6280] text-xs">Missed: {missed.join(', ')}</li>
+              )}
+            </ul>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </motion.div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// CL3-A: Failure Breakdown card. Three pills (real / bad tests / env) with
+// counts, plus an optional expandable "by signal" list. Renders only when
+// `failureBreakdown.total > 0`.
+//
+// Pill tone helpers are exported for unit tests (see __tests__/
+// cl3-failure-breakdown.test.ts).
+// ────────────────────────────────────────────────────────────────────────
+export function failurePillLabel(kind: 'real' | 'bad' | 'env'): string {
+  if (kind === 'real') return 'Real';
+  if (kind === 'bad') return 'Bad tests';
+  return 'Env';
+}
+
+export function failurePillTone(kind: 'real' | 'bad' | 'env'): string {
+  if (kind === 'real') return 'bg-red-500/10 border-red-500/30 text-red-300';
+  if (kind === 'bad') return 'bg-amber-500/10 border-amber-500/30 text-amber-300';
+  return 'bg-white/5 border-white/15 text-[#8DA0BC]';
+}
+
+export function failureBreakdownSummary(b: FailureBreakdown | null | undefined): {
+  real: number; bad: number; env: number; total: number;
+} {
+  const safe = (v: unknown): number => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  };
+  const real = safe(b?.real);
+  const bad = safe(b?.bad);
+  const env = safe(b?.env);
+  const total = safe(b?.total) || real + bad + env;
+  return { real, bad, env, total };
+}
+
+function FailureBreakdownCard({ breakdown }: { breakdown: FailureBreakdown }) {
+  const [open, setOpen] = useState(false);
+  const s = failureBreakdownSummary(breakdown);
+  if (s.total === 0) return null;
+  const byBucket = breakdown.byBucket || {};
+  const buckets = Object.entries(byBucket).sort((a, b) => b[1] - a[1]);
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl border border-white/10 bg-white/[0.02] overflow-hidden"
+    >
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="w-full px-5 py-4 flex items-center justify-between gap-4 text-left hover:bg-white/[0.02] transition-colors"
+      >
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-lg bg-white/5 border border-white/10 flex items-center justify-center">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="12" cy="12" r="10" />
+              <line x1="12" y1="8" x2="12" y2="12" />
+              <line x1="12" y1="16" x2="12.01" y2="16" />
+            </svg>
+          </div>
+          <div>
+            <div className="text-[#F0F6FF] font-semibold text-sm">Failure breakdown</div>
+            <div className="text-[#8DA0BC]/80 text-xs font-mono">
+              {s.total} failure{s.total === 1 ? '' : 's'} classified
+            </div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <span
+            className={`px-2.5 py-1 rounded-full text-[11px] font-semibold border ${failurePillTone('real')}`}
+            data-testid="failure-pill-real"
+          >
+            {failurePillLabel('real')} · {s.real}
+          </span>
+          <span
+            className={`px-2.5 py-1 rounded-full text-[11px] font-semibold border ${failurePillTone('bad')}`}
+            data-testid="failure-pill-bad"
+          >
+            {failurePillLabel('bad')} · {s.bad}
+          </span>
+          <span
+            className={`px-2.5 py-1 rounded-full text-[11px] font-semibold border ${failurePillTone('env')}`}
+            data-testid="failure-pill-env"
+          >
+            {failurePillLabel('env')} · {s.env}
+          </span>
+          <svg
+            width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+            className={`text-[#4A6280] transition-transform ml-1 ${open ? 'rotate-180' : ''}`}
+          >
+            <polyline points="6 9 12 15 18 9" />
+          </svg>
+        </div>
+      </button>
+      <AnimatePresence initial={false}>
+        {open && buckets.length > 0 && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            style={{ overflow: 'hidden' }}
+            className="border-t border-white/8"
+          >
+            <div className="px-5 py-4">
+              <div className="text-[10px] uppercase tracking-wider text-[#8DA0BC]/70 font-semibold mb-2">
+                By signal
+              </div>
+              <ul className="space-y-1.5">
+                {buckets.map(([signal, count]) => (
+                  <li
+                    key={signal}
+                    className="flex items-center justify-between text-xs text-[#C4D2E5] font-mono"
+                  >
+                    <span>{signal}</span>
+                    <span className="text-[#8DA0BC]">{count}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </motion.div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// ─── CL3-C: Canonical suite snapshot card ─────────────────────────────────
+// Fetches the latest canonical suite for (workspace_id, project_key) and
+// renders a download button + summary stats. Hidden for solo runs, runs that
+// didn't snapshot, and non-claude-local runs (those don't go through the
+// CL3-C snapshot path in the pipeline-worker).
+
+interface CanonicalSuiteSummary {
+  id: string
+  version: number
+  totalTests: number
+  passingTests: number
+  acCoverageRatio: string | number | null
+  archiveBytes: number
+  createdAt: string | null
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  suiteManifest?: any
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  bugScorecard?: any
+  sourceRunId: string | null
+}
+
+function CanonicalSuiteCard({
+  workspaceId,
+  projectKey,
+}: {
+  workspaceId: string
+  projectKey: string
+}) {
+  const [suite, setSuite] = useState<CanonicalSuiteSummary | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!workspaceId || !projectKey) return;
+    let cancelled = false;
+    setLoading(true);
+    fetch(
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/canonical-suite?projectKey=${encodeURIComponent(projectKey)}&latest=true`,
+      { cache: 'no-store' }
+    )
+      .then(async (res) => {
+        if (cancelled) return;
+        if (res.status === 404) {
+          setSuite(null);
+          setLoading(false);
+          return;
+        }
+        if (!res.ok) {
+          setError(`Failed to load canonical suite (status ${res.status})`);
+          setLoading(false);
+          return;
+        }
+        const json = (await res.json()) as { suite?: CanonicalSuiteSummary };
+        if (cancelled) return;
+        setSuite(json.suite ?? null);
+        setLoading(false);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError((err as Error).message);
+        setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId, projectKey]);
+
+  if (loading) return null;
+  if (error) return null;
+  if (!suite) return null;
+
+  const coverageNum =
+    typeof suite.acCoverageRatio === 'number'
+      ? suite.acCoverageRatio
+      : suite.acCoverageRatio
+        ? Number(suite.acCoverageRatio)
+        : null;
+  const coveragePct = coverageNum !== null && !Number.isNaN(coverageNum)
+    ? `${Math.round(coverageNum * 100)}%`
+    : '—';
+  const sizeKb = Math.max(1, Math.round((suite.archiveBytes || 0) / 1024));
+  const downloadUrl = `/api/workspaces/${encodeURIComponent(workspaceId)}/canonical-suite/${encodeURIComponent(suite.id)}/download`;
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl overflow-hidden border border-sky-500/25 bg-sky-500/[0.05]"
+      data-testid="canonical-suite-card"
+    >
+      <div className="px-5 py-4 flex items-start gap-3">
+        <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 bg-sky-500/15 border border-sky-500/30">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#38BDF8" strokeWidth="2.2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div>
+              <div className="text-sky-200 font-semibold text-sm">
+                Canonical Suite v{suite.version}
+              </div>
+              <div className="text-sky-100/80 text-xs mt-0.5">
+                {suite.totalTests} tests, {suite.passingTests} passing · AC coverage {coveragePct} · {sizeKb} KB
+                {suite.createdAt ? ` · saved ${new Date(suite.createdAt).toLocaleString()}` : ''}
+              </div>
+            </div>
+            <a
+              href={downloadUrl}
+              className="px-3 py-1.5 rounded-md text-xs font-semibold bg-sky-500/20 hover:bg-sky-500/30 text-sky-100 border border-sky-500/40 transition-colors"
+              data-testid="canonical-suite-download"
+              download
+            >
+              Download zip
+            </a>
+          </div>
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+// CL3-B: QA Cycle Complete banner. Shown when the iteration controller
+// graduates the run because only real bugs remained and the pass rate
+// plateaued.
+// ────────────────────────────────────────────────────────────────────────
+function QaCycleCompleteBanner({ realCount }: { realCount: number }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl overflow-hidden border border-emerald-500/30 bg-emerald-500/[0.06]"
+      data-testid="qa-cycle-complete-banner"
+    >
+      <div className="px-5 py-4 flex items-start gap-3">
+        <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 bg-emerald-500/15 border border-emerald-500/30">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#34D399" strokeWidth="2.2">
+            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+            <polyline points="22 4 12 14.01 9 11.01" />
+          </svg>
+        </div>
+        <div className="flex-1">
+          <div className="text-emerald-200 font-semibold text-sm">QA cycle complete</div>
+          <div className="text-emerald-100/80 text-xs mt-0.5">
+            {realCount} real bug{realCount === 1 ? '' : 's'} confirmed. Fix and re-run via Top-up.
+          </div>
+        </div>
+      </div>
     </motion.div>
   );
 }
@@ -3368,6 +4065,9 @@ export default function TestRunDetailPage() {
 
   const testResultsHeaderRef = useRef<HTMLDivElement>(null);
   const evtSourceRef = useRef<EventSource | null>(null);
+  // CL-B: dismissed pause events (modal/banner) keyed by event id.
+  const dismissedPausesRef = useRef<Set<string>>(new Set());
+  const [, forcePauseRerender] = useState(0);
 
   const isLiveOrRunning = useCallback((run: TestRun | null) => {
     if (!run) return false;
@@ -3719,6 +4419,20 @@ export default function TestRunDetailPage() {
   // actually annotated generationMeta — legacy runs have neither field and
   // the banner stays hidden.
   const generationMeta = (report?.metadata?.generationMeta ?? null) as GenerationMetaShape | null;
+  // WS-5 / WS-6: prefer the top-level fields written by the MCP report
+  // generator; fall back to nested generationMeta for older reports.
+  const acCoverage: AcCoverage | null = (report?.acCoverage
+    ?? (report?.metadata?.acCoverage as AcCoverage | null | undefined)
+    ?? (generationMeta as unknown as { acCoverage?: AcCoverage })?.acCoverage
+    ?? null) as AcCoverage | null;
+  const bugScorecard: BugScorecard | null = (report?.bugScorecard
+    ?? (report?.metadata?.bugScorecard as BugScorecard | null | undefined)
+    ?? (generationMeta as unknown as { bugScorecard?: BugScorecard })?.bugScorecard
+    ?? null) as BugScorecard | null;
+  // CL3-A: failure breakdown — prefer top-level field, fall back to generationMeta.
+  const failureBreakdown: FailureBreakdown | null = ((report as ReportJson | null)?.failureBreakdown
+    ?? (generationMeta as unknown as { failureBreakdown?: FailureBreakdown })?.failureBreakdown
+    ?? null) as FailureBreakdown | null;
   const partialWarning = generationMeta?.partialGenerationWarning ?? null;
   const qualityWarning = generationMeta?.qualityWarning ?? null;
   const coverageTopUps = Array.isArray(generationMeta?.coverageTopUps)
@@ -3898,8 +4612,64 @@ export default function TestRunDetailPage() {
     hour: '2-digit', minute: '2-digit', hour12: true,
   });
 
+  // ── CL-B: find the latest pause event we should surface as a modal/banner.
+  // `dismissedPausesRef` is declared earlier (before all conditional returns)
+  // to keep hook order stable.
+  const latestPauseEvents = (() => {
+    let q: LiveEvent | null = null;
+    let l: LiveEvent | null = null;
+    for (const ev of liveEvents) {
+      if (ev.eventType === 'awaiting_user_question') q = ev;
+      else if (ev.eventType === 'awaiting_user_login') l = ev;
+    }
+    return { question: q, login: l };
+  })();
+
+  function dismissPause(eventId: string) {
+    dismissedPausesRef.current.add(eventId);
+    forcePauseRerender((v) => v + 1);
+  }
+
+  const liveQuestionMeta = (() => {
+    const ev = latestPauseEvents.question;
+    if (!ev) return null;
+    if (dismissedPausesRef.current.has(ev.id)) return null;
+    const meta = (ev.metadata ?? {}) as Partial<ClaudeAwaitingUserQuestionMeta>;
+    if (typeof meta.questionId !== 'string' || typeof meta.question !== 'string') return null;
+    return { eventId: ev.id, meta: meta as ClaudeAwaitingUserQuestionMeta };
+  })();
+  const liveLoginMeta = (() => {
+    const ev = latestPauseEvents.login;
+    if (!ev) return null;
+    if (dismissedPausesRef.current.has(ev.id)) return null;
+    const meta = (ev.metadata ?? {}) as Partial<ClaudeAwaitingUserLoginMeta>;
+    if (typeof meta.message !== 'string') return null;
+    return { eventId: ev.id, meta: meta as ClaudeAwaitingUserLoginMeta };
+  })();
+
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="max-w-6xl mx-auto flex flex-col gap-6">
+      {/* CL-B: pause-state UI (banner + modal). Surface near the top so they
+          are unmissable; both auto-dismiss after the POST succeeds. */}
+      {liveLoginMeta && (
+        <LoginPausedBanner
+          runId={testRun.id}
+          message={liveLoginMeta.meta.message}
+          loginUrl={liveLoginMeta.meta.loginUrl ?? null}
+          onResumed={() => dismissPause(liveLoginMeta.eventId)}
+        />
+      )}
+      {liveQuestionMeta && (
+        <QuestionModal
+          runId={testRun.id}
+          questionId={liveQuestionMeta.meta.questionId}
+          question={liveQuestionMeta.meta.question}
+          options={liveQuestionMeta.meta.options ?? null}
+          confidence={liveQuestionMeta.meta.confidence}
+          onSubmitted={() => dismissPause(liveQuestionMeta.eventId)}
+        />
+      )}
+
       {/* Back + header */}
       <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} className="flex flex-col gap-3">
         <Link href="/all-tests" className="inline-flex items-center gap-2 text-[#4A6280] hover:text-[#F0F6FF] text-sm transition-colors w-fit">
@@ -3921,6 +4691,19 @@ export default function TestRunDetailPage() {
             <span className={`px-3 py-1 rounded-full text-xs font-semibold ${runStatusClass(testRun.status)}`}>
               {runStatusLabel(testRun.status)}
             </span>
+            {/* WS-2: Top-up coverage button. Shown only on Claude-local runs
+               that have completed (or completed_with_findings) — these are
+               the runs that recorded a Claude sessionId we can resume. */}
+            {(() => {
+              const sg = (generationMeta as unknown as { selectedGenerator?: string })?.selectedGenerator
+                ?? (report?.metadata as unknown as { selectedGenerator?: string })?.selectedGenerator
+                ?? null;
+              const status = (testRun.status || '').toLowerCase();
+              const isTerminal = status === 'completed' || status === 'completed_with_findings' || status === 'passed' || status === 'failed';
+              const isClaudeLocal = sg === 'claude-local';
+              if (!isTerminal || !isClaudeLocal) return null;
+              return <TopUpButton runId={testRun.id} />;
+            })()}
           </div>
         </div>
       </motion.div>
@@ -3966,6 +4749,37 @@ export default function TestRunDetailPage() {
       {!pipelineError && generationMeta && Array.isArray(generationMeta.qaContractQuestions) && generationMeta.qaContractQuestions.length > 0 && (
         <QaContractAdvisoryBanner generationMeta={generationMeta} />
       )}
+
+      {/* CL3-B: QA cycle complete banner. Shown when the iteration loop
+          terminated with `stop_qa_cycle_complete` — only real bugs remain
+          and the pass rate plateaued. Surfaces the real-bug count and
+          directs the operator to the Top-up workflow.
+
+          NB: `testRun.status` is typed as a union that does not yet include
+          'qa_cycle_complete' (CL3-C handles the schema bump). We compare via
+          a string-cast so the new state still renders today. */}
+      {(testRun.status as string) === 'qa_cycle_complete' && (
+        <QaCycleCompleteBanner realCount={Number(failureBreakdown?.real || 0)} />
+      )}
+
+      {/* ── CL3-C: Canonical suite snapshot card ─────────────────────────
+          Shown only when the run is owned by a workspace that has a
+          fingerprinted projectKey AND the run came from the claude-local
+          generator (those are the only runs that flow through the CL3-C
+          snapshot path). The card itself hides when no suite is found, so
+          even runs that didn't snapshot stay quiet. */}
+      {(() => {
+        const sg = (generationMeta as unknown as { selectedGenerator?: string })?.selectedGenerator
+          ?? (report?.metadata as unknown as { selectedGenerator?: string })?.selectedGenerator
+          ?? null;
+        const status = (testRun.status || '').toLowerCase();
+        const isTerminal = status === 'completed' || status === 'completed_with_findings'
+          || status === 'passed' || status === 'failed' || status === 'qa_cycle_complete';
+        const wsId = testRun.workspace_id || null;
+        const pk = testRun.project_key || null;
+        if (!isTerminal || sg !== 'claude-local' || !wsId || !pk) return null;
+        return <CanonicalSuiteCard workspaceId={wsId} projectKey={pk} />;
+      })()}
 
       {shouldShowCoverageTopUpBanner && (
         <CoverageTopUpAdvisoryBanner topUps={coverageTopUps} />
@@ -4119,6 +4933,27 @@ export default function TestRunDetailPage() {
         <KpiCard label="Skipped" value={skippedTests} color="text-amber-400" delay={240} loading={isRunningPhase && !hasLiveStats} />
         <KpiCard label="Pass Rate" value={passRate} sub="%" color={passRate >= 70 ? 'text-emerald-400' : passRate >= 40 ? 'text-amber-400' : 'text-red-400'} delay={320} loading={isRunningPhase && !hasLiveStats} />
       </div>
+
+      {/* WS-5: AC Coverage card. Renders the ratio of acceptance criteria that
+          ended up exercised by at least one PASSING test, plus a collapsible
+          list of covered / uncovered AC IDs. */}
+      {acCoverage && (acCoverage.totalAcTags ?? 0) > 0 && (
+        <AcCoverageCard coverage={acCoverage} />
+      )}
+
+      {/* WS-6: Bug Detection Scorecard. Renders only when KNOWN_BUGS.md was
+          parsed at the project root — i.e. for fixture apps like pulseboard
+          that ship a planted-bug ledger. */}
+      {bugScorecard && (bugScorecard.total ?? 0) > 0 && (
+        <BugScorecardCard scorecard={bugScorecard} />
+      )}
+
+      {/* CL3-A: Failure breakdown card — three pills (Real / Bad tests / Env)
+          + an expandable per-signal breakdown. Only renders when the worker
+          actually classified at least one failure. */}
+      {failureBreakdown && (failureBreakdown.total ?? 0) > 0 && (
+        <FailureBreakdownCard breakdown={failureBreakdown} />
+      )}
 
       {/* Tier pills (Phase D) — Tier A/B/C segmentation from MCP. Only shown
           when the run reported a tier breakdown. */}
