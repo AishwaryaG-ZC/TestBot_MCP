@@ -21,6 +21,7 @@
 const fs = require('fs');
 const path = require('path');
 const Logger = require('./logger');
+const BrowserSetup = require('./playwright-browser-setup');
 const {
   sanitizeAuthFlow,
 } = require('./auth-flow-utils');
@@ -345,7 +346,7 @@ async function waitForLoginVerification({
  * `successIndicator` and not the `failureIndicator`. We use Playwright via
  * runtime require so missing deps fall through to a clear error, not a crash.
  */
-async function driveLogin({ baseURL, authFlow, credentials, storageStatePath }) {
+async function driveLogin({ projectPath, baseURL, authFlow, credentials, storageStatePath }) {
   let chromium;
   try {
     ({ chromium } = require('playwright'));
@@ -353,7 +354,18 @@ async function driveLogin({ baseURL, authFlow, credentials, storageStatePath }) 
     return { ok: false, reason: 'playwright not installed — cannot drive login' };
   }
 
-  const browser = await chromium.launch({ headless: true });
+  BrowserSetup.ensureChromiumInstalled(projectPath || process.cwd(), { reason: 'credential_injection' });
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+  } catch (error) {
+    if (BrowserSetup.looksLikeMissingBrowserError(error)) {
+      BrowserSetup.ensureChromiumInstalled(projectPath || process.cwd(), { reason: 'credential_injection_retry' });
+      browser = await chromium.launch({ headless: true });
+    } else {
+      throw error;
+    }
+  }
   const context = await browser.newContext();
   const page = await context.newPage();
 
@@ -481,7 +493,7 @@ async function injectCredentials({
     const role = normalizeRoleLabel(cred.role || cred.name || 'user');
     const storageStatePath = stateFileFor(projectPath, role);
 
-    const result = await driveLogin({ baseURL, authFlow, credentials: cred, storageStatePath });
+    const result = await driveLogin({ projectPath, baseURL, authFlow, credentials: cred, storageStatePath });
     if (result.ok) {
       Logger.info('CredentialsInjector', `Login verified for role=${role}`, { storageStatePath });
       roles.push({ role, name: role, storageStatePath, loginVerified: true });

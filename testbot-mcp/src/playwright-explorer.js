@@ -26,6 +26,7 @@ const {
   sanitizeAuthFlow,
   scoreAuthFlowCandidate,
 } = require('./auth-flow-utils');
+const BrowserSetup = require('./playwright-browser-setup');
 
 const MAX_ROUTES_PER_WALK = 20;
 const MAX_CLICK_PROBES_PER_WALK = 8;
@@ -508,7 +509,18 @@ async function exploreWithPlaywright({ baseURL, credentials, storageStatePaths =
     return { available: false, reason: `Invalid baseURL: ${baseURL}` };
   }
 
-  const browser = await chromium.launch({ headless: true });
+  BrowserSetup.ensureChromiumInstalled(process.cwd(), { reason: 'playwright_exploration' });
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+  } catch (error) {
+    if (BrowserSetup.looksLikeMissingBrowserError(error)) {
+      BrowserSetup.ensureChromiumInstalled(process.cwd(), { reason: 'playwright_exploration_retry' });
+      browser = await chromium.launch({ headless: true });
+    } else {
+      throw error;
+    }
+  }
   try {
     const walks = [];
 
@@ -601,7 +613,18 @@ async function enrichRoutesWithDOM({ baseURL, routes = [], storageStatePaths = [
   );
   const contextOptions = validState ? { storageState: validState.storageStatePath } : {};
 
-  const browser = await chromium.launch({ headless: true });
+  BrowserSetup.ensureChromiumInstalled(process.cwd(), { reason: 'playwright_dom_enrichment' });
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+  } catch (error) {
+    if (BrowserSetup.looksLikeMissingBrowserError(error)) {
+      BrowserSetup.ensureChromiumInstalled(process.cwd(), { reason: 'playwright_dom_enrichment_retry' });
+      browser = await chromium.launch({ headless: true });
+    } else {
+      throw error;
+    }
+  }
   const enrichments = {};
   let errorProbe = null;
 

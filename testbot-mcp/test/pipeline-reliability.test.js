@@ -21,6 +21,7 @@ const {
   effectiveRetainedRunnableFloor,
   shouldAttemptCoverageTopUp,
   collectGenerationQuality,
+  quarantineHardcodedBaseUrlMismatchFiles,
   buildExistingSuiteManifest,
   buildFailedAgentRetryMetadata,
   buildCoverageRetryMetadata,
@@ -1765,6 +1766,48 @@ test('quality gates reject hardcoded origins that do not match configured baseUR
     assert.equal(gate.error.diagnostics.reason, 'hardcoded_base_url_mismatch');
     assert.equal(gate.error.diagnostics.errorCode, 'HARDCODED_BASE_URL_MISMATCH');
   });
+});
+
+test('hardcoded-origin recovery quarantines only external-origin specs', () => {
+  const projectPath = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-origin-recovery-'));
+  const generatedDir = path.join(projectPath, 'tests', 'generated');
+  fs.mkdirSync(generatedDir, { recursive: true });
+  fs.writeFileSync(path.join(generatedDir, 'good.spec.ts'), `
+    import { test, expect } from '@playwright/test';
+    test('same-origin cart page remains runnable', async ({ page }) => {
+      await page.goto('/cart');
+      await expect(page.locator('body')).toBeVisible();
+    });
+  `);
+  fs.writeFileSync(path.join(generatedDir, 'bad.spec.ts'), `
+    import { test, expect } from '@playwright/test';
+    test('placeholder image must not run', async ({ page }) => {
+      await page.goto('https://example.com/img.jpg');
+      await expect(page.locator('body')).toBeVisible();
+    });
+  `);
+
+  try {
+    const before = collectGenerationQuality(projectPath, { baseURL: 'http://localhost:3000' });
+    assert.equal(before.hardcodedBaseUrlMismatches.length, 1);
+    assert.equal(before.hardcodedBaseUrlMismatches[0].file, 'bad.spec.ts');
+
+    const recovery = quarantineHardcodedBaseUrlMismatchFiles({
+      projectPath,
+      mismatches: before.hardcodedBaseUrlMismatches,
+    });
+    assert.equal(recovery.applied, true);
+    assert.equal(recovery.quarantinedFiles.length, 1);
+    assert.equal(recovery.quarantinedFiles[0].filename, 'bad.spec.ts');
+    assert.equal(fs.existsSync(path.join(generatedDir, 'good.spec.ts')), true);
+    assert.equal(fs.existsSync(path.join(generatedDir, 'bad.spec.ts')), false);
+
+    const after = collectGenerationQuality(projectPath, { baseURL: 'http://localhost:3000' });
+    assert.equal(after.hardcodedBaseUrlMismatches.length, 0);
+    assert.equal(after.runnableTests, 1);
+  } finally {
+    fs.rmSync(projectPath, { recursive: true, force: true });
+  }
 });
 
 test('pipeline error classifier treats hardcoded baseURL mismatch as generation quality failure', () => {

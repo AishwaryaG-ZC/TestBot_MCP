@@ -347,6 +347,7 @@ function renderAntiPatterns() {
     '- `await page.waitForTimeout(...)` — use `expect(...).toBeVisible({ timeout })` or `page.waitForResponse` instead.',
     '- Tests that assert the test suite\'s own assumptions back at it — assert against the running app, not against literal strings the test constructed.',
     '- `expect(response.status()).toBeLessThan(500)` as the only API-status check — be specific about what you expect.',
+    '- Absolute external URLs such as `https://example.com`, placeholder image hosts, Instagram links, Supabase project URLs, or guessed localhost ports. Use relative app routes like `page.goto("/route")`; only call an external origin when the source code explicitly defines that external API contract.',
   ].join('\n');
 }
 

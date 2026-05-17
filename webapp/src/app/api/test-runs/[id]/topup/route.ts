@@ -31,6 +31,7 @@ import { getCurrentUser } from '@/lib/auth/session'
 import { db } from '@/lib/db'
 import {
   projectSourceFingerprints,
+  projectClaudeSessions,
   projectWorkspaces,
   testRuns,
   workspaceMembers,
@@ -104,6 +105,25 @@ function extractParentRoutes(report: unknown): string[] {
     }
   }
   return [...out].slice(0, 200)
+}
+
+function extractProjectKey(report: unknown, fallback: string | null | undefined): string {
+  if (report && typeof report === 'object') {
+    const r = report as Record<string, unknown>
+    const metadata = r.metadata as Record<string, unknown> | undefined
+    const projectInfo = metadata?.projectInfo as Record<string, unknown> | undefined
+    const workspace = metadata?.workspaceContext as Record<string, unknown> | undefined
+    const candidates = [
+      workspace?.projectKey,
+      projectInfo?.projectKey,
+      metadata?.projectName,
+      r.projectName,
+    ]
+    for (const c of candidates) {
+      if (typeof c === 'string' && c.trim()) return c.trim()
+    }
+  }
+  return (fallback || 'unknown').trim() || 'unknown'
 }
 
 function extractFailures(report: unknown): FailureLike[] {
@@ -224,6 +244,41 @@ export function computeTopupDiff(
   return { changedFiles, newFiles, removedFiles }
 }
 
+function normalizeRouteFromFile(filePath: string): string | null {
+  const p = String(filePath || '').replace(/\\/g, '/')
+  const appIdx = p.lastIndexOf('/app/')
+  if (appIdx >= 0) {
+    const rel = p.slice(appIdx + 5).replace(/\/(page|route)\.(tsx?|jsx?)$/, '')
+    if (rel && rel !== p) {
+      const route = rel.replace(/\([^)]*\)\//g, '').replace(/\[(\.\.\.)?([^\]]+)\]/g, ':$2')
+      return `/${route}`.replace(/\/+/g, '/').replace(/\/$/, '') || '/'
+    }
+  }
+  return null
+}
+
+function surfaceKeyForFile(filePath: string, fileKind?: string | null): string {
+  const route = normalizeRouteFromFile(filePath)
+  if (route) {
+    const isApi = String(fileKind || '').includes('api') || /\/route\.(tsx?|jsx?)$/i.test(filePath)
+    return `${isApi ? 'api' : 'ui'}:${route}`
+  }
+  const base = path.basename(filePath || 'source').toLowerCase().replace(/[^a-z0-9.:-]+/g, '-')
+  return `source:${base || 'source'}`
+}
+
+function selectTopupSurfaces(diff: {
+  changedFiles: TopupDiffEntry[]
+  newFiles: TopupDiffEntry[]
+  removedFiles: TopupDiffEntry[]
+}): string[] {
+  const out = new Set<string>()
+  for (const f of [...diff.changedFiles, ...diff.newFiles]) {
+    if (f.filePath) out.add(surfaceKeyForFile(f.filePath, f.fileKind))
+  }
+  return [...out].slice(0, Number.parseInt(process.env.HEALIX_CLAUDE_MAX_SHARDS || '', 10) || 8)
+}
+
 /**
  * Compute current fingerprints from disk. Requires `testbot-mcp` to be
  * resolvable (local dev only). On any error returns []. The fingerprinter
@@ -327,7 +382,7 @@ export async function POST(
   }
 
   // 3. Parent must be in a top-up-able terminal state.
-  const terminal = ['passed', 'failed', 'error', 'completed', 'completed_with_findings']
+  const terminal = ['passed', 'failed', 'error', 'completed', 'completed_with_findings', 'qa_cycle_complete', 'coverage_degraded']
   if (!terminal.includes(parent.status || '')) {
     return NextResponse.json(
       { error: 'Parent run is not yet complete', status: parent.status },
@@ -364,7 +419,12 @@ export async function POST(
     newFiles: TopupDiffEntry[]
     removedFiles: TopupDiffEntry[]
     parentRoutes: Array<string>
+    selectedSurfaces?: Array<string>
   } | null = null
+  let selectedSurfaces: string[] = []
+  let resumedSessions: string[] = []
+  let freshSessions: string[] = []
+  const invalidatedSessions: string[] = []
   try {
     if (parent.projectPath && parent.workspaceId) {
       const parentFingerprints = await db
@@ -395,12 +455,14 @@ export async function POST(
       )
 
       const parentRoutes = extractParentRoutes(parent.reportJson)
+      selectedSurfaces = selectTopupSurfaces(diff)
 
       topupFocus = {
         changedFiles: diff.changedFiles,
         newFiles: diff.newFiles,
         removedFiles: diff.removedFiles,
         parentRoutes,
+        selectedSurfaces,
       }
     }
   } catch (focusErr) {
@@ -418,6 +480,37 @@ export async function POST(
       .where(eq(projectWorkspaces.id, parent.workspaceId))
       .limit(1)
     if (!wsRow) topupFocus = null
+  }
+
+  if (parent.workspaceId && selectedSurfaces.length > 0) {
+    try {
+      const projectKey = extractProjectKey(parent.reportJson, parent.creationName)
+      const sessionRows = await db
+        .select({
+          surfaceKey: projectClaudeSessions.surfaceKey,
+          status: projectClaudeSessions.status,
+          expiresAt: projectClaudeSessions.expiresAt,
+        })
+        .from(projectClaudeSessions)
+        .where(
+          and(
+            eq(projectClaudeSessions.workspaceId, parent.workspaceId),
+            eq(projectClaudeSessions.projectKey, projectKey)
+          )
+        )
+      const active = new Set(
+        sessionRows
+          .filter((s) => s.status === 'active' && (!s.expiresAt || s.expiresAt > new Date()))
+          .map((s) => s.surfaceKey)
+      )
+      resumedSessions = selectedSurfaces.filter((s) => active.has(s))
+      freshSessions = selectedSurfaces.filter((s) => !active.has(s))
+    } catch (sessionErr) {
+      console.warn('[topup] session registry lookup failed', (sessionErr as Error).message)
+      freshSessions = selectedSurfaces
+    }
+  } else {
+    freshSessions = selectedSurfaces
   }
 
   // 5. Insert child row with parent_run_id.
@@ -518,7 +611,13 @@ export async function POST(
           new: topupFocus.newFiles.length,
           removed: topupFocus.removedFiles.length,
           parentRoutes: topupFocus.parentRoutes.length,
+          selectedSurfaces,
         }
       : null,
+    selectedSurfaces,
+    resumedSessions,
+    freshSessions,
+    invalidatedSessions,
+    topupMode: selectedSurfaces.length > 0 ? 'surface_delta' : 'parent_session_feedback',
   })
 }

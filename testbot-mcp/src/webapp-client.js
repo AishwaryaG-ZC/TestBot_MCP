@@ -934,6 +934,54 @@ class WebappClient {
     return payload;
   }
 
+  async _patch(path, body, { timeoutMs } = {}) {
+    const url = `${this.dashboardUrl}${path}`;
+    const fetchFn = getFetch();
+    const limit = Number.isFinite(timeoutMs) ? timeoutMs : 30_000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), limit);
+    let response;
+    try {
+      response = await fetchFn(url, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': this.apiKey || '',
+        },
+        body: JSON.stringify(body || {}),
+        signal: controller.signal,
+      });
+    } catch (networkErr) {
+      clearTimeout(timer);
+      if (networkErr.name === 'AbortError') {
+        const err = new Error(`Healix webapp PATCH timed out after ${limit}ms: ${path}`);
+        err.code = 'WEBAPP_TIMEOUT';
+        throw err;
+      }
+      const err = new Error(`Cannot reach Healix webapp at ${url}: ${networkErr.message}`);
+      err.code = 'WEBAPP_UNREACHABLE';
+      throw err;
+    }
+    clearTimeout(timer);
+
+    let payload = null;
+    const rawText = await response.text().catch(() => '');
+    try { payload = rawText ? JSON.parse(rawText) : null; } catch { payload = null; }
+
+    if (!response.ok) {
+      const detail = payload?.error || rawText.slice(0, 400) || `HTTP ${response.status}`;
+      const err = new Error(`Healix webapp PATCH ${path} failed (${response.status}): ${detail}`);
+      err.code = response.status === 401 ? 'INVALID_API_KEY' :
+                 response.status === 403 ? 'WORKSPACE_ACCESS_DENIED' :
+                 response.status === 404 ? 'NOT_FOUND' :
+                 response.status >= 500 ? 'WEBAPP_SERVER_ERROR' : 'WEBAPP_ERROR';
+      err.status = response.status;
+      err.payload = payload;
+      throw err;
+    }
+    return payload;
+  }
+
   // ── Workspace sync methods ──────────────────────────────────────────────────
 
   /**
@@ -1222,6 +1270,156 @@ class WebappClient {
       );
     } catch (err) {
       Logger.warn('WebappClient', 'pushWorkspaceCoverage failed (non-blocking)', { code: err.code, message: err.message });
+      return null;
+    }
+  }
+
+  async getClaudeSessions({ workspaceId, projectKey, surfaceKey, projectPathHash } = {}) {
+    if (!this.apiKey || !workspaceId || !projectKey) return [];
+    const params = new URLSearchParams();
+    params.set('projectKey', projectKey);
+    if (surfaceKey) params.set('surfaceKey', surfaceKey);
+    if (projectPathHash) params.set('projectPathHash', projectPathHash);
+    try {
+      const payload = await this._get(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/claude-sessions?${params.toString()}`,
+        { timeoutMs: 10_000 }
+      );
+      return Array.isArray(payload?.sessions) ? payload.sessions : [];
+    } catch (err) {
+      Logger.warn('WebappClient', 'getClaudeSessions failed (non-blocking)', {
+        workspaceId,
+        projectKey,
+        surfaceKey,
+        code: err?.code,
+        message: err?.message,
+      });
+      return [];
+    }
+  }
+
+  async upsertClaudeSession({
+    workspaceId,
+    projectKey,
+    projectPathHash,
+    surfaceKey,
+    claudeSessionId,
+    model,
+    effort,
+    sourceSignature,
+    prdSignature,
+    corpusVersion,
+    lastRunId,
+    lastIteration,
+    status,
+    expiresAt,
+    invalidationReason,
+  } = {}) {
+    if (!this.apiKey || !workspaceId || !projectKey || !projectPathHash || !surfaceKey || !claudeSessionId) {
+      return null;
+    }
+    try {
+      return await this._post(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/claude-sessions`,
+        {
+          projectKey,
+          projectPathHash,
+          surfaceKey,
+          claudeSessionId,
+          model,
+          effort,
+          sourceSignature,
+          prdSignature,
+          corpusVersion,
+          lastRunId,
+          lastIteration,
+          status,
+          expiresAt,
+          invalidationReason,
+        },
+        { timeoutMs: 15_000, retryDelaysMs: [0, 1000], retryMaxElapsedMs: 5_000 }
+      );
+    } catch (err) {
+      Logger.warn('WebappClient', 'upsertClaudeSession failed (non-blocking)', {
+        workspaceId,
+        projectKey,
+        surfaceKey,
+        code: err?.code,
+        message: err?.message,
+      });
+      return null;
+    }
+  }
+
+  async invalidateClaudeSession({ workspaceId, sessionDbId, reason } = {}) {
+    if (!this.apiKey || !workspaceId || !sessionDbId) return null;
+    try {
+      return await this._patch(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/claude-sessions/${encodeURIComponent(sessionDbId)}/invalidate`,
+        { reason: reason || 'worker_invalidation' },
+        { timeoutMs: 10_000 }
+      );
+    } catch (err) {
+      Logger.warn('WebappClient', 'invalidateClaudeSession failed (non-blocking)', {
+        workspaceId,
+        sessionDbId,
+        code: err?.code,
+        message: err?.message,
+      });
+      return null;
+    }
+  }
+
+  async recordQaGenerationIteration({
+    workspaceId,
+    testRunId,
+    runId,
+    projectKey,
+    surfaceKey,
+    claudeSessionId,
+    promptHash,
+    iteration,
+    decision,
+    passRate,
+    acCoverageRatio,
+    skipCount,
+    failureBreakdown,
+    usage,
+    costUsd,
+    metadata,
+  } = {}) {
+    if (!this.apiKey || !workspaceId || !projectKey || !surfaceKey || !decision) return null;
+    try {
+      return await this._post(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/qa-iterations`,
+        {
+          testRunId,
+          runId,
+          projectKey,
+          surfaceKey,
+          claudeSessionId,
+          promptHash,
+          iteration,
+          decision,
+          passRate,
+          acCoverageRatio,
+          skipCount,
+          failureBreakdown,
+          usage,
+          costUsd,
+          metadata,
+        },
+        { timeoutMs: 10_000, retryDelaysMs: [0], retryMaxElapsedMs: 0 }
+      );
+    } catch (err) {
+      Logger.warn('WebappClient', 'recordQaGenerationIteration failed (non-blocking)', {
+        workspaceId,
+        projectKey,
+        surfaceKey,
+        decision,
+        code: err?.code,
+        message: err?.message,
+      });
       return null;
     }
   }

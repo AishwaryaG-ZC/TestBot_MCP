@@ -75,3 +75,67 @@ test('null projectKey is treated as its own bucket and round-trips', () => {
   // Mismatched projectKey ("pulseboard" vs null) should NOT match.
   assert.equal(Session.loadSession({ cwd: '/p/app', projectKey: 'pulseboard', sessionFile: file }), null);
 });
+
+test('surface/model/signature metadata must match before resume', () => {
+  const file = mktemp();
+  Session.saveSession({
+    sessionId: 's-surface',
+    cwd: '/p/app',
+    projectKey: 'pulseboard',
+    surfaceKey: 'api:POST /api/issues',
+    model: 'claude-sonnet-4-6',
+    effort: 'medium',
+    sourceSignature: 'src-a',
+    prdSignature: 'prd-a',
+    corpusVersion: 'v1',
+    sessionFile: file,
+  });
+  assert.equal(
+    Session.loadSession({
+      cwd: '/p/app',
+      projectKey: 'pulseboard',
+      surfaceKey: 'api:POST /api/issues',
+      model: 'claude-sonnet-4-6',
+      effort: 'medium',
+      sourceSignature: 'src-a',
+      prdSignature: 'prd-a',
+      corpusVersion: 'v1',
+      sessionFile: file,
+    }).sessionId,
+    's-surface'
+  );
+  assert.equal(Session.loadSession({
+    cwd: '/p/app',
+    projectKey: 'pulseboard',
+    surfaceKey: 'ui:/projects',
+    model: 'claude-sonnet-4-6',
+    effort: 'medium',
+    sourceSignature: 'src-a',
+    prdSignature: 'prd-a',
+    corpusVersion: 'v1',
+    sessionFile: file,
+  }), null);
+  assert.equal(Session.loadSession({
+    cwd: '/p/app',
+    projectKey: 'pulseboard',
+    surfaceKey: 'api:POST /api/issues',
+    model: 'claude-opus-4-6',
+    effort: 'medium',
+    sourceSignature: 'src-a',
+    prdSignature: 'prd-a',
+    corpusVersion: 'v1',
+    sessionFile: file,
+  }), null);
+});
+
+test('expired local sessions are not resumed', () => {
+  const file = mktemp();
+  Session.saveSession({
+    sessionId: 's-expired',
+    cwd: '/p/app',
+    projectKey: 'pulseboard',
+    expiresAt: new Date(Date.now() - 1000).toISOString(),
+    sessionFile: file,
+  });
+  assert.equal(Session.loadSession({ cwd: '/p/app', projectKey: 'pulseboard', sessionFile: file }), null);
+});

@@ -726,8 +726,9 @@ class ReportGenerator {
       acCoverage: this.stripAnsiAndNormalize(generationMeta?.acCoverage || null),
       bugScorecard: this.stripAnsiAndNormalize(generationMeta?.bugScorecard || null),
       // CL3-A / CL3-B — top-level breakdown + optional runStatus override.
-      // `runStatus` is null in normal terminations; only set to
-      // 'qa_cycle_complete' when the iteration controller graduates the run.
+      // `runStatus` is null in normal terminations; set when the iteration
+      // controller graduates the run (`qa_cycle_complete`) or reports useful
+      // execution with incomplete coverage (`coverage_degraded`).
       failureBreakdown: this.stripAnsiAndNormalize(generationMeta?.failureBreakdown || null),
       runStatus: generationMeta?.runStatus || null,
     };

@@ -268,9 +268,19 @@ export default function HomePage() {
                               ? 'bg-blue-500/10 text-blue-400'
                               : test.status === 'completed_with_findings'
                               ? 'bg-amber-500/10 text-amber-300'
+                              : test.status === 'qa_cycle_complete'
+                              ? 'bg-emerald-500/10 text-emerald-300'
+                              : test.status === 'coverage_degraded'
+                              ? 'bg-yellow-500/10 text-yellow-300'
                               : 'bg-amber-500/10 text-amber-400'
                           }`}>
-                            {test.status === 'completed_with_findings' ? 'findings' : test.status}
+                            {test.status === 'completed_with_findings'
+                              ? 'findings'
+                              : test.status === 'qa_cycle_complete'
+                                ? 'QA complete'
+                                : test.status === 'coverage_degraded'
+                                  ? 'degraded'
+                                  : test.status}
                           </span>
                         </td>
                         <td className="px-4 py-4">

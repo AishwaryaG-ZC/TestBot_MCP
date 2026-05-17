@@ -523,14 +523,14 @@ export async function POST(request: NextRequest) {
     // CL3-B — the worker can override the run status to mark "QA cycle
     // complete" (graceful exit: only real bugs remained, pass rate plateaued).
     // It also accepts the value from `report.runStatus` for callers that
-    // bundle it inside the report blob. The only override value currently
-    // honored is 'qa_cycle_complete'; anything else falls back to inference.
+    // bundle it inside the report blob. Only known non-error lifecycle
+    // statuses are honored; anything else falls back to inference.
     const explicitRunStatus =
       (typeof run_status === 'string' && run_status.trim().length > 0 && run_status.trim())
       || (typeof bodyRunStatus === 'string' && bodyRunStatus.trim().length > 0 && bodyRunStatus.trim())
       || ((report as unknown as { runStatus?: string })?.runStatus)
       || null
-    const allowedOverrides = new Set(['qa_cycle_complete'])
+    const allowedOverrides = new Set(['qa_cycle_complete', 'coverage_degraded'])
     const runStatus = pipelineErrorPayload
       ? 'error'
       : (explicitRunStatus && allowedOverrides.has(String(explicitRunStatus)))

@@ -937,3 +937,76 @@ export const projectSourceFingerprints = pgTable(
     index('src_fingerprints_lookup').on(table.workspaceId, table.projectKey, table.sourceRunId),
   ]
 )
+
+// ── Claude-local resumable generation state ────────────────────────────────
+// DB is authoritative for team/workspace runs. The MCP keeps a local
+// ~/.healix cache only as a fallback when this table cannot be reached.
+
+export type ProjectClaudeSessionStatus = 'active' | 'invalidated' | 'expired'
+
+export const projectClaudeSessions = pgTable(
+  'project_claude_sessions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => projectWorkspaces.id, { onDelete: 'cascade' }),
+    projectKey: text('project_key').notNull(),
+    projectPathHash: text('project_path_hash').notNull(),
+    surfaceKey: text('surface_key').notNull(),
+    claudeSessionId: text('claude_session_id').notNull(),
+    model: text('model').notNull(),
+    effort: text('effort').notNull(),
+    sourceSignature: text('source_signature'),
+    prdSignature: text('prd_signature'),
+    corpusVersion: text('corpus_version'),
+    lastRunId: text('last_run_id'),
+    lastIteration: integer('last_iteration').notNull().default(1),
+    status: text('status').notNull().default('active').$type<ProjectClaudeSessionStatus>(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+    invalidationReason: text('invalidation_reason'),
+    createdBy: uuid('created_by').references(() => profiles.id),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('project_claude_sessions_unique').on(
+      table.workspaceId,
+      table.projectKey,
+      table.projectPathHash,
+      table.surfaceKey,
+    ),
+    index('project_claude_sessions_lookup').on(table.workspaceId, table.projectKey, table.surfaceKey),
+    index('project_claude_sessions_status_idx').on(table.workspaceId, table.status),
+  ]
+)
+
+export const qaGenerationIterations = pgTable(
+  'qa_generation_iterations',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => projectWorkspaces.id, { onDelete: 'cascade' }),
+    testRunId: uuid('test_run_id').references(() => testRuns.id, { onDelete: 'set null' }),
+    runId: text('run_id'),
+    projectKey: text('project_key').notNull(),
+    surfaceKey: text('surface_key').notNull(),
+    claudeSessionId: text('claude_session_id'),
+    promptHash: text('prompt_hash'),
+    iteration: integer('iteration').notNull(),
+    decision: text('decision').notNull(),
+    passRate: numeric('pass_rate', { precision: 5, scale: 4 }),
+    acCoverageRatio: numeric('ac_coverage_ratio', { precision: 5, scale: 4 }),
+    skipCount: integer('skip_count').notNull().default(0),
+    failureBreakdown: jsonb('failure_breakdown').$type<Record<string, unknown>>(),
+    usage: jsonb('usage').$type<Record<string, unknown>>(),
+    costUsd: numeric('cost_usd', { precision: 12, scale: 6 }),
+    metadata: jsonb('metadata').$type<Record<string, unknown>>(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('qa_generation_iterations_lookup').on(table.workspaceId, table.projectKey, table.surfaceKey),
+    index('qa_generation_iterations_run_idx').on(table.workspaceId, table.runId),
+  ]
+)

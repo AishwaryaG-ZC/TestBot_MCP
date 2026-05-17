@@ -18,6 +18,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 const Logger = require('../../logger');
 const Preflight = require('./preflight');
@@ -25,6 +26,17 @@ const PromptBuilder = require('./prompt-builder');
 const Exec = require('./exec');
 const Session = require('./session');
 const AskUser = require('./ask-user');
+
+const DEFAULT_MODEL = process.env.HEALIX_CLAUDE_MODEL || 'claude-sonnet-4-6';
+const DEFAULT_EFFORT = process.env.HEALIX_CLAUDE_EFFORT || 'medium';
+
+function _sha(value) {
+  return crypto.createHash('sha256').update(String(value || '')).digest('hex');
+}
+
+function _jsonSha(value) {
+  try { return _sha(JSON.stringify(value || null)); } catch { return _sha(String(value || '')); }
+}
 
 function _writeStatus({ statusDir, runId, phase, message, metadata, telemetryReporter }) {
   if (!statusDir) return;
@@ -102,6 +114,10 @@ async function runClaudeGeneration(args = {}) {
     // CL3-D — Top-up focus shipped from the topup route. Passed straight
     // through to the prompt builder; absent on non-top-up runs.
     topupFocus = null,
+    surfaceKey = 'root',
+    sessionMetadata = null,
+    model = DEFAULT_MODEL,
+    effort = DEFAULT_EFFORT,
     // ── Test-injection seams ────────────────────────────────────────────────
     _preflight = Preflight.preflight,
     _spawnClaude = Exec.spawnClaude,
@@ -117,6 +133,19 @@ async function runClaudeGeneration(args = {}) {
   if (!testsDir) throw new Error('runClaudeGeneration: testsDir is required');
 
   const projectKey = _resolveProjectKey({ workspaceContext, projectInfo, projectPath });
+  const workspaceId = workspaceContext?.workspaceId || workspaceContext?.id || null;
+  const projectPathHash = sessionMetadata?.projectPathHash || _session.hashProjectPath(projectPath);
+  const sourceSignature = sessionMetadata?.sourceSignature || _jsonSha(context || {});
+  const prdSignature = sessionMetadata?.prdSignature || _sha(prdContent || JSON.stringify(parsedPRD || null));
+  const corpusVersion = sessionMetadata?.corpusVersion || (
+    corpusSeed?.version ||
+    corpusSeed?.canonicalVersion ||
+    corpusSeed?.manifestHash ||
+    null
+  );
+  const expiresAt = sessionMetadata?.expiresAt || _session.defaultExpiresAt();
+  let sessionResumeSource = explicitSessionId ? 'explicit' : 'fresh';
+  let sessionDbId = sessionMetadata?.sessionDbId || null;
 
   // ── 1. Preflight ────────────────────────────────────────────────────────
   if (!_skipPreflight) {
@@ -152,10 +181,67 @@ async function runClaudeGeneration(args = {}) {
   // ── 2. Session resume resolution ────────────────────────────────────────
   let sessionId = explicitSessionId || null;
   if (!sessionId && iterationNumber > 1) {
-    const saved = _session.loadSession({ cwd: projectPath, projectKey });
-    if (saved?.sessionId) {
-      sessionId = saved.sessionId;
-      Logger.info('ClaudeLocal/Index', 'Resuming prior Claude session', { sessionId, projectKey });
+    if (client && typeof client.getClaudeSessions === 'function' && workspaceId) {
+      const rows = await client.getClaudeSessions({
+        workspaceId,
+        projectKey,
+        surfaceKey,
+        projectPathHash,
+      });
+      const match = rows.find((row) => _session.compatibleSession({
+        sessionId: row.claudeSessionId || row.sessionId,
+        cwd: projectPath,
+        projectKey: row.projectKey,
+        surfaceKey: row.surfaceKey,
+        projectPathHash: row.projectPathHash,
+        model: row.model,
+        effort: row.effort,
+        sourceSignature: row.sourceSignature,
+        prdSignature: row.prdSignature,
+        corpusVersion: row.corpusVersion,
+        status: row.status,
+        expiresAt: row.expiresAt,
+      }, {
+        cwd: projectPath,
+        projectKey,
+        surfaceKey,
+        projectPathHash,
+        model,
+        effort,
+        sourceSignature,
+        prdSignature,
+        corpusVersion,
+      }));
+      if (match?.claudeSessionId) {
+        sessionId = match.claudeSessionId;
+        sessionDbId = match.id || null;
+        sessionResumeSource = 'db';
+        Logger.info('ClaudeLocal/Index', 'Resuming Claude session from DB registry', {
+          sessionId,
+          projectKey,
+          surfaceKey,
+          sessionDbId,
+        });
+      }
+    }
+    if (!sessionId) {
+      const saved = _session.loadSession({
+        cwd: projectPath,
+        projectKey,
+        surfaceKey,
+        projectPathHash,
+        model,
+        effort,
+        sourceSignature,
+        prdSignature,
+        corpusVersion,
+      });
+      if (saved?.sessionId) {
+        sessionId = saved.sessionId;
+        sessionDbId = saved.sessionDbId || null;
+        sessionResumeSource = 'local_cache';
+        Logger.info('ClaudeLocal/Index', 'Resuming Claude session from local cache', { sessionId, projectKey, surfaceKey });
+      }
     }
   }
 
@@ -176,10 +262,13 @@ async function runClaudeGeneration(args = {}) {
     topupFocus,
   });
   const promptTokenEstimate = PromptBuilder.estimatePromptTokens(prompt);
+  const promptHash = _sha(prompt);
   Logger.info('ClaudeLocal/Index', 'Built prompt', {
     iteration: iterationNumber,
+    surfaceKey,
     chars: prompt.length,
     tokensEstimate: promptTokenEstimate,
+    promptHash,
   });
 
   _writeStatus({
@@ -187,7 +276,15 @@ async function runClaudeGeneration(args = {}) {
     runId,
     phase: 'claude_local_iteration_started',
     message: `Iteration ${iterationNumber} — Claude generating`,
-    metadata: { iteration: iterationNumber, promptBytes: prompt.length, tokensEstimate: promptTokenEstimate, sessionId },
+    metadata: {
+      iteration: iterationNumber,
+      surfaceKey,
+      promptBytes: prompt.length,
+      tokensEstimate: promptTokenEstimate,
+      promptHash,
+      sessionId,
+      sessionResumeSource,
+    },
     telemetryReporter,
   });
 
@@ -275,6 +372,8 @@ async function runClaudeGeneration(args = {}) {
       projectPath,
       mcpConfigPath,
       sessionId,
+      model,
+      effort,
       binary: _binary,
       spawnFn: _spawnFn,
       onEvent,
@@ -297,6 +396,10 @@ async function runClaudeGeneration(args = {}) {
     Logger.error('ClaudeLocal/Index', 'Claude stream ended with error', err);
     // ERROR_LOGIN_REQUIRED → surface as awaiting_user_login.
     if (err?.code === 'ERROR_LOGIN_REQUIRED') {
+      if (client && workspaceId && sessionDbId && typeof client.invalidateClaudeSession === 'function') {
+        client.invalidateClaudeSession({ workspaceId, sessionDbId, reason: 'claude_login_required' }).catch(() => {});
+      }
+      _session.clearSession({ cwd: projectPath, projectKey, surfaceKey });
       _writeStatus({ statusDir, runId, phase: 'awaiting_user_login', message: 'claude reported login required mid-stream', metadata: { reason: 'logged_out' }, telemetryReporter });
       return { status: 'awaiting_user_login', loginUrl: null, reason: 'logged_out' };
     }
@@ -317,7 +420,52 @@ async function runClaudeGeneration(args = {}) {
   // ── 6. Persist session for next iteration ──────────────────────────────
   const finalSessionId = final?.sessionId || sessionId || null;
   if (finalSessionId) {
-    _session.saveSession({ sessionId: finalSessionId, cwd: projectPath, projectKey });
+    const localEntry = _session.saveSession({
+      sessionId: finalSessionId,
+      cwd: projectPath,
+      projectKey,
+      surfaceKey,
+      model,
+      effort,
+      sourceSignature,
+      prdSignature,
+      corpusVersion,
+      workspaceId,
+      sessionDbId,
+      expiresAt,
+      lastRunId: runId,
+      lastIteration: iterationNumber,
+    });
+    if (client && workspaceId && typeof client.upsertClaudeSession === 'function') {
+      const persisted = await client.upsertClaudeSession({
+        workspaceId,
+        projectKey,
+        projectPathHash,
+        surfaceKey,
+        claudeSessionId: finalSessionId,
+        model,
+        effort,
+        sourceSignature,
+        prdSignature,
+        corpusVersion,
+        lastRunId: runId,
+        lastIteration: iterationNumber,
+        status: 'active',
+        expiresAt,
+      });
+      sessionDbId = persisted?.session?.id || localEntry?.sessionDbId || sessionDbId || null;
+      if (sessionDbId && localEntry?.sessionDbId !== sessionDbId) {
+        _session.saveSession({
+          ...localEntry,
+          sessionId: finalSessionId,
+          cwd: projectPath,
+          projectKey,
+          surfaceKey,
+          sessionDbId,
+          sessionFile: undefined,
+        });
+      }
+    }
   }
 
   // WS-3: capture Claude's "DONE" self-completion signal. The stream parser
@@ -353,7 +501,10 @@ async function runClaudeGeneration(args = {}) {
     message: `Iteration ${iterationNumber} produced ${files.length} file(s)`,
     metadata: {
       iteration: iterationNumber,
+      surfaceKey,
       sessionId: finalSessionId,
+      sessionResumeSource,
+      sessionDbId,
       files: files.map((f) => f.path),
       usage: final?.usage || null,
       summary: final?.summary || null,
@@ -371,13 +522,23 @@ async function runClaudeGeneration(args = {}) {
     selfDone,
     generationMeta: {
       iteration: iterationNumber,
+      surfaceKey,
       promptBytes: prompt.length,
       promptTokenEstimate,
+      promptHash,
       askUserCount: askUserPending.length,
       costUsd: final?.costUsd ?? null,
       numTurns: final?.numTurns ?? null,
       subtype: final?.subtype || null,
       selfDone,
+      model,
+      effort,
+      sessionResumeSource,
+      sessionDbId,
+      projectPathHash,
+      sourceSignature,
+      prdSignature,
+      corpusVersion,
       // CL2-B — include sessionId in the per-iteration meta so the topup
       // route (which reads parent.report.generationMeta.iterations[i].sessionId)
       // can resume the Claude session for follow-up iterations.
@@ -397,4 +558,6 @@ module.exports = {
   AskUser,
   IterationController: require('./iteration-controller'),
   FeedbackBuilder: require('./feedback-builder'),
+  SurfaceInventory: require('./surface-inventory'),
+  ContextPacker: require('./context-packer'),
 };

@@ -74,11 +74,15 @@ function statusBadgeClass(status: string | null | undefined) {
   if (status === 'failed') return 'bg-red-500/10 text-red-400'
   if (status === 'running') return 'bg-blue-500/10 text-blue-400'
   if (status === 'completed_with_findings') return 'bg-amber-500/10 text-amber-300'
+  if (status === 'qa_cycle_complete') return 'bg-emerald-500/10 text-emerald-300'
+  if (status === 'coverage_degraded') return 'bg-yellow-500/10 text-yellow-300'
   return 'bg-amber-500/10 text-amber-400'
 }
 
 function statusLabel(status: string | null | undefined) {
   if (status === 'completed_with_findings') return 'findings'
+  if (status === 'qa_cycle_complete') return 'QA complete'
+  if (status === 'coverage_degraded') return 'degraded'
   return status || 'unknown'
 }
 
@@ -155,7 +159,7 @@ export default function AllTestsPage() {
 
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'all' | 'passed' | 'failed' | 'completed_with_findings' | 'running'>('all');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'passed' | 'failed' | 'completed_with_findings' | 'qa_cycle_complete' | 'coverage_degraded' | 'running'>('all');
   const [sortBy, setSortBy] = useState<'date' | 'name' | 'status'>('date');
   const [pageSize, setPageSize] = useState(25);
   const [page, setPage] = useState(1);
@@ -487,6 +491,8 @@ export default function AllTestsPage() {
               <option value="passed">Passed</option>
               <option value="failed">Failed</option>
               <option value="completed_with_findings">Findings</option>
+              <option value="qa_cycle_complete">QA Complete</option>
+              <option value="coverage_degraded">Coverage Degraded</option>
               <option value="running">Running</option>
             </select>
             <select

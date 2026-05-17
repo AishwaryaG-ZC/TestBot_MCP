@@ -8,6 +8,7 @@ const path = require('path');
 const net = require('net');
 const { spawn, execSync } = require('child_process');
 const Logger = require('./logger');
+const BrowserSetup = require('./playwright-browser-setup');
 
 const GENERATED_SPEC_FILE_PATTERN = /\.(?:spec|test)\.(?:ts|js|mts|mjs|cts|cjs)$/i;
 const AUTH_TAG_PATTERN = /@auth|@tierB/i;
@@ -451,30 +452,9 @@ module.exports = defineConfig({
   }
 
   ensurePlaywrightBrowsersInstalled() {
-    const browsersPath = process.env.PLAYWRIGHT_BROWSERS_PATH ||
-      path.join(process.env.HOME || process.env.USERPROFILE || '', '.cache', 'ms-playwright');
-
-    let hasChromium = false;
-    try {
-      if (fs.existsSync(browsersPath)) {
-        hasChromium = fs.readdirSync(browsersPath).some(dir => dir.startsWith('chromium'));
-      }
-    } catch {
-      // If we can't read the directory, assume browsers are missing
-    }
-
-    if (!hasChromium) {
-      Logger.info('PlaywrightIntegration', 'Chromium browser not found. Installing via playwright install...');
-      try {
-        execSync('npx playwright install chromium', {
-          cwd: this.config.projectPath,
-          stdio: 'pipe',
-          timeout: 180000,
-        });
-        Logger.info('PlaywrightIntegration', 'Chromium browser installed successfully');
-      } catch (error) {
-        Logger.warn('PlaywrightIntegration', 'Could not auto-install Chromium. Run manually: npx playwright install chromium', { error: error.message });
-      }
+    const result = BrowserSetup.ensureChromiumInstalled(this.config.projectPath, { reason: 'playwright_test_execution' });
+    if (!result.ok) {
+      Logger.warn('PlaywrightIntegration', 'Could not ensure Chromium browser runtime', result);
     }
   }
 

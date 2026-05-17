@@ -13,7 +13,7 @@
  *   2. CL3-B qa_cycle_complete       → stop_qa_cycle_complete
  *                                      (only real bugs left + passRate plateaued; iter>=2)
  *   3. selfDone && iter>=1           → stop_self_done   (Claude said DONE)
- *   4. iter >= maxIterations         → stop_max_iterations
+ *   4. iter >= maxIterations         → stop_coverage_degraded | stop_max_iterations
  *   5. real coverage win             → stop_success     (only when totalAcTags >= 5)
  *   6. passRate >= target            → stop_success
  *   7. no-progress stall             → stop_no_progress
@@ -45,7 +45,7 @@ const MIN_TOTAL_ACS_FOR_COVERAGE_STOP = 5;
  * @param {number}  [input.maxIterations]          Cap iterations (default 5; HEALIX_CLAUDE_MAX_ITERATIONS overrides)
  * @param {object}  [input.targets]                Override thresholds
  * @param {object}  [input.failureBreakdown]       CL3-B: { real, bad, env } counts from failure classifier
- * @returns {{ decision: 'continue'|'stop_success'|'stop_self_done'|'stop_qa_cycle_complete'|'stop_max_iterations'|'stop_no_progress'|'stop_aborted',
+ * @returns {{ decision: 'continue'|'stop_success'|'stop_self_done'|'stop_qa_cycle_complete'|'stop_max_iterations'|'stop_coverage_degraded'|'stop_no_progress'|'stop_aborted',
  *             reason: string,
  *             noProgressCounter: number,
  *             targetsMet: boolean }}
@@ -145,6 +145,20 @@ function decide(input) {
 
   // 3. Iteration cap — hard ceiling, cost guard.
   if (iteration >= maxIterations) {
+    const allowCoverageDegraded = input.allowCoverageDegraded !== false;
+    const usefulTestsRan = (Number.isFinite(input.totalTests) && input.totalTests > 0)
+      || passRate > 0
+      || (Number.isFinite(input.executedTests) && input.executedTests > 0);
+    const breakdown = input.failureBreakdown || {};
+    const envFailures = Number(breakdown.env || 0);
+    if (allowCoverageDegraded && usefulTestsRan && envFailures === 0) {
+      return {
+        decision: 'stop_coverage_degraded',
+        reason: `reached max iterations (${maxIterations}) with useful tests executed; reporting coverage_degraded instead of pipeline error`,
+        noProgressCounter: prevNoProgress,
+        targetsMet: false,
+      };
+    }
     return {
       decision: 'stop_max_iterations',
       reason: `reached max iterations (${maxIterations})`,

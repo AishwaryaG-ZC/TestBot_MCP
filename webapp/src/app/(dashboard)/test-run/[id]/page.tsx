@@ -526,6 +526,7 @@ function StatusBadge({ status }: { status: string }) {
 function runStatusLabel(status: string | null | undefined): string {
   if (status === 'completed_with_findings') return 'completed with findings';
   if (status === 'qa_cycle_complete') return 'QA cycle complete';
+  if (status === 'coverage_degraded') return 'coverage degraded';
   return status || 'unknown';
 }
 
@@ -535,6 +536,7 @@ function runStatusClass(status: string | null | undefined): string {
   if (status === 'running') return 'bg-blue-500/10 border border-blue-500/20 text-blue-400';
   if (status === 'completed_with_findings') return 'bg-amber-500/10 border border-amber-500/25 text-amber-300';
   if (status === 'qa_cycle_complete') return 'bg-emerald-500/10 border border-emerald-500/25 text-emerald-300';
+  if (status === 'coverage_degraded') return 'bg-yellow-500/10 border border-yellow-500/25 text-yellow-300';
   return 'bg-amber-500/10 border border-amber-500/20 text-amber-400';
 }
 
@@ -2793,11 +2795,12 @@ function CanonicalSuiteCard({
   const [suite, setSuite] = useState<CanonicalSuiteSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [loadedKey, setLoadedKey] = useState<string | null>(null);
+  const suiteKey = `${workspaceId}:${projectKey}`;
 
   useEffect(() => {
     if (!workspaceId || !projectKey) return;
     let cancelled = false;
-    setLoading(true);
     fetch(
       `/api/workspaces/${encodeURIComponent(workspaceId)}/canonical-suite?projectKey=${encodeURIComponent(projectKey)}&latest=true`,
       { cache: 'no-store' }
@@ -2806,30 +2809,36 @@ function CanonicalSuiteCard({
         if (cancelled) return;
         if (res.status === 404) {
           setSuite(null);
+          setError(null);
+          setLoadedKey(suiteKey);
           setLoading(false);
           return;
         }
         if (!res.ok) {
           setError(`Failed to load canonical suite (status ${res.status})`);
+          setLoadedKey(suiteKey);
           setLoading(false);
           return;
         }
         const json = (await res.json()) as { suite?: CanonicalSuiteSummary };
         if (cancelled) return;
         setSuite(json.suite ?? null);
+        setError(null);
+        setLoadedKey(suiteKey);
         setLoading(false);
       })
       .catch((err) => {
         if (cancelled) return;
         setError((err as Error).message);
+        setLoadedKey(suiteKey);
         setLoading(false);
       });
     return () => {
       cancelled = true;
     };
-  }, [workspaceId, projectKey]);
+  }, [workspaceId, projectKey, suiteKey]);
 
-  if (loading) return null;
+  if (loading || loadedKey !== suiteKey) return null;
   if (error) return null;
   if (!suite) return null;
 
@@ -4699,7 +4708,7 @@ export default function TestRunDetailPage() {
                 ?? (report?.metadata as unknown as { selectedGenerator?: string })?.selectedGenerator
                 ?? null;
               const status = (testRun.status || '').toLowerCase();
-              const isTerminal = status === 'completed' || status === 'completed_with_findings' || status === 'passed' || status === 'failed';
+              const isTerminal = status === 'completed' || status === 'completed_with_findings' || status === 'passed' || status === 'failed' || status === 'qa_cycle_complete' || status === 'coverage_degraded';
               const isClaudeLocal = sg === 'claude-local';
               if (!isTerminal || !isClaudeLocal) return null;
               return <TopUpButton runId={testRun.id} />;
@@ -4774,7 +4783,7 @@ export default function TestRunDetailPage() {
           ?? null;
         const status = (testRun.status || '').toLowerCase();
         const isTerminal = status === 'completed' || status === 'completed_with_findings'
-          || status === 'passed' || status === 'failed' || status === 'qa_cycle_complete';
+          || status === 'passed' || status === 'failed' || status === 'qa_cycle_complete' || status === 'coverage_degraded';
         const wsId = testRun.workspace_id || null;
         const pk = testRun.project_key || null;
         if (!isTerminal || sg !== 'claude-local' || !wsId || !pk) return null;

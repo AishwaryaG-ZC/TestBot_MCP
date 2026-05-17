@@ -1659,7 +1659,7 @@ function extractQualityFailureFileNames(qualityAudit = {}) {
 
 function isHardQualityAuditError(error) {
   const text = String(error || '');
-  return /^(?:generated_tests_missing|no_generated_tests|zero_runnable_tests|runnable_coverage_too_low|fallback_or_template_spec|hardcoded_unverified_credentials|ungrounded_api_endpoint|hash_route_without_hash_fragment|unblocked_protected_route_without_credentials|protected_route_missing_auth_tag|auth_gated_review_form_without_auth_tag|missing_qa_contract_coverage|missing_api_test_files)(?::|$)/i.test(text);
+  return /^(?:generated_tests_missing|no_generated_tests|zero_runnable_tests|runnable_coverage_too_low|hardcoded_base_url_mismatch|fallback_or_template_spec|hardcoded_unverified_credentials|ungrounded_api_endpoint|hash_route_without_hash_fragment|unblocked_protected_route_without_credentials|protected_route_missing_auth_tag|auth_gated_review_form_without_auth_tag|missing_qa_contract_coverage|missing_api_test_files)(?::|$)/i.test(text);
 }
 
 function qualityAuditHasHardErrors(qualityAudit = {}) {
@@ -2054,6 +2054,53 @@ function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason =
     quarantinedFiles,
     remainingFiles: Math.max(0, allFiles.length - quarantinedFiles.length),
     tier0SkippedFiles: tier0Skipped,
+  };
+}
+
+function quarantineHardcodedBaseUrlMismatchFiles({ projectPath, mismatches = [], reason = 'hardcoded_base_url_mismatch' } = {}) {
+  const filenames = [...new Set((mismatches || []).map((m) => path.basename(m?.file || '')).filter(Boolean))];
+  if (filenames.length === 0) {
+    return { applied: false, reason: 'no_mismatch_files', quarantinedFiles: [] };
+  }
+  const dirs = TierIsolation.ensureTierDirs(projectPath);
+  const quarantineDir = path.join(projectPath, 'tests', '.healix-quarantine', `${Date.now()}-${reason}`);
+  const quarantinedFiles = [];
+  const searchRoots = [dirs.legacy, dirs.tier1, dirs.tier0];
+
+  for (const filename of filenames) {
+    for (const root of searchRoots) {
+      const source = path.join(root, filename);
+      if (!fs.existsSync(source)) continue;
+      ensureDir(quarantineDir);
+      const rootLabel = root === dirs.legacy ? 'generated' : root === dirs.tier1 ? 'tier1' : 'tier0';
+      const target = path.join(quarantineDir, `${rootLabel}-${filename}`);
+      try {
+        fs.renameSync(source, target);
+        quarantinedFiles.push({
+          filename,
+          source,
+          path: target,
+          tier: rootLabel,
+          reason,
+          mismatches: (mismatches || [])
+            .filter((m) => path.basename(m?.file || '') === filename)
+            .map((m) => ({ url: m.url, expectedOrigin: m.expectedOrigin, actualOrigin: m.actualOrigin })),
+        });
+      } catch (err) {
+        Logger.warn('PipelineWorker', 'Failed to quarantine hardcoded-origin spec', {
+          filename,
+          source,
+          reason: err?.message,
+        });
+      }
+    }
+  }
+
+  return {
+    applied: quarantinedFiles.length > 0,
+    reason,
+    quarantineDir: quarantinedFiles.length > 0 ? quarantineDir : null,
+    quarantinedFiles,
   };
 }
 
@@ -9034,26 +9081,84 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     // Tier-1 ephemeral dir is where Claude writes its specs. The deterministic
     // Tier-0 pack stays in the persistent dir (tier-isolation handles publish).
     const tier1Dir = TierIsolation.ensureTierDirs(config.projectPath).tier1;
+    const surfaceInventory = ClaudeLocal.SurfaceInventory.buildSurfaceInventory({
+      context: generationContext,
+      parsedPRD: parsedPRD || null,
+      explorationArtifact: explorationArtifact || null,
+      roles: roles || [],
+      corpusSeed: corpusBootstrap?.corpusSeed || null,
+      topupFocus: config.topupFocus || null,
+      maxShards: Number.parseInt(process.env.HEALIX_CLAUDE_MAX_SHARDS || '', 10) || undefined,
+    });
+    const primarySurface = (surfaceInventory.selectedSurfaces || [])[0]
+      || (surfaceInventory.surfaces || [])[0]
+      || { surfaceKey: 'root', label: 'Root QA generation' };
+    const packed = ClaudeLocal.ContextPacker.packContextForSurface({
+      context: generationContext,
+      parsedPRD: parsedPRD || null,
+      explorationArtifact: explorationArtifact || null,
+      corpusSeed: corpusBootstrap?.corpusSeed || null,
+      corpusGuidance: corpusGuidance || null,
+      feedback: null,
+      topupFocus: config.topupFocus || null,
+      surface: primarySurface,
+      projectPath: config.projectPath,
+    });
+    generationMeta.claudeSurfaceInventory = {
+      summary: surfaceInventory.summary,
+      surfaces: surfaceInventory.surfaces.map((s) => ({
+        surfaceKey: s.surfaceKey,
+        type: s.type,
+        label: s.label,
+        changed: s.changed,
+        routes: s.routes,
+        apiEndpoints: s.apiEndpoints,
+        forms: s.forms,
+        roles: s.roles,
+        acIds: s.acIds,
+        sourceFiles: s.sourceFiles,
+        fingerprintHash: s.fingerprintHash,
+      })),
+      selectedSurfaceKeys: surfaceInventory.selectedSurfaces.map((s) => s.surfaceKey),
+      activeSurfaceKey: primarySurface.surfaceKey,
+      promptBudget: packed.promptBudget,
+    };
+    if (statusDir) {
+      recordRunDecision(statusDir, telemetryReporter, {
+        runId,
+        decisionType: 'claude_surface_inventory',
+        phase: 'generation_surface_inventory',
+        status: 'info',
+        message: `Prepared ${surfaceInventory.summary.totalSurfaces} Claude surface shard(s); active shard ${primarySurface.surfaceKey}.`,
+        metadata: generationMeta.claudeSurfaceInventory,
+      });
+    }
 
     const adapterClient = new WebappClient({ apiKey: process.env.HEALIX_API_KEY });
     const claudeResult = await ClaudeLocal.runClaudeGeneration({
-      context: generationContext,
+      context: packed.context,
       projectPath: config.projectPath,
       testsDir: tier1Dir,
       prdContent: prdContent || '',
-      parsedPRD: parsedPRD || null,
-      explorationArtifact: explorationArtifact || null,
+      parsedPRD: packed.parsedPRD || parsedPRD || null,
+      explorationArtifact: packed.explorationArtifact || explorationArtifact || null,
       roles: roles || [],
       projectInfo,
       runId,
       statusDir,
       client: adapterClient,
       workspaceContext: corpusBootstrap?.workspaceContext || null,
-      corpusSeed: corpusBootstrap?.corpusSeed || null,
-      corpusGuidance: corpusGuidance || null,
+      corpusSeed: packed.corpusSeed || corpusBootstrap?.corpusSeed || null,
+      corpusGuidance: packed.corpusGuidance || corpusGuidance || null,
       iterationNumber: 1,
       feedback: null,
       sessionId: null,
+      surfaceKey: primarySurface.surfaceKey,
+      sessionMetadata: {
+        sourceSignature: primarySurface.fingerprintHash || null,
+        prdSignature: null,
+        corpusVersion: corpusBootstrap?.corpusSeed?.version || corpusBootstrap?.corpusSeed?.canonicalVersion || null,
+      },
       telemetryReporter,
     });
 
@@ -9092,6 +9197,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         provider: 'claude-local',
         selectedGenerator: 'claude-local',
         iterations: [claudeResult.generationMeta],
+        surfaceInventory: generationMeta.claudeSurfaceInventory,
         selfDone: claudeResult.selfDone === true,
         // CL2-B — top-level mirror of the session id so the topup route can
         // grab it from `report.generationMeta.claudeSessionId` without
@@ -11314,9 +11420,37 @@ async function runPipeline(config, runId) {
             generationMeta.tierBRoles = currentRunTierBRoles;
           }
 
-          const qualityScan = collectGenerationQuality(config.projectPath, {
+          let qualityScan = collectGenerationQuality(config.projectPath, {
             baseURL: config.baseURL || projectInfo.baseURL,
           });
+          if (Array.isArray(qualityScan.hardcodedBaseUrlMismatches) && qualityScan.hardcodedBaseUrlMismatches.length > 0) {
+            const quarantine = quarantineHardcodedBaseUrlMismatchFiles({
+              projectPath: config.projectPath,
+              mismatches: qualityScan.hardcodedBaseUrlMismatches,
+              reason: 'hardcoded_base_url_mismatch',
+            });
+            if (quarantine.applied) {
+              qualityScan = collectGenerationQuality(config.projectPath, {
+                baseURL: config.baseURL || projectInfo.baseURL,
+              });
+              generationMeta = generationMeta || {};
+              generationMeta.hardcodedOriginRecovery = {
+                applied: true,
+                quarantineDir: quarantine.quarantineDir,
+                quarantinedFiles: quarantine.quarantinedFiles,
+                remainingRunnableTests: qualityScan.runnableTests,
+                remainingTotalTests: qualityScan.totalTests,
+              };
+              recordRunDecision(statusDir, telemetryReporter, {
+                runId,
+                decisionType: 'quality_recovery_decision',
+                phase: 'generation_origin_recovery',
+                status: 'warning',
+                message: 'Specs that targeted a different app origin were quarantined; retained same-origin specs will continue.',
+                metadata: generationMeta.hardcodedOriginRecovery,
+              });
+            }
+          }
           if (generationMeta?.retainedSuite) {
             qualityScan.retainedSuite = generationMeta.retainedSuite;
           }
@@ -11599,6 +11733,10 @@ async function runPipeline(config, runId) {
         parsedPRD,
         explorationArtifact,
         roles: rolesForGeneration,
+        surfaceKey: generationMeta?.surfaceInventory?.activeSurfaceKey
+          || generationMeta?.claudeSurfaceInventory?.activeSurfaceKey
+          || 'root',
+        surfaceInventory: generationMeta?.surfaceInventory || generationMeta?.claudeSurfaceInventory || null,
         // WS-3: pass the initial generation's self-DONE flag through so the
         // iteration-loop's first decide() call can honour it without needing
         // a re-invocation.
@@ -11967,6 +12105,8 @@ async function runPipeline(config, runId) {
         explorationArtifact: null,
         roles: roles || [],
         selfDone: false,
+        surfaceKey: 'root',
+        surfaceInventory: null,
       };
       generationMeta = generationMeta || {};
       generationMeta.selectedGenerator = 'claude-local';
@@ -11979,24 +12119,71 @@ async function runPipeline(config, runId) {
       try {
         const seededIter = (config.parentIteration || 1) + 1;
         const topupAdapterClient = new WebappClient({ apiKey: process.env.HEALIX_API_KEY });
-        const topupRegen = await ClaudeLocal.runClaudeGeneration({
+        const topupInventory = ClaudeLocal.SurfaceInventory.buildSurfaceInventory({
           context: claudeLocalCtx.context,
+          parsedPRD: null,
+          explorationArtifact: null,
+          roles: claudeLocalCtx.roles,
+          topupFocus: config.topupFocus || null,
+        });
+        const topupSurface = (topupInventory.selectedSurfaces || [])[0]
+          || (topupInventory.surfaces || [])[0]
+          || { surfaceKey: 'root' };
+        const topupPacked = ClaudeLocal.ContextPacker.packContextForSurface({
+          context: claudeLocalCtx.context,
+          parsedPRD: null,
+          explorationArtifact: null,
+          corpusSeed: null,
+          corpusGuidance: null,
+          feedback: config.parentFeedback || '',
+          topupFocus: config.topupFocus || null,
+          surface: topupSurface,
+          projectPath: config.projectPath,
+        });
+        generationMeta.claudeSurfaceInventory = {
+          summary: topupInventory.summary,
+          surfaces: topupInventory.surfaces.map((s) => ({
+            surfaceKey: s.surfaceKey,
+            type: s.type,
+            label: s.label,
+            changed: s.changed,
+            routes: s.routes,
+            apiEndpoints: s.apiEndpoints,
+            forms: s.forms,
+            roles: s.roles,
+            sourceFiles: s.sourceFiles,
+            fingerprintHash: s.fingerprintHash,
+          })),
+          selectedSurfaceKeys: topupInventory.selectedSurfaces.map((s) => s.surfaceKey),
+          activeSurfaceKey: topupSurface.surfaceKey,
+          promptBudget: topupPacked.promptBudget,
+          topupMode: 'surface_delta',
+        };
+        claudeLocalCtx.surfaceKey = topupSurface.surfaceKey;
+        claudeLocalCtx.surfaceInventory = generationMeta.claudeSurfaceInventory;
+        const topupRegen = await ClaudeLocal.runClaudeGeneration({
+          context: topupPacked.context,
           projectPath: config.projectPath,
           testsDir: TierIsolation.ensureTierDirs(config.projectPath).tier1,
           prdContent: '',
-          parsedPRD: null,
-          explorationArtifact: null,
+          parsedPRD: topupPacked.parsedPRD || null,
+          explorationArtifact: topupPacked.explorationArtifact || null,
           roles: claudeLocalCtx.roles,
           projectInfo,
           runId,
           statusDir,
           client: topupAdapterClient,
           workspaceContext: workspaceState?.workspaceId ? { workspaceId: workspaceState.workspaceId } : null,
-          corpusSeed: null,
-          corpusGuidance: null,
+          corpusSeed: topupPacked.corpusSeed || null,
+          corpusGuidance: topupPacked.corpusGuidance || null,
           iterationNumber: seededIter,
-          feedback: config.parentFeedback || '',
+          feedback: topupPacked.feedback || config.parentFeedback || '',
           sessionId: config.parentSessionId,
+          surfaceKey: topupSurface.surfaceKey,
+          sessionMetadata: {
+            sourceSignature: topupSurface.fingerprintHash || null,
+            corpusVersion: config.topupFocus?.canonicalSuiteVersion || null,
+          },
           telemetryReporter,
           // CL3-D — focus areas shipped by /api/test-runs/[id]/topup
           topupFocus: config.topupFocus || null,
@@ -12153,6 +12340,8 @@ async function runPipeline(config, runId) {
         passRate,
         previousPassRate,
         iteration: claudeIteration,
+        totalTests: Number(testResults.total || 0),
+        executedTests: Number(testResults.total || 0),
         uncoveredAcTagsCount: uncoveredAcIds.length,
         previousUncoveredCount,
         totalAcTags,
@@ -12184,6 +12373,44 @@ async function runPipeline(config, runId) {
         passRate,
         decision: decision?.decision || decision,
       }, telemetryReporter);
+      if (durableClient && workspaceState?.workspaceId && typeof durableClient.recordQaGenerationIteration === 'function') {
+        const latestIterationMeta = Array.isArray(generationMeta?.iterations)
+          ? generationMeta.iterations.find((m) => Number(m?.iteration) === claudeIteration) || generationMeta.iterations[generationMeta.iterations.length - 1]
+          : null;
+        durableClient.recordQaGenerationIteration({
+          workspaceId: workspaceState.workspaceId,
+          testRunId: liveTestRunId || null,
+          runId,
+          projectKey: workspaceState?.identity?.projectKey
+            || corpusBootstrap?.workspaceContext?.projectKey
+            || projectInfo?.projectKey
+            || projectInfo?.name
+            || path.basename(config.projectPath),
+          surfaceKey: latestIterationMeta?.surfaceKey
+            || claudeLocalCtx?.surfaceKey
+            || generationMeta?.surfaceInventory?.activeSurfaceKey
+            || generationMeta?.claudeSurfaceInventory?.activeSurfaceKey
+            || 'root',
+          claudeSessionId,
+          promptHash: latestIterationMeta?.promptHash || null,
+          iteration: claudeIteration,
+          decision: decision?.decision || decision,
+          passRate,
+          acCoverageRatio: acCoverage?.ratio || 0,
+          skipCount: Number(testResults.skipped || 0),
+          failureBreakdown: testResults.failureBreakdown || null,
+          usage: latestIterationMeta?.usage || null,
+          costUsd: latestIterationMeta?.costUsd ?? null,
+          metadata: {
+            reason: decision?.reason || null,
+            uncoveredCount: uncoveredAcIds.length,
+            totalAcTags,
+            selfDone: claudeSelfDone,
+            promptTokenEstimate: latestIterationMeta?.promptTokenEstimate || null,
+            sessionResumeSource: latestIterationMeta?.sessionResumeSource || null,
+          },
+        }).catch(() => undefined);
+      }
 
       const verdict = decision?.decision || decision;
       claudeLocalFinalVerdict = verdict;
@@ -12209,26 +12436,45 @@ async function runPipeline(config, runId) {
         uncoveredAcTags: uncoveredAcIds,
       });
       const adapterClient = new WebappClient({ apiKey: process.env.HEALIX_API_KEY });
+      const activeSurface = (claudeLocalCtx?.surfaceInventory?.surfaces || [])
+        .find((s) => s.surfaceKey === claudeLocalCtx?.surfaceKey)
+        || { surfaceKey: claudeLocalCtx?.surfaceKey || 'root' };
+      const packedRegen = ClaudeLocal.ContextPacker.packContextForSurface({
+        context: claudeLocalCtx?.context || {},
+        parsedPRD: claudeLocalCtx?.parsedPRD || null,
+        explorationArtifact: claudeLocalCtx?.explorationArtifact || null,
+        corpusSeed: null,
+        corpusGuidance: null,
+        feedback,
+        topupFocus: config.topupFocus || null,
+        surface: activeSurface,
+        projectPath: config.projectPath,
+      });
       let reGen;
       try {
         reGen = await ClaudeLocal.runClaudeGeneration({
-          context: claudeLocalCtx?.context || {},
+          context: packedRegen.context || claudeLocalCtx?.context || {},
           projectPath: config.projectPath,
           testsDir: TierIsolation.ensureTierDirs(config.projectPath).tier1,
           prdContent: claudeLocalCtx?.prdContent || '',
-          parsedPRD: claudeLocalCtx?.parsedPRD || null,
-          explorationArtifact: claudeLocalCtx?.explorationArtifact || null,
+          parsedPRD: packedRegen.parsedPRD || claudeLocalCtx?.parsedPRD || null,
+          explorationArtifact: packedRegen.explorationArtifact || claudeLocalCtx?.explorationArtifact || null,
           roles: claudeLocalCtx?.roles || [],
           projectInfo,
           runId,
           statusDir,
           client: adapterClient,
           workspaceContext: workspaceState?.workspaceId ? { workspaceId: workspaceState.workspaceId } : null,
-          corpusSeed: null,
-          corpusGuidance: null,
+          corpusSeed: packedRegen.corpusSeed || null,
+          corpusGuidance: packedRegen.corpusGuidance || null,
           iterationNumber: claudeIteration + 1,
-          feedback,
+          feedback: packedRegen.feedback || feedback,
           sessionId: claudeSessionId,
+          surfaceKey: activeSurface.surfaceKey || 'root',
+          sessionMetadata: {
+            sourceSignature: activeSurface.fingerprintHash || null,
+            corpusVersion: corpusBootstrap?.corpusSeed?.version || corpusBootstrap?.corpusSeed?.canonicalVersion || null,
+          },
           telemetryReporter,
           // CL3-D — propagate top-up focus across iterations of a top-up run.
           topupFocus: config.topupFocus || null,
@@ -12283,6 +12529,9 @@ async function runPipeline(config, runId) {
     if (claudeLocalFinalVerdict === 'stop_qa_cycle_complete') {
       generationMeta = generationMeta || {};
       generationMeta.runStatus = 'qa_cycle_complete';
+    } else if (claudeLocalFinalVerdict === 'stop_coverage_degraded') {
+      generationMeta = generationMeta || {};
+      generationMeta.runStatus = 'coverage_degraded';
     }
 
     // WS-5: when the iteration loop did not run (saas, or no claude-local
@@ -13134,6 +13383,7 @@ module.exports = {
   shouldAttemptCoverageTopUp,
   isRepairableGenerationFailure,
   collectGenerationQuality,
+  quarantineHardcodedBaseUrlMismatchFiles,
   buildExistingSuiteManifest,
   buildFailedAgentRetryMetadata,
   buildCoverageRetryMetadata,

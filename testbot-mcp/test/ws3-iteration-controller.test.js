@@ -51,13 +51,27 @@ test('WS-3: stop_aborted still wins over selfDone', () => {
   assert.equal(r.decision, 'stop_aborted');
 });
 
-test('WS-3: iteration >= maxIterations returns stop_max_iterations (default cap = 5)', () => {
+test('Claude hardening: iteration cap with useful tests returns coverage_degraded', () => {
   const r = IC.decide({
     passRate: 0.9,
     iteration: 5,
     totalAcTags: 20,
     uncoveredAcTagsCount: 5,
     previousPassRate: 0.85,
+    totalTests: 20,
+  });
+  assert.equal(r.decision, 'stop_coverage_degraded');
+});
+
+test('WS-3: iteration cap can still return stop_max_iterations when coverage-degraded is disabled', () => {
+  const r = IC.decide({
+    passRate: 0.9,
+    iteration: 5,
+    totalAcTags: 20,
+    uncoveredAcTagsCount: 5,
+    previousPassRate: 0.85,
+    totalTests: 20,
+    allowCoverageDegraded: false,
   });
   assert.equal(r.decision, 'stop_max_iterations');
 });
@@ -134,6 +148,7 @@ test('WS-3: HEALIX_CLAUDE_MAX_ITERATIONS env var overrides default cap', () => {
       uncoveredAcTagsCount: 10,
       previousPassRate: 0.4,
       previousUncoveredCount: 12,
+      allowCoverageDegraded: false,
     });
     assert.equal(r.decision, 'stop_max_iterations');
   } finally {
