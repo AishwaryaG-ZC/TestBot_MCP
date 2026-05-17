@@ -52,26 +52,26 @@ function baseArgs(overrides = {}) {
   };
 }
 
-test('WS-5 prompt: AC tagging directive header is present in the task brief', () => {
+test('WS-5 prompt: AC tagging rule is delegated to the Claude skill', () => {
   const md = PromptBuilder.buildPrompt(baseArgs());
-  assert.ok(md.includes('AC tagging requirement (CRITICAL)'), 'directive header missing');
-  assert.ok(md.includes('[REQ:F<feature>.S<story>.AC<num>]'), 'format example missing');
+  assert.ok(md.includes('healix-qa-engineer'), 'skill invocation missing');
+  assert.ok(md.includes('ac-tagging.md'), 'skill AC-tagging file reference missing');
+  assert.ok(md.includes('DONE protocol'), 'DONE protocol reference missing');
 });
 
-test('WS-5 prompt: AC checklist lists all 5 canonical IDs from the parsed PRD', () => {
+test('WS-5 prompt: compact AC preview lists all 5 canonical IDs from the parsed PRD', () => {
   const md = PromptBuilder.buildPrompt(baseArgs());
-  assert.ok(md.includes('## Acceptance criteria to cover'), 'checklist header missing');
+  assert.ok(md.includes('## Acceptance criteria preview'), 'AC preview header missing');
   for (const id of ['F1.S1.AC1', 'F1.S1.AC2', 'F1.S1.AC3', 'F2.S1.AC1', 'F2.S1.AC2']) {
-    assert.ok(md.includes(`- [ ] ${id}`), `missing checklist entry for ${id}`);
+    assert.ok(md.includes(id), `missing AC preview entry for ${id}`);
   }
 });
 
-test('WS-5 prompt: AC checklist is suppressed when parsedPRD has no features', () => {
+test('WS-5 prompt: AC preview shows empty state when parsedPRD has no features', () => {
   const md = PromptBuilder.buildPrompt(baseArgs({ parsedPRD: { features: [] } }));
-  assert.equal(md.includes('## Acceptance criteria to cover'), false);
-  // The directive is still present — it lives in the task brief and is
-  // independent of having a structured PRD.
-  assert.ok(md.includes('AC tagging requirement (CRITICAL)'));
+  assert.ok(md.includes('## Acceptance criteria preview'));
+  assert.ok(md.includes('(no structured acceptance criteria parsed'));
+  assert.ok(md.includes('ac-tagging.md'));
 });
 
 test('WS-5 prompt: collectAcIdsFromPRD returns canonical IDs', () => {

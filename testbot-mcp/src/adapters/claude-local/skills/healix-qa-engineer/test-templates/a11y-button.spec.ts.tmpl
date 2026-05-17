@@ -1,0 +1,8 @@
+import { test, expect } from '@playwright/test';
+
+test('[REQ:F1.S1.AC1] interactive controls have accessible names', async ({ page }) => {
+  await page.goto('/');
+  for (const button of await page.getByRole('button').all()) {
+    await expect(button).toHaveAccessibleName();
+  }
+});

@@ -43,6 +43,8 @@ const DEFAULT_EFFORT = process.env.HEALIX_CLAUDE_EFFORT || 'medium';
  * @param {string} [args.model]             - --model override (default: env HEALIX_CLAUDE_MODEL → 'claude-sonnet-4-6')
  * @param {string} [args.effort]            - --effort override (default: env HEALIX_CLAUDE_EFFORT → 'medium')
  * @param {object} [args.env]               - env override
+ * @param {string} [args.systemPrompt]      - --append-system-prompt inline text
+ * @param {string} [args.systemPromptFile]  - --append-system-prompt-file path
  * @param {function} [args.spawnFn]         - test-injection hook
  * @param {function} [args.onEvent]         - shortcut: forwarded onto parser 'event'
  * @returns {{
@@ -61,6 +63,8 @@ function spawnClaude(args = {}) {
     model = DEFAULT_MODEL,
     effort = DEFAULT_EFFORT,
     env,
+    systemPrompt,
+    systemPromptFile,
     spawnFn = spawn,
     onEvent,
   } = args;
@@ -84,6 +88,11 @@ function spawnClaude(args = {}) {
   }
   if (effort) {
     cliArgs.push('--effort', effort);
+  }
+  if (systemPromptFile) {
+    cliArgs.push('--append-system-prompt-file', systemPromptFile);
+  } else if (systemPrompt) {
+    cliArgs.push('--append-system-prompt', systemPrompt);
   }
   if (mcpConfigPath) {
     cliArgs.push('--mcp-config', mcpConfigPath);

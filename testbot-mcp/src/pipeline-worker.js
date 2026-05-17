@@ -9093,16 +9093,24 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     const primarySurface = (surfaceInventory.selectedSurfaces || [])[0]
       || (surfaceInventory.surfaces || [])[0]
       || { surfaceKey: 'root', label: 'Root QA generation' };
-    const packed = ClaudeLocal.ContextPacker.packContextForSurface({
+    const packSurface = (surface) => ClaudeLocal.ContextPacker.packContextForSurface({
       context: generationContext,
+      prdContent: prdContent || '',
       parsedPRD: parsedPRD || null,
       explorationArtifact: explorationArtifact || null,
+      roles: roles || [],
       corpusSeed: corpusBootstrap?.corpusSeed || null,
       corpusGuidance: corpusGuidance || null,
       feedback: null,
       topupFocus: config.topupFocus || null,
-      surface: primarySurface,
+      surface,
       projectPath: config.projectPath,
+      runId,
+    });
+    const packed = packSurface(primarySurface);
+    const fanoutPlan = ClaudeLocal.SurfaceInventory.planClaudeFanout({
+      surfaceInventory,
+      primaryPromptTokens: packed.promptBudget?.estimatedTokens || packed.promptBudget?.tokens || 0,
     });
     generationMeta.claudeSurfaceInventory = {
       summary: surfaceInventory.summary,
@@ -9119,9 +9127,28 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         sourceFiles: s.sourceFiles,
         fingerprintHash: s.fingerprintHash,
       })),
-      selectedSurfaceKeys: surfaceInventory.selectedSurfaces.map((s) => s.surfaceKey),
-      activeSurfaceKey: primarySurface.surfaceKey,
+      selectedSurfaceKeys: fanoutPlan.surfaces.map((s) => s.surfaceKey),
+      activeSurfaceKey: fanoutPlan.surfaces[0]?.surfaceKey || primarySurface.surfaceKey,
       promptBudget: packed.promptBudget,
+      fanout: {
+        enabled: fanoutPlan.fanout,
+        reason: fanoutPlan.reason,
+        tokenThreshold: fanoutPlan.tokenThreshold,
+        primaryPromptTokens: fanoutPlan.primaryPromptTokens,
+        concurrency: Number.parseInt(process.env.HEALIX_CLAUDE_SHARD_CONCURRENCY || '', 10) || 1,
+        surfaces: fanoutPlan.surfaces.map((s) => ({
+          surfaceKey: s.surfaceKey,
+          type: s.type,
+          label: s.label,
+          specialistRole: s.specialistRole,
+          fingerprintHash: s.fingerprintHash,
+        })),
+      },
+      contextArtifacts: packed.contextArtifacts ? {
+        root: packed.contextArtifacts.root,
+        bytes: packed.contextArtifacts.bytes,
+        files: packed.contextArtifacts.relativeFiles || packed.contextArtifacts.files,
+      } : null,
     };
     if (statusDir) {
       recordRunDecision(statusDir, telemetryReporter, {
@@ -9129,80 +9156,131 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         decisionType: 'claude_surface_inventory',
         phase: 'generation_surface_inventory',
         status: 'info',
-        message: `Prepared ${surfaceInventory.summary.totalSurfaces} Claude surface shard(s); active shard ${primarySurface.surfaceKey}.`,
+        message: `Prepared ${surfaceInventory.summary.totalSurfaces} Claude surface shard(s); selected ${fanoutPlan.surfaces.length} shard(s).`,
         metadata: generationMeta.claudeSurfaceInventory,
       });
     }
 
     const adapterClient = new WebappClient({ apiKey: process.env.HEALIX_API_KEY });
-    const claudeResult = await ClaudeLocal.runClaudeGeneration({
-      context: packed.context,
-      projectPath: config.projectPath,
-      testsDir: tier1Dir,
-      prdContent: prdContent || '',
-      parsedPRD: packed.parsedPRD || parsedPRD || null,
-      explorationArtifact: packed.explorationArtifact || explorationArtifact || null,
-      roles: roles || [],
-      projectInfo,
-      runId,
-      statusDir,
-      client: adapterClient,
-      workspaceContext: corpusBootstrap?.workspaceContext || null,
-      corpusSeed: packed.corpusSeed || corpusBootstrap?.corpusSeed || null,
-      corpusGuidance: packed.corpusGuidance || corpusGuidance || null,
-      iterationNumber: 1,
-      feedback: null,
-      sessionId: null,
-      surfaceKey: primarySurface.surfaceKey,
-      sessionMetadata: {
-        sourceSignature: primarySurface.fingerprintHash || null,
-        prdSignature: null,
-        corpusVersion: corpusBootstrap?.corpusSeed?.version || corpusBootstrap?.corpusSeed?.canonicalVersion || null,
-      },
-      telemetryReporter,
-    });
+    const shardResults = [];
+    const shardFailures = [];
+    for (let shardIndex = 0; shardIndex < fanoutPlan.surfaces.length; shardIndex += 1) {
+      const shardSurface = fanoutPlan.surfaces[shardIndex];
+      const shardPacked = shardSurface.surfaceKey === primarySurface.surfaceKey ? packed : packSurface(shardSurface);
+      let shardResult;
+      try {
+        shardResult = await ClaudeLocal.runClaudeGeneration({
+          context: shardPacked.context,
+          projectPath: config.projectPath,
+          testsDir: tier1Dir,
+          prdContent: prdContent || '',
+          parsedPRD: shardPacked.parsedPRD || parsedPRD || null,
+          explorationArtifact: shardPacked.explorationArtifact || explorationArtifact || null,
+          roles: roles || [],
+          projectInfo,
+          runId,
+          statusDir,
+          client: adapterClient,
+          workspaceContext: corpusBootstrap?.workspaceContext || null,
+          corpusSeed: shardPacked.corpusSeed || corpusBootstrap?.corpusSeed || null,
+          corpusGuidance: shardPacked.corpusGuidance || corpusGuidance || null,
+          iterationNumber: 1,
+          feedback: null,
+          sessionId: null,
+          surfaceKey: shardSurface.surfaceKey,
+          contextArtifacts: shardPacked.contextArtifacts || null,
+          compactSummary: shardPacked.compactSummary || null,
+          promptBudget: shardPacked.promptBudget || null,
+          sessionMetadata: {
+            surface: shardSurface,
+            specialistRole: shardSurface.specialistRole || null,
+            shardIndex,
+            shardCount: fanoutPlan.surfaces.length,
+            sourceSignature: shardSurface.fingerprintHash || null,
+            prdSignature: null,
+            corpusVersion: corpusBootstrap?.corpusSeed?.version || corpusBootstrap?.corpusSeed?.canonicalVersion || null,
+          },
+          telemetryReporter,
+        });
+      } catch (err) {
+        if (err?.code === 'CLAUDE_LOGIN_REQUIRED' || err?.code === 'CLAUDE_AWAITING_USER_QUESTION') throw err;
+        const failure = {
+          surfaceKey: shardSurface.surfaceKey,
+          specialistRole: shardSurface.specialistRole || null,
+          code: err?.code || 'CLAUDE_SHARD_FAILED',
+          message: normalizeErrorText(err?.message || err),
+        };
+        shardFailures.push(failure);
+        Logger.warn('PipelineWorker', 'Claude shard failed; continuing with remaining shards and Tier-0', failure);
+        if (statusDir) {
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'claude_shard_decision',
+            phase: 'generation_claude_shard',
+            status: 'warning',
+            message: `Claude shard ${shardSurface.surfaceKey} failed; continuing with retained shards/Tier-0.`,
+            metadata: failure,
+          });
+        }
+        continue;
+      }
 
-    if (claudeResult.status === 'awaiting_user_login') {
-      const err = new Error(`Claude Code login required: ${claudeResult.reason || 'unknown'}`);
-      err.code = 'CLAUDE_LOGIN_REQUIRED';
-      err.adapterResult = claudeResult;
-      throw err;
+      if (shardResult.status === 'awaiting_user_login') {
+        const err = new Error(`Claude Code login required: ${shardResult.reason || 'unknown'}`);
+        err.code = 'CLAUDE_LOGIN_REQUIRED';
+        err.adapterResult = shardResult;
+        throw err;
+      }
+      if (shardResult.status === 'awaiting_user_question') {
+        // Surface upward — the worker's post-execute iteration loop will block
+        // on the answer poll, NOT generateWithFallbackChain. For now we treat
+        // it as a soft pause that produced zero files; the outer iteration
+        // loop reinvokes once the answer comes in.
+        const err = new Error('Claude pipeline paused on awaiting_user_question');
+        err.code = 'CLAUDE_AWAITING_USER_QUESTION';
+        err.adapterResult = shardResult;
+        throw err;
+      }
+      shardResults.push(shardResult);
     }
-    if (claudeResult.status === 'awaiting_user_question') {
-      // Surface upward — the worker's post-execute iteration loop will block
-      // on the answer poll, NOT generateWithFallbackChain. For now we treat
-      // it as a soft pause that produced zero files; the outer iteration
-      // loop reinvokes once the answer comes in.
-      const err = new Error('Claude pipeline paused on awaiting_user_question');
-      err.code = 'CLAUDE_AWAITING_USER_QUESTION';
-      err.adapterResult = claudeResult;
-      throw err;
+    if (shardFailures.length > 0) {
+      generationMeta.claudeSurfaceInventory.shardFailures = shardFailures;
     }
 
     // Synchronise legacy view (tests/generated) so validation + execution see
     // both Tier-0 + Tier-1 files in one directory.
     try { TierIsolation.syncLegacyView(config.projectPath, { clear: false }); } catch { /* best-effort */ }
 
+    const generated = shardResults.reduce((sum, result) => sum + Number(result.generated || 0), 0);
+    const files = shardResults.flatMap((result) => Array.isArray(result.files) ? result.files : []);
+    const lastSessionId = [...shardResults].reverse().find((result) => result.sessionId)?.sessionId || null;
+    const usage = shardResults.length === 1
+      ? shardResults[0]?.usage
+      : shardResults.map((result) => result.usage).filter(Boolean);
+    const summary = shardResults.map((result) => result.summary).filter(Boolean).join('\n\n');
+    const selfDone = shardResults.some((result) => result.selfDone === true);
+
     return {
-      generated: claudeResult.generated,
-      files: claudeResult.files,
+      generated,
+      files,
       provider: 'claude-local',
-      claudeSessionId: claudeResult.sessionId,
-      claudeUsage: claudeResult.usage,
-      claudeSummary: claudeResult.summary,
+      claudeSessionId: lastSessionId,
+      claudeUsage: usage,
+      claudeSummary: summary,
       // WS-3: surface Claude's self-DONE marker so the iteration loop in the
       // pipeline-worker can short-circuit on the very first controller call.
-      claudeSelfDone: claudeResult.selfDone === true,
+      claudeSelfDone: selfDone,
       generationMeta: {
         provider: 'claude-local',
         selectedGenerator: 'claude-local',
-        iterations: [claudeResult.generationMeta],
+        iterations: shardResults.map((result) => result.generationMeta).filter(Boolean),
         surfaceInventory: generationMeta.claudeSurfaceInventory,
-        selfDone: claudeResult.selfDone === true,
+        shardFailures,
+        selfDone,
         // CL2-B — top-level mirror of the session id so the topup route can
         // grab it from `report.generationMeta.claudeSessionId` without
         // walking iterations[].
-        claudeSessionId: claudeResult.sessionId || null,
+        claudeSessionId: lastSessionId,
       },
     };
   };
@@ -12131,14 +12209,17 @@ async function runPipeline(config, runId) {
           || { surfaceKey: 'root' };
         const topupPacked = ClaudeLocal.ContextPacker.packContextForSurface({
           context: claudeLocalCtx.context,
+          prdContent: '',
           parsedPRD: null,
           explorationArtifact: null,
+          roles: claudeLocalCtx.roles,
           corpusSeed: null,
           corpusGuidance: null,
           feedback: config.parentFeedback || '',
           topupFocus: config.topupFocus || null,
           surface: topupSurface,
           projectPath: config.projectPath,
+          runId,
         });
         generationMeta.claudeSurfaceInventory = {
           summary: topupInventory.summary,
@@ -12157,6 +12238,11 @@ async function runPipeline(config, runId) {
           selectedSurfaceKeys: topupInventory.selectedSurfaces.map((s) => s.surfaceKey),
           activeSurfaceKey: topupSurface.surfaceKey,
           promptBudget: topupPacked.promptBudget,
+          contextArtifacts: topupPacked.contextArtifacts ? {
+            root: topupPacked.contextArtifacts.root,
+            bytes: topupPacked.contextArtifacts.bytes,
+            files: topupPacked.contextArtifacts.relativeFiles || topupPacked.contextArtifacts.files,
+          } : null,
           topupMode: 'surface_delta',
         };
         claudeLocalCtx.surfaceKey = topupSurface.surfaceKey;
@@ -12180,7 +12266,11 @@ async function runPipeline(config, runId) {
           feedback: topupPacked.feedback || config.parentFeedback || '',
           sessionId: config.parentSessionId,
           surfaceKey: topupSurface.surfaceKey,
+          contextArtifacts: topupPacked.contextArtifacts || null,
+          compactSummary: topupPacked.compactSummary || null,
+          promptBudget: topupPacked.promptBudget || null,
           sessionMetadata: {
+            surface: topupSurface,
             sourceSignature: topupSurface.fingerprintHash || null,
             corpusVersion: config.topupFocus?.canonicalSuiteVersion || null,
           },
@@ -12441,14 +12531,17 @@ async function runPipeline(config, runId) {
         || { surfaceKey: claudeLocalCtx?.surfaceKey || 'root' };
       const packedRegen = ClaudeLocal.ContextPacker.packContextForSurface({
         context: claudeLocalCtx?.context || {},
+        prdContent: claudeLocalCtx?.prdContent || '',
         parsedPRD: claudeLocalCtx?.parsedPRD || null,
         explorationArtifact: claudeLocalCtx?.explorationArtifact || null,
+        roles: claudeLocalCtx?.roles || [],
         corpusSeed: null,
         corpusGuidance: null,
         feedback,
         topupFocus: config.topupFocus || null,
         surface: activeSurface,
         projectPath: config.projectPath,
+        runId,
       });
       let reGen;
       try {
@@ -12471,7 +12564,11 @@ async function runPipeline(config, runId) {
           feedback: packedRegen.feedback || feedback,
           sessionId: claudeSessionId,
           surfaceKey: activeSurface.surfaceKey || 'root',
+          contextArtifacts: packedRegen.contextArtifacts || null,
+          compactSummary: packedRegen.compactSummary || null,
+          promptBudget: packedRegen.promptBudget || null,
           sessionMetadata: {
+            surface: activeSurface,
             sourceSignature: activeSurface.fingerprintHash || null,
             corpusVersion: corpusBootstrap?.corpusSeed?.version || corpusBootstrap?.corpusSeed?.canonicalVersion || null,
           },

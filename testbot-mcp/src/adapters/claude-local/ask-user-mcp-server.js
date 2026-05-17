@@ -53,17 +53,11 @@ async function main() {
     'ask_user_question',
     {
       title: 'Ask the human a clarifying question',
-      description: [
-        'Ask the human a clarifying question. Use ONLY when truly stuck —',
-        'auth ambiguity, RBAC edge case, missing fixture, or you cannot decide',
-        'between two equally valid AC interpretations. Returns the user\'s typed',
-        'answer as a string. Do NOT use for trivial preferences or stylistic',
-        'choices — proceed with a sensible default instead.',
-      ].join(' '),
+      description: 'Ask only for blocking QA ambiguity; returns the human answer.',
       inputSchema: {
-        question: z.string().describe('The clarifying question, phrased plainly for a human reader.'),
-        options: z.array(z.string()).optional().describe('Optional multiple-choice answers; if omitted the user types free-text.'),
-        confidence: z.number().min(0).max(1).optional().describe('Your prior confidence in the default decision, 0–1. Lower means you really need help.'),
+        question: z.string().describe('Plain question.'),
+        options: z.array(z.string()).optional().describe('Optional choices.'),
+        confidence: z.number().min(0).max(1).optional().describe('0-1 default confidence.'),
       },
     },
     async ({ question, options, confidence }) => {

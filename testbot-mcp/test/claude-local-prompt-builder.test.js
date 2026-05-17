@@ -60,16 +60,19 @@ test('prompt builder renders all required sections in the load-bearing order', (
   const md = PromptBuilder.buildPrompt(baseArgs());
 
   const sections = [
+    'Skill',
     'Working directory + output path',
     'Project info',
     'Roles + auth',
-    'PRD (full)',
-    'Acceptance criteria',
-    'Routes + UI',
-    'API endpoints + schemas',
-    'Workflows',
+    'Context manifest',
+    'Surface focus',
+    'Acceptance criteria preview',
+    'PRD (fallback compact)',
+    'Routes + UI (fallback compact)',
+    'API endpoints + schemas (fallback compact)',
     'Existing corpus state',
     'Tier-0 invariants already covered',
+    'Iteration delta',
     'Task brief',
   ];
   let cursor = 0;
@@ -94,6 +97,15 @@ test('prompt builder includes Playwright import + storageState guidance', () => 
   assert.ok(md.includes("import { test, expect } from '@playwright/test'"));
   assert.ok(md.includes('test.use({ storageState'));
   assert.ok(md.includes('test.describe()'));
+});
+
+test('prompt builder invokes the healix skill instead of embedding bulky rule blocks', () => {
+  const md = PromptBuilder.buildPrompt(baseArgs());
+  assert.ok(md.includes('healix-qa-engineer'));
+  assert.ok(md.includes('grounding-rules.md'));
+  assert.equal(md.includes('## Anti-patterns — NEVER write these'), false);
+  assert.equal(md.includes('## Grounding rules (every assertion must be backed by truth)'), false);
+  assert.equal(md.includes('The role credentials list above is the source of truth'), false);
 });
 
 test('prompt builder lists verified roles + storageState paths', () => {
@@ -159,4 +171,39 @@ test('prompt builder gracefully handles empty/missing context', () => {
   assert.ok(md.includes('## Task brief'));
   assert.ok(md.includes('(no PRD content provided)'));
   assert.ok(md.includes('(no authenticated roles available'));
+});
+
+test('buildPromptWithMetadata keeps stable prefix stable while feedback changes delta tail', () => {
+  const one = PromptBuilder.buildPromptWithMetadata(baseArgs({
+    iterationNumber: 1,
+    feedback: null,
+  }));
+  const two = PromptBuilder.buildPromptWithMetadata(baseArgs({
+    iterationNumber: 2,
+    feedback: {
+      iteration: 2,
+      failedTests: [{ file: 'cart.spec.ts', title: 'checkout', errorMessage: 'Timed out' }],
+      uncoveredAcTags: ['F2.S1.AC1'],
+    },
+  }));
+  assert.equal(one.stablePrefix, two.stablePrefix);
+  assert.notEqual(one.deltaTail, two.deltaTail);
+  assert.ok(one.stablePrefixTokens > 0);
+  assert.ok(two.deltaTokens > one.deltaTokens);
+});
+
+test('prompt builder omits loaded context bodies on resumed iterations 2-3', () => {
+  const md = PromptBuilder.buildPrompt(baseArgs({
+    omitLoadedContext: true,
+    contextArtifacts: {
+      root: '/tmp/example-app/.healix/context/run/ui-login',
+      files: { 'prd.md': '/tmp/example-app/.healix/context/run/ui-login/prd.md' },
+      relativeFiles: { 'prd.md': '.healix/context/run/ui-login/prd.md' },
+      bytes: 1200,
+    },
+    prdContent: '# PRD\n\nThis full PRD body should not be repeated on resume.',
+  }));
+  assert.ok(md.includes('bulk context were already loaded earlier in the session'));
+  assert.ok(md.includes('prd.md'));
+  assert.equal(md.includes('This full PRD body should not be repeated on resume.'), false);
 });

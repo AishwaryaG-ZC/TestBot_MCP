@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 
 const DEFAULT_MAX_SHARDS = 8;
+const DEFAULT_FANOUT_TOKEN_THRESHOLD = 60_000;
 
 function sha(value) {
   return crypto.createHash('sha256').update(String(value || '')).digest('hex');
@@ -365,12 +366,55 @@ function priority(type) {
   return 4;
 }
 
+function specialistRoleForSurface(surface) {
+  if (surface?.type === 'api') return 'api-contract';
+  if (surface?.type === 'rbac') return 'rbac-auth';
+  if (surface?.type === 'form') return 'workflow-uat';
+  if (surface?.type === 'ui') return 'ui-a11y';
+  return 'workflow-uat';
+}
+
+function planClaudeFanout({
+  surfaceInventory,
+  primaryPromptTokens = 0,
+  mode = process.env.HEALIX_CLAUDE_FANOUT_MODE || 'auto',
+  tokenThreshold = DEFAULT_FANOUT_TOKEN_THRESHOLD,
+} = {}) {
+  const selected = Array.isArray(surfaceInventory?.selectedSurfaces) && surfaceInventory.selectedSurfaces.length
+    ? surfaceInventory.selectedSurfaces
+    : Array.isArray(surfaceInventory?.surfaces) ? surfaceInventory.surfaces : [];
+  if (!selected.length) {
+    return { fanout: false, reason: 'no_surfaces', surfaces: [{ surfaceKey: 'root', specialistRole: 'workflow-uat' }] };
+  }
+  const normalizedMode = String(mode || 'auto').toLowerCase();
+  if (normalizedMode === 'off') {
+    return { fanout: false, reason: 'disabled', surfaces: [{ ...selected[0], specialistRole: specialistRoleForSurface(selected[0]) }] };
+  }
+  const shouldFanout = normalizedMode === 'always'
+    || selected.length > 3
+    || Number(primaryPromptTokens || 0) > tokenThreshold;
+  const chosen = shouldFanout ? selected : selected.slice(0, 1);
+  return {
+    fanout: shouldFanout,
+    reason: shouldFanout
+      ? (selected.length > 3 ? 'surface_count' : Number(primaryPromptTokens || 0) > tokenThreshold ? 'token_budget' : 'forced')
+      : 'single_surface',
+    tokenThreshold,
+    primaryPromptTokens,
+    surfaces: chosen.map((surface) => ({
+      ...surface,
+      specialistRole: specialistRoleForSurface(surface),
+    })),
+  };
+}
+
 module.exports = {
   buildSurfaceInventory,
+  planClaudeFanout,
   normalizeRoute,
   normalizeEndpoint,
   isArtifactFile,
   stableJson,
   sha,
-  _internals: { collectAcIds, routeFromFile, sourceFilesFrom },
+  _internals: { collectAcIds, routeFromFile, sourceFilesFrom, specialistRoleForSurface },
 };

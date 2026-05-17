@@ -26,6 +26,9 @@ const PromptBuilder = require('./prompt-builder');
 const Exec = require('./exec');
 const Session = require('./session');
 const AskUser = require('./ask-user');
+const ContextPacker = require('./context-packer');
+const SkillInstaller = require('./skill-installer');
+const SystemPrompt = require('./system-prompt');
 
 const DEFAULT_MODEL = process.env.HEALIX_CLAUDE_MODEL || 'claude-sonnet-4-6';
 const DEFAULT_EFFORT = process.env.HEALIX_CLAUDE_EFFORT || 'medium';
@@ -79,6 +82,22 @@ function _resolveProjectKey({ workspaceContext, projectInfo, projectPath }) {
   return 'unknown';
 }
 
+function _feedbackHasBlockingAmbiguity(feedback) {
+  if (!feedback) return false;
+  const text = typeof feedback === 'string' ? feedback : JSON.stringify(feedback || {});
+  return /\b(ambig|clarif|question|rbac|auth|role|fixture|blocked|cannot decide|needs user)\b/i.test(text);
+}
+
+function _shouldMountAskUserMcp({ iterationNumber, feedback, env = process.env } = {}) {
+  const min = Number.parseInt(env.HEALIX_CLAUDE_ASK_USER_MCP_MIN_ITERATION || '2', 10);
+  const threshold = Number.isFinite(min) && min > 0 ? min : 2;
+  if (env.HEALIX_CLAUDE_ASK_USER_MCP === 'always') return { mount: true, reason: 'forced_always' };
+  if (env.HEALIX_CLAUDE_ASK_USER_MCP === 'off') return { mount: false, reason: 'disabled' };
+  if (_feedbackHasBlockingAmbiguity(feedback)) return { mount: true, reason: 'blocking_ambiguity_feedback' };
+  if ((iterationNumber || 1) >= threshold) return { mount: true, reason: `iteration_${iterationNumber}_gte_${threshold}` };
+  return { mount: false, reason: 'early_iteration_no_ambiguity' };
+}
+
 /**
  * Inspect a tool_use input payload (Write / Edit) and pull out the absolute
  * file path it targets. Returns null for unknown shapes.
@@ -116,6 +135,9 @@ async function runClaudeGeneration(args = {}) {
     topupFocus = null,
     surfaceKey = 'root',
     sessionMetadata = null,
+    contextArtifacts: suppliedContextArtifacts = null,
+    compactSummary: suppliedCompactSummary = null,
+    promptBudget: suppliedPromptBudget = null,
     model = DEFAULT_MODEL,
     effort = DEFAULT_EFFORT,
     // ── Test-injection seams ────────────────────────────────────────────────
@@ -176,6 +198,19 @@ async function runClaudeGeneration(args = {}) {
       _safeReportPhase(client, { runId, phase: 'awaiting_user_login', metadata: { reason: 'logged_out', loginUrl: pf.loginUrl || null, message: pf.message } });
       return { status: 'awaiting_user_login', loginUrl: pf.loginUrl || null, reason: 'logged_out' };
     }
+  }
+
+  let skillMeta;
+  try {
+    skillMeta = SkillInstaller.installHealixSkill();
+  } catch (err) {
+    Logger.warn('ClaudeLocal/Index', 'Healix skill installation failed (non-blocking)', { message: err?.message });
+    skillMeta = {
+      skillInstalled: false,
+      skillName: SkillInstaller.SKILL_NAME,
+      skillVersion: SkillInstaller.SKILL_VERSION,
+      reason: err?.message || 'install_failed',
+    };
   }
 
   // ── 2. Session resume resolution ────────────────────────────────────────
@@ -245,8 +280,33 @@ async function runClaudeGeneration(args = {}) {
     }
   }
 
-  // ── 3. Prompt build ─────────────────────────────────────────────────────
-  const prompt = PromptBuilder.buildPrompt({
+  // ── 3. Context artifact + prompt build ──────────────────────────────────
+  const surfaceFocus = sessionMetadata?.surface || { surfaceKey };
+  const contextArtifacts = suppliedContextArtifacts || ContextPacker.writeContextArtifacts({
+    projectPath,
+    runId,
+    surface: surfaceFocus,
+    context,
+    parsedPRD,
+    prdContent,
+    explorationArtifact,
+    roles,
+    corpusSeed,
+    corpusGuidance,
+    feedback,
+    sourcePreviews: [],
+  });
+  const compactSummary = suppliedCompactSummary || ContextPacker._internals.compactContextSummary({
+    context,
+    parsedPRD,
+    explorationArtifact,
+    roles,
+    corpusSeed,
+    corpusGuidance,
+    surface: surfaceFocus,
+  });
+  const omitLoadedContext = Boolean(sessionId && iterationNumber >= 2 && iterationNumber <= 3);
+  const promptParts = PromptBuilder.buildPromptWithMetadata({
     context,
     projectPath,
     testsDir,
@@ -260,15 +320,26 @@ async function runClaudeGeneration(args = {}) {
     feedback,
     iterationNumber,
     topupFocus,
+    contextArtifacts,
+    compactSummary,
+    skill: skillMeta,
+    omitLoadedContext,
   });
+  const prompt = promptParts.prompt;
   const promptTokenEstimate = PromptBuilder.estimatePromptTokens(prompt);
   const promptHash = _sha(prompt);
+  const stablePrefixHash = _sha(promptParts.stablePrefix);
+  const deltaHash = _sha(promptParts.deltaTail);
+  const contextArtifactBytes = contextArtifacts?.bytes || 0;
   Logger.info('ClaudeLocal/Index', 'Built prompt', {
     iteration: iterationNumber,
     surfaceKey,
     chars: prompt.length,
     tokensEstimate: promptTokenEstimate,
     promptHash,
+    stablePrefixHash,
+    deltaHash,
+    contextArtifactBytes,
   });
 
   _writeStatus({
@@ -282,6 +353,10 @@ async function runClaudeGeneration(args = {}) {
       promptBytes: prompt.length,
       tokensEstimate: promptTokenEstimate,
       promptHash,
+      stablePrefixHash,
+      deltaHash,
+      contextArtifactBytes,
+      cacheFriendlyPrefix: true,
       sessionId,
       sessionResumeSource,
     },
@@ -291,17 +366,24 @@ async function runClaudeGeneration(args = {}) {
   // ── 4. MCP config (ask-user injection) ─────────────────────────────────
   let mcpConfigPath = null;
   let mcpCleanup = () => {};
+  const askUserMcp = _shouldMountAskUserMcp({ iterationNumber, feedback });
   try {
-    const cfg = _writeMcpConfig({
-      runId,
-      apiUrl: client?.dashboardUrl || process.env.HEALIX_API_URL || null,
-      apiKey: client?.apiKey || process.env.HEALIX_API_KEY || null,
-    });
-    mcpConfigPath = cfg.configPath;
-    mcpCleanup = cfg.cleanup;
+    if (askUserMcp.mount) {
+      const cfg = _writeMcpConfig({
+        runId,
+        apiUrl: client?.dashboardUrl || process.env.HEALIX_API_URL || null,
+        apiKey: client?.apiKey || process.env.HEALIX_API_KEY || null,
+      });
+      mcpConfigPath = cfg.configPath;
+      mcpCleanup = cfg.cleanup;
+    }
   } catch (err) {
     Logger.warn('ClaudeLocal/Index', 'Failed to write ask-user MCP config — continuing without it', { message: err?.message });
   }
+
+  const systemPromptOption = SystemPrompt.prepareSystemPromptOption({
+    binary: _binary || 'claude',
+  });
 
   // ── 5. Spawn + stream-parse ────────────────────────────────────────────
   const filesEdited = new Map(); // absPath -> { tool, lastInput }
@@ -374,6 +456,8 @@ async function runClaudeGeneration(args = {}) {
       sessionId,
       model,
       effort,
+      systemPrompt: systemPromptOption.systemPrompt,
+      systemPromptFile: systemPromptOption.systemPromptFile,
       binary: _binary,
       spawnFn: _spawnFn,
       onEvent,
@@ -526,6 +610,8 @@ async function runClaudeGeneration(args = {}) {
       promptBytes: prompt.length,
       promptTokenEstimate,
       promptHash,
+      stablePrefixHash,
+      deltaHash,
       askUserCount: askUserPending.length,
       costUsd: final?.costUsd ?? null,
       numTurns: final?.numTurns ?? null,
@@ -539,6 +625,27 @@ async function runClaudeGeneration(args = {}) {
       sourceSignature,
       prdSignature,
       corpusVersion,
+      promptTokenReduction: {
+        cacheFriendlyPrefix: true,
+        stablePrefixHash,
+        deltaHash,
+        stablePrefixTokens: promptParts.stablePrefixTokens,
+        deltaTokens: promptParts.deltaTokens,
+        contextArtifactBytes,
+        contextArtifactRoot: contextArtifacts?.root || null,
+        omitLoadedContext,
+        suppliedPromptBudget: suppliedPromptBudget || null,
+      },
+      skill: skillMeta,
+      askUserMcpMounted: Boolean(mcpConfigPath),
+      mcpMountReason: askUserMcp.reason,
+      toolOverheadOptimized: true,
+      systemPrompt: {
+        used: systemPromptOption.used,
+        strategy: systemPromptOption.strategy || null,
+        mode: systemPromptOption.mode,
+        file: systemPromptOption.systemPromptFile || null,
+      },
       // CL2-B — include sessionId in the per-iteration meta so the topup
       // route (which reads parent.report.generationMeta.iterations[i].sessionId)
       // can resume the Claude session for follow-up iterations.
@@ -549,6 +656,7 @@ async function runClaudeGeneration(args = {}) {
 
 module.exports = {
   runClaudeGeneration,
+  _shouldMountAskUserMcp,
   // Sub-modules re-exported so callers can mock individual layers
   Preflight,
   PromptBuilder,
@@ -559,5 +667,7 @@ module.exports = {
   IterationController: require('./iteration-controller'),
   FeedbackBuilder: require('./feedback-builder'),
   SurfaceInventory: require('./surface-inventory'),
-  ContextPacker: require('./context-packer'),
+  ContextPacker,
+  SkillInstaller,
+  SystemPrompt,
 };

@@ -66,6 +66,17 @@ function renderProjectInfo(projectInfo, testsDir, projectPath) {
   return lines.join('\n');
 }
 
+function renderSkillInvocation(skill = {}) {
+  const skillName = skill.skillName || 'healix-qa-engineer';
+  const skillPath = skill.skillPath || '~/.claude/skills/healix-qa-engineer';
+  return [
+    `Use the Claude skill \`${skillName}\` for this task.`,
+    `Skill path: \`${skillPath}\`.`,
+    'Read the skill rule files once before writing tests: grounding-rules.md, anti-patterns.md, ac-tagging.md, auth-flow.md, done-protocol.md.',
+    'Do not paste or restate those rules in the prompt; apply them while authoring specs.',
+  ].join('\n');
+}
+
 function renderWorkingDirective(testsDir) {
   return [
     `Use the Edit and Write tools (NOT bash redirection) to create spec files into:`,
@@ -302,23 +313,14 @@ function renderFeedback(feedback) {
 
 function renderTaskBrief() {
   return [
-    "Now generate the test suite. You are the senior QA engineer; the team is depending on you to ship a suite that achieves near-zero defect leakage. Concrete steps:",
+    "Generate or repair Playwright specs for this Healix shard.",
     "",
-    "1. Read everything above carefully (PRD, ACs, routes, forms, corpus state).",
-    "2. For EVERY AC in the 'Acceptance criteria to cover' checklist, write at least one focused spec file. Smoke + regression + UAT layers — cover all three where applicable.",
-    "3. Use the `Write` or `Edit` tool to create each `.spec.ts` file inside the testsDir.",
-    "4. Prefer real-user flows over isolated unit checks — chain steps the way a user would (login → navigate → act → assert end state).",
-    "5. Tests can be either Playwright UI (`page` fixture) OR API (`request` fixture); use whichever best exercises the AC.",
-    "6. If a PRD AC is ambiguous OR you need to clarify an auth/RBAC rule that exploration did not surface, call the `ask_user_question` MCP tool. DO NOT silently guess on ambiguity — that's how false confidence gets shipped.",
-    "7. Only write `DONE` when EVERY AC in the checklist has at least one tagged test AND every test you wrote is grounded in real selectors / real endpoints (no hallucinated URLs/IDs). The orchestrator will OVERRIDE a premature DONE and ask you to keep going. Don't trigger that — be honest about what's left.",
-    "",
-    renderAcTaggingDirective(),
-    "",
-    renderGroundingRules(),
-    "",
-    renderAntiPatterns(),
-    "",
-    renderAuthInstructions(),
+    "1. Use the `healix-qa-engineer` skill rules instead of relying on this prompt for invariants.",
+    "2. Read only the context files needed for this shard before writing tests.",
+    "3. Create or edit `.spec.ts` files only inside the assigned testsDir.",
+    "4. Cover uncovered ACs with grounded workflow, API, or role tests.",
+    "5. If true ambiguity blocks correctness and the ask-user tool is available, ask once; otherwise record a skipped coverage question.",
+    "6. End with `DONE` only when the skill's DONE protocol is satisfied.",
   ].join('\n');
 }
 
@@ -500,7 +502,73 @@ function renderTopupFocus(topupFocus) {
   return out.join('\n').trim();
 }
 
-function buildPrompt(args) {
+function renderContextManifest(contextArtifacts, compactSummary, { omitLoadedContext = false } = {}) {
+  if (!contextArtifacts?.files) return '(context files were not materialized; use compact sections below)';
+  const out = [
+    'Context files for this shard are on disk. Prefer reading these files on demand instead of asking for more context.',
+    '',
+  ];
+  const files = contextArtifacts.relativeFiles || contextArtifacts.files || {};
+  for (const name of ['manifest.json', 'acceptance-criteria.csv', 'routes.csv', 'api.csv', 'forms.csv', 'roles.csv', 'corpus.json', 'feedback.md', 'prd.md']) {
+    if (files[name]) out.push(`- ${name}: \`${files[name]}\``);
+  }
+  if (Array.isArray(contextArtifacts.sourcePreviews) && contextArtifacts.sourcePreviews.length) {
+    out.push(`- source-previews/: ${contextArtifacts.sourcePreviews.length} compact source preview file(s)`);
+  }
+  out.push('');
+  out.push(`Context artifact bytes: ${contextArtifacts.bytes || 0}`);
+  if (omitLoadedContext) {
+    out.push('This is a resumed iteration. The PRD and bulk context were already loaded earlier in the session; re-read files only if needed.');
+  }
+  if (compactSummary?.counts) {
+    out.push('');
+    out.push(`Summary counts: AC=${compactSummary.counts.acceptanceCriteria || 0}, routes=${compactSummary.counts.routes || 0}, APIs=${compactSummary.counts.apiEndpoints || 0}, forms=${compactSummary.counts.forms || 0}, roles=${compactSummary.counts.roles || 0}, persistedTests=${compactSummary.counts.persistedTests || 0}.`);
+  }
+  return out.join('\n');
+}
+
+function renderCompactSurface(compactSummary) {
+  if (!compactSummary?.surface) return null;
+  const s = compactSummary.surface;
+  return [
+    `surfaceKey,type,label`,
+    `${s.surfaceKey || 'root'},${s.type || 'misc'},${s.label || s.surfaceKey || 'Root'}`,
+    '',
+    `routes: ${(s.routes || []).join(', ') || '(none)'}`,
+    `apiEndpoints: ${(s.apiEndpoints || []).join(', ') || '(none)'}`,
+    `forms: ${(s.forms || []).join(', ') || '(none)'}`,
+    `roles: ${(s.roles || []).join(', ') || '(none)'}`,
+    `targetAcIds: ${(s.acIds || []).slice(0, 40).join(', ') || '(see acceptance-criteria.csv)'}`,
+  ].join('\n');
+}
+
+function compactAcPreview(parsedPRD, limit = 30) {
+  const ids = collectAcIdsFromPRD(parsedPRD);
+  if (!ids.length) return '(no structured acceptance criteria parsed; read prd.md if present)';
+  const lines = ['id,text'];
+  for (const { id, text } of ids.slice(0, limit)) {
+    const safeText = String(text || '').replace(/"/g, '""').replace(/\n/g, ' ').slice(0, 220);
+    lines.push(`${id},"${safeText}"`);
+  }
+  if (ids.length > limit) lines.push(`...,"${ids.length - limit} more ACs in acceptance-criteria.csv"`);
+  return lines.join('\n');
+}
+
+function renderIterationDelta({ iterationNumber, feedback, topupFocus, omitLoadedContext }) {
+  const out = [
+    `## Iteration delta`,
+    '',
+    `iteration: ${iterationNumber || 1}`,
+    `contextMode: ${omitLoadedContext ? 'resumed-reference-only' : 'compact-with-files'}`,
+  ];
+  const feedbackBlock = renderFeedback(feedback);
+  if (feedbackBlock) out.push('', feedbackBlock);
+  const topupFocusBlock = renderTopupFocus(topupFocus);
+  if (topupFocusBlock) out.push('', topupFocusBlock);
+  return out.join('\n');
+}
+
+function buildPromptWithMetadata(args) {
   const {
     context = {},
     projectPath,
@@ -515,42 +583,48 @@ function buildPrompt(args) {
     feedback,
     iterationNumber,
     topupFocus,
+    contextArtifacts,
+    compactSummary,
+    skill,
+    omitLoadedContext = false,
   } = args || {};
 
-  const parts = [];
-  parts.push(`# Healix QA pipeline — Claude-local generation${iterationNumber ? ` (iteration ${iterationNumber})` : ''}\n`);
-  parts.push(`${FOCUS_DIRECTIVE}\n`);
+  const stableParts = [];
+  stableParts.push(`# Healix QA pipeline — Claude-local generation\n`);
+  stableParts.push(`${FOCUS_DIRECTIVE}\n`);
+  stableParts.push(section('Skill', renderSkillInvocation(skill)));
+  stableParts.push(section('Working directory + output path', renderWorkingDirective(testsDir)));
+  stableParts.push(section('Project info', renderProjectInfo(projectInfo, testsDir, projectPath)));
+  stableParts.push(section('Roles + auth', renderRoles(roles)));
+  stableParts.push(section('Context manifest', renderContextManifest(contextArtifacts, compactSummary, { omitLoadedContext })));
+  stableParts.push(section('Surface focus', renderCompactSurface(compactSummary) || '(root surface)'));
+  stableParts.push(section('Acceptance criteria preview', omitLoadedContext ? 'Use acceptance-criteria.csv from the context manifest if coverage details are needed.' : compactAcPreview(parsedPRD)));
+  if (!contextArtifacts && !omitLoadedContext) {
+    stableParts.push(section('PRD (fallback compact)', renderPRD(prdContent)));
+    stableParts.push(section('Routes + UI (fallback compact)', renderRoutesAndUI(explorationArtifact)));
+    stableParts.push(section('API endpoints + schemas (fallback compact)', renderApi(explorationArtifact, context)));
+  }
+  stableParts.push(section('Existing corpus state', renderCorpusState(corpusSeed, corpusGuidance)));
+  stableParts.push(section('Tier-0 invariants already covered', renderTier0Invariants()));
 
-  parts.push(section('Working directory + output path', renderWorkingDirective(testsDir)));
-  parts.push(section('Project info', renderProjectInfo(projectInfo, testsDir, projectPath)));
-  parts.push(section('Roles + auth', renderRoles(roles)));
-  parts.push(section('PRD (full)', renderPRD(prdContent)));
-  parts.push(section('Acceptance criteria', renderAcceptanceCriteria(parsedPRD)));
-  // WS-5: render the canonical AC checklist (one bullet per `[REQ:...]`
-  // marker) so Claude sees the entire universe of targets it must tag tests
-  // against. Skipped when the PRD failed to parse into structured ACs.
-  const acChecklist = renderAcChecklist(parsedPRD);
-  if (acChecklist) parts.push(acChecklist + '\n');
-  parts.push(section('Routes + UI', renderRoutesAndUI(explorationArtifact)));
-  parts.push(section('API endpoints + schemas', renderApi(explorationArtifact, context)));
-  parts.push(section('Workflows', renderWorkflows(explorationArtifact, context)));
-  parts.push(section('Existing corpus state', renderCorpusState(corpusSeed, corpusGuidance)));
-  parts.push(section('Tier-0 invariants already covered', renderTier0Invariants()));
+  const deltaParts = [];
+  deltaParts.push(renderIterationDelta({ iterationNumber, feedback, topupFocus, omitLoadedContext }));
+  deltaParts.push(section('Task brief', renderTaskBrief()));
 
-  const feedbackBlock = renderFeedback(feedback);
-  if (feedbackBlock) parts.push(feedbackBlock + '\n');
+  const stablePrefix = scrubBugTokens(stableParts.join('\n'));
+  const deltaTail = scrubBugTokens(deltaParts.join('\n'));
+  const prompt = `${stablePrefix}\n${deltaTail}`;
+  return {
+    prompt,
+    stablePrefix,
+    deltaTail,
+    stablePrefixTokens: estimatePromptTokens(stablePrefix),
+    deltaTokens: estimatePromptTokens(deltaTail),
+  };
+}
 
-  // CL3-D — top-up focus areas live just above the task brief so they're the
-  // last thing Claude reads before it starts producing tests.
-  const topupFocusBlock = renderTopupFocus(topupFocus);
-  if (topupFocusBlock) parts.push(topupFocusBlock + '\n');
-
-  parts.push(section('Task brief', renderTaskBrief()));
-
-  // CL2-F — Final defensive scrub. Pure invariant: NO `BUG-X` token (the
-  // exact shape KNOWN_BUGS.md uses) ever reaches Claude's prompt. The
-  // scorecard reader stays the only sanctioned consumer of that label space.
-  return scrubBugTokens(parts.join('\n'));
+function buildPrompt(args) {
+  return buildPromptWithMetadata(args).prompt;
 }
 
 /**
@@ -564,6 +638,7 @@ function estimatePromptTokens(markdown) {
 
 module.exports = {
   buildPrompt,
+  buildPromptWithMetadata,
   estimatePromptTokens,
   // Exposed for granular testing
   _internals: {
@@ -577,6 +652,10 @@ module.exports = {
     renderTier0Invariants,
     renderFeedback,
     renderTaskBrief,
+    renderSkillInvocation,
+    renderContextManifest,
+    renderCompactSurface,
+    renderIterationDelta,
     renderAcTaggingDirective,
     renderAcChecklist,
     collectAcIdsFromPRD,
