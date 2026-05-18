@@ -42,6 +42,17 @@ interface DashboardData {
     email: string | null
     fullName: string | null
   }>
+  recentRuns: Array<{
+    id: string
+    creationName: string | null
+    status: string | null
+    totalTests: number
+    passedTests: number
+    failedTests: number
+    createdAt: string | null
+    contributorEmail: string | null
+    contributorName: string | null
+  }>
 }
 
 function truncate(s: string | null | undefined, n: number): string {
@@ -136,6 +147,7 @@ export default async function WorkspaceOverviewPage({ params }: PageProps) {
       counts: { members: 1, corpusSize: 0, acsCovered: 0, acsTotal: 0, byTier: { L0: 0, L1: 0, L2: 0, L3: 0 }, testsRun7d: 0 },
       recentActivity: [],
       topContributors: [],
+      recentRuns: [],
     }
   }
 
@@ -170,12 +182,58 @@ export default async function WorkspaceOverviewPage({ params }: PageProps) {
             Activity stream →
           </Link>
           <Link
-            href={`/all-tests`}
+            href={`/all-tests?workspace_id=${workspaceId}`}
             className="text-[10px] uppercase tracking-widest font-semibold border border-white/10 text-[#8BA4C8] hover:text-[#F0F6FF] hover:border-white/30 px-3 py-1.5 rounded-lg"
           >
             All test runs →
           </Link>
         </div>
+      </div>
+
+      {/* Recent test runs across all members — surfaces the owner's runs too */}
+      <div className="glass-card rounded-2xl p-4" data-testid="workspace-recent-runs">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-[#F0F6FF] text-sm font-bold">Recent test runs</h3>
+          <Link
+            href={`/all-tests?workspace_id=${workspaceId}`}
+            className="text-[10px] uppercase tracking-widest text-[#60A5FA] hover:text-[#F0F6FF]"
+          >
+            View all →
+          </Link>
+        </div>
+        {data.recentRuns.length === 0 ? (
+          <div className="text-[#4A6280] text-sm py-8 text-center">
+            No runs yet in this workspace. Run Healix from any member's machine to see results here.
+          </div>
+        ) : (
+          <ul className="divide-y divide-white/5">
+            {data.recentRuns.map((run) => {
+              const pct = run.totalTests > 0 ? Math.round((run.passedTests / run.totalTests) * 100) : 0
+              const ok = pct >= 80
+              const statusClass =
+                run.status === 'passed' ? 'bg-emerald-500/10 text-emerald-400' :
+                run.status === 'failed' ? 'bg-red-500/10 text-red-400' :
+                run.status === 'running' ? 'bg-blue-500/10 text-blue-400' :
+                run.status === 'completed_with_findings' ? 'bg-amber-500/10 text-amber-300' :
+                'bg-amber-500/10 text-amber-400'
+              return (
+                <li key={run.id} className="py-2.5 flex flex-wrap items-center gap-3 text-xs">
+                  <Link href={`/test-run/${run.id}`} className="text-[#F0F6FF] hover:text-[#60A5FA] font-medium flex-1 truncate">
+                    {run.creationName || 'Untitled Test'}
+                  </Link>
+                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${ok ? 'bg-emerald-500/10 text-emerald-400' : 'bg-red-500/10 text-red-400'}`}>
+                    {run.passedTests}/{run.totalTests}
+                  </span>
+                  <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${statusClass}`}>
+                    {run.status === 'completed_with_findings' ? 'findings' : run.status}
+                  </span>
+                  <span className="text-[#4A6280]">{run.contributorName ?? run.contributorEmail ?? 'unknown'}</span>
+                  <span className="text-[#4A6280] font-mono">{run.createdAt ? formatRelative(run.createdAt) : ''}</span>
+                </li>
+              )
+            })}
+          </ul>
+        )}
       </div>
 
       {/* KPI cards */}
@@ -381,6 +439,28 @@ async function loadDashboardData(workspaceId: string): Promise<DashboardData | n
 
   for (const c of contributorRows) contributorIds.add(c.userId)
 
+  // Recent test runs across all workspace members — surfaces the owner's runs
+  // (and everyone else's) directly on the overview so users don't have to go
+  // hunting through /all-tests with the right filter.
+  const recentRunRows = await db
+    .select({
+      id: testRuns.id,
+      userId: testRuns.userId,
+      creationName: testRuns.creationName,
+      status: testRuns.status,
+      totalTests: testRuns.totalTests,
+      passedTests: testRuns.passedTests,
+      failedTests: testRuns.failedTests,
+      createdAt: testRuns.createdAt,
+    })
+    .from(testRuns)
+    .where(eq(testRuns.workspaceId, workspaceId))
+    .orderBy(desc(testRuns.createdAt))
+    .limit(15)
+  for (const r of recentRunRows) {
+    if (r.userId) contributorIds.add(r.userId)
+  }
+
   let profileMap = new Map<string, { email: string | null; fullName: string | null }>()
   if (contributorIds.size > 0) {
     const profileRows = await db
@@ -421,6 +501,17 @@ async function loadDashboardData(workspaceId: string): Promise<DashboardData | n
       testsPromoted: c.value,
       email: profileMap.get(c.userId)?.email ?? null,
       fullName: profileMap.get(c.userId)?.fullName ?? null,
+    })),
+    recentRuns: recentRunRows.map((r) => ({
+      id: r.id,
+      creationName: r.creationName,
+      status: r.status,
+      totalTests: r.totalTests ?? 0,
+      passedTests: r.passedTests ?? 0,
+      failedTests: r.failedTests ?? 0,
+      createdAt: r.createdAt?.toISOString() ?? null,
+      contributorEmail: r.userId ? profileMap.get(r.userId)?.email ?? null : null,
+      contributorName: r.userId ? profileMap.get(r.userId)?.fullName ?? null : null,
     })),
   }
 }

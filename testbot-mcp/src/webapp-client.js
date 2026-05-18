@@ -942,23 +942,64 @@ class WebappClient {
    * Returns null (non-throwing) when the workspace doesn't exist (solo mode).
    * Throws on auth errors so the pipeline can surface them.
    */
-  async resolveWorkspace({ projectKey }) {
+  async resolveWorkspace({ projectKey, gitRemote }) {
     if (!this.apiKey || !projectKey) return null;
     try {
+      const params = new URLSearchParams({ projectKey });
+      // Also send the raw gitRemote when we have it. The server uses it as
+      // a defense-in-depth fallback: if the primary hash doesn't match (e.g.
+      // because the client couldn't resolve a custom SSH host alias), the
+      // server will derive alternate hashes from this raw string and retry.
+      if (gitRemote && typeof gitRemote === 'string' && gitRemote.trim().length > 0) {
+        params.set('gitRemote', gitRemote.trim());
+      }
       return await this._get(
-        `/api/workspaces/resolve?projectKey=${encodeURIComponent(projectKey)}`,
+        `/api/workspaces/resolve?${params.toString()}`,
         { timeoutMs: 10_000 }
       );
     } catch (err) {
       if (err.status === 404) return { found: false };
       if (err.status === 403) {
-        Logger.warn('WebappClient', 'Workspace found but not a member — running solo', {
+        // The server uses two distinct 403 shapes:
+        //   { error: 'WORKSPACE_REQUIRES_PAID_PLAN', message } — caller is on
+        //     a free plan or inactive subscription. Every workspace member
+        //     must be on a paid plan; surface this so the user sees a clear
+        //     "upgrade required" message instead of a silent solo-mode run.
+        //   { found: true, member: false, message } — workspace exists but
+        //     the caller isn't a member of it. Surface as a join hint.
+        const payload = err.payload || null;
+        if (payload?.error === 'WORKSPACE_REQUIRES_PAID_PLAN') {
+          Logger.warn('WebappClient', 'Workspace blocked: this account needs a paid plan with an active subscription', {
+            projectKey,
+            message: payload?.message || null,
+            hint: 'Upgrade at /plan-billing in the Healix dashboard. Every workspace member must be on a paid plan.',
+          });
+          return {
+            found: true,
+            member: false,
+            paidPlanRequired: true,
+            message: payload?.message || 'Team workspaces are available on paid plans.',
+          };
+        }
+        if (payload && payload.member === false) {
+          Logger.warn('WebappClient', 'Workspace found but not a member — running solo', {
+            projectKey,
+            hint: 'Join the workspace via invite code in the Healix dashboard.',
+          });
+          return {
+            found: true,
+            member: false,
+            paidPlanRequired: false,
+            message: payload?.message || 'You are not a member of this workspace.',
+          };
+        }
+        // Generic 403 with no recognised payload shape — log and fall through.
+        Logger.warn('WebappClient', 'resolveWorkspace returned 403 with unrecognised payload — running solo', {
           projectKey,
-          hint: 'Join the workspace via invite code in the Healix dashboard.',
+          payload,
         });
         return null;
       }
-      if (err.code === 'WORKSPACE_REQUIRES_PAID_PLAN' || err.status === 403) return null;
       Logger.warn('WebappClient', 'resolveWorkspace failed (non-blocking)', { code: err.code, message: err.message });
       return null;
     }

@@ -612,6 +612,7 @@ class ReportGenerator {
     api_key,
     dashboard_url,
     workspaceId,
+    workspaceSkip,
   }) {
     const timestamp = new Date().toISOString();
     const reportsDir = path.join(projectPath, 'healix-reports');
@@ -681,6 +682,22 @@ class ReportGenerator {
         deterministicVerdicts: Number(normalizedAiTriage?.deterministicVerdicts || 0),
         findingSummary,
         skipSummary,
+        // Workspace binding state. When the run was successfully attached to a
+        // workspace, workspaceId is set on the row and this block is null.
+        // When the run was NOT attached, the dashboard reads this block to
+        // tell the user WHY — without it the user has to dig through MCP
+        // stderr to find the warning, which they don't.
+        workspaceBinding: workspaceId
+          ? { status: 'attached', workspaceId }
+          : workspaceSkip
+            ? {
+                status: 'skipped',
+                reason: this.stripAnsiAndNormalize(workspaceSkip.reason || 'unknown'),
+                message: this.stripAnsiAndNormalize(workspaceSkip.message || null),
+                projectKey: this.stripAnsiAndNormalize(workspaceSkip.projectKey || null),
+                paidPlanRequired: Boolean(workspaceSkip.paidPlanRequired),
+              }
+            : { status: 'solo' },
       },
       stats: {
         total: Number(testResults.total || 0),

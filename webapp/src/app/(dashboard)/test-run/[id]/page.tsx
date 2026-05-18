@@ -222,12 +222,22 @@ interface GenerationMetaShape {
   [key: string]: unknown;
 }
 
+interface WorkspaceBindingShape {
+  status?: 'attached' | 'skipped' | 'solo';
+  workspaceId?: string | null;
+  reason?: string | null;
+  message?: string | null;
+  projectKey?: string | null;
+  paidPlanRequired?: boolean;
+}
+
 interface ReportJson {
   metadata?: {
     projectPath?: string;
     runId?: string;
     run_id?: string;
     generationMeta?: GenerationMetaShape | null;
+    workspaceBinding?: WorkspaceBindingShape | null;
     live?: {
       isLive?: boolean;
       phase?: string;
@@ -2073,6 +2083,58 @@ function GenerationJobProgressChip({ job }: { job: GenerationJobSnapshot | null 
   return null;
 }
 
+function WorkspaceBindingBanner({ binding }: { binding: WorkspaceBindingShape }) {
+  const reason = binding.reason || 'unknown';
+  const paid = binding.paidPlanRequired === true;
+  const isMembershipIssue = reason === 'not_a_member';
+  const isProjectKeyIssue = reason === 'workspace_not_found' || reason === 'no_project_identity';
+
+  let title = 'This run was not shared with any workspace';
+  let action: { href: string; label: string } | null = null;
+
+  if (paid) {
+    title = 'This run was not shared because workspace access requires a paid plan';
+    action = { href: '/plan-billing', label: 'Upgrade plan →' };
+  } else if (isMembershipIssue) {
+    title = 'This run was not shared because you are not a member of the workspace for this project';
+    action = { href: '/workspace', label: 'Join workspace →' };
+  } else if (isProjectKeyIssue) {
+    title = 'This run was not shared because no workspace is bound to this project';
+    action = { href: '/workspace', label: 'Create or join workspace →' };
+  } else if (reason === 'no_api_key') {
+    title = 'This run was not shared because HEALIX_API_KEY is missing from the MCP environment';
+  }
+
+  const accent = paid ? 'border-amber-500/40 bg-amber-500/10' : 'border-blue-500/40 bg-blue-500/10';
+  const titleClass = paid ? 'text-amber-300' : 'text-[#60A5FA]';
+
+  return (
+    <div className={`rounded-2xl border ${accent} p-4 flex flex-col gap-2`} data-testid="workspace-binding-banner">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex flex-col gap-1">
+          <div className={`text-sm font-semibold ${titleClass}`}>{title}</div>
+          {binding.message && (
+            <div className="text-[#C8D9EF] text-xs">{binding.message}</div>
+          )}
+          {binding.projectKey && (
+            <div className="text-[10px] uppercase tracking-widest text-[#4A6280] font-mono mt-1">
+              project key: <code className="text-[#8BA4C8]">{binding.projectKey.slice(0, 28)}…</code>
+            </div>
+          )}
+        </div>
+        {action && (
+          <Link
+            href={action.href}
+            className="text-[10px] uppercase tracking-widest font-semibold border border-white/20 hover:border-white/40 text-[#F0F6FF] px-3 py-1.5 rounded-lg whitespace-nowrap"
+          >
+            {action.label}
+          </Link>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
   const [open, setOpen] = useState(false);
   const score = Math.max(0, Math.min(100, Math.round(warning.qualityScore)));
@@ -3719,6 +3781,7 @@ export default function TestRunDetailPage() {
   // actually annotated generationMeta — legacy runs have neither field and
   // the banner stays hidden.
   const generationMeta = (report?.metadata?.generationMeta ?? null) as GenerationMetaShape | null;
+  const workspaceBinding = (report?.metadata?.workspaceBinding ?? null) as WorkspaceBindingShape | null;
   const partialWarning = generationMeta?.partialGenerationWarning ?? null;
   const qualityWarning = generationMeta?.qualityWarning ?? null;
   const coverageTopUps = Array.isArray(generationMeta?.coverageTopUps)
@@ -3955,6 +4018,10 @@ export default function TestRunDetailPage() {
           agentsCompleted={agentsCompletedFromMeta}
           agentsRequested={agentsRequestedFromMeta}
         />
+      )}
+
+      {workspaceBinding && workspaceBinding.status === 'skipped' && (
+        <WorkspaceBindingBanner binding={workspaceBinding} />
       )}
 
       {!pipelineError && qualityWarning && (

@@ -1,10 +1,36 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth/session'
 import { db } from '@/lib/db'
-import { testRuns, testFailures, generationJobs } from '@/lib/db/schema'
+import { testRuns, testFailures, generationJobs, workspaceMembers } from '@/lib/db/schema'
 import { eq, and, desc, sql } from 'drizzle-orm'
 import { extractRunIdFromReport, getLiveRunsForUser } from '@/lib/mcp-live-runs'
 import { loadQaFindingsForRun } from '@/lib/qa-corpus'
+
+/**
+ * Returns true when `viewerId` is allowed to read a test run owned by
+ * `ownerId`. Workspace teammates may read each other's runs as long as the
+ * run is stamped with a `workspaceId` they're members of — that's the whole
+ * point of sharing a workspace.
+ */
+async function canViewTestRun(
+  viewerId: string,
+  ownerId: string,
+  workspaceId: string | null
+): Promise<boolean> {
+  if (viewerId === ownerId) return true
+  if (!workspaceId) return false
+  const [membership] = await db
+    .select({ workspaceId: workspaceMembers.workspaceId })
+    .from(workspaceMembers)
+    .where(
+      and(
+        eq(workspaceMembers.workspaceId, workspaceId),
+        eq(workspaceMembers.userId, viewerId)
+      )
+    )
+    .limit(1)
+  return Boolean(membership)
+}
 
 // ── Generation-job progress projection (P2-i) ────────────────────────────────
 // Normalizes a linked generation_jobs row into the wire shape consumed by the
@@ -82,11 +108,11 @@ async function loadLatestGenerationJob(
   }
 }
 
-async function loadFailuresForRun(runId: string, userId: string) {
+async function loadFailuresForRun(runId: string, ownerUserId: string) {
   const rows = await db
     .select()
     .from(testFailures)
-    .where(and(eq(testFailures.testRunId, runId), eq(testFailures.userId, userId)))
+    .where(and(eq(testFailures.testRunId, runId), eq(testFailures.userId, ownerUserId)))
     .orderBy(testFailures.createdAt)
   return rows.map((r) => ({
     id: r.id,
@@ -126,23 +152,25 @@ export async function GET(
       // Prefer a real ingested run when it exists — ingest happens during the
       // 'reporting' phase, well before 'completed', so this fires as soon as
       // results are available and returns full report_json + ai_analysis.
+      // Workspace teammates are allowed to read each other's runs, so the
+      // lookup is by metadata.runId alone; access is gated below.
       const [ingestedRow] = await db
         .select()
         .from(testRuns)
-        .where(
-          and(
-            eq(testRuns.userId, user.id),
-            sql`${testRuns.reportJson}->'metadata'->>'runId' = ${runId}`
-          )
-        )
+        .where(sql`${testRuns.reportJson}->'metadata'->>'runId' = ${runId}`)
         .orderBy(testRuns.createdAt)
         .limit(1)
 
       if (ingestedRow) {
+        const allowed = await canViewTestRun(user.id, ingestedRow.userId, ingestedRow.workspaceId)
+        if (!allowed) {
+          return NextResponse.json({ error: 'Test run not found' }, { status: 404 })
+        }
+        const ownerId = ingestedRow.userId
         const [test_failures, qa_findings, generationJob] = await Promise.all([
-          loadFailuresForRun(ingestedRow.id, user.id),
-          loadQaFindingsForRun(ingestedRow.id, user.id),
-          loadLatestGenerationJob(ingestedRow.id, user.id),
+          loadFailuresForRun(ingestedRow.id, ownerId),
+          loadQaFindingsForRun(ingestedRow.id, ownerId),
+          loadLatestGenerationJob(ingestedRow.id, ownerId),
         ])
         const data = {
           id: ingestedRow.id,
@@ -189,20 +217,28 @@ export async function GET(
       return NextResponse.json({ data: { ...liveRun, generationJob: null } })
     }
 
+    // Workspace teammates may read each other's runs through the shared
+    // workspace — pull the row by id alone and gate access after.
     const [row] = await db
       .select()
       .from(testRuns)
-      .where(and(eq(testRuns.id, id), eq(testRuns.userId, user.id)))
+      .where(eq(testRuns.id, id))
       .limit(1)
 
     if (!row) {
       return NextResponse.json({ error: 'Test run not found' }, { status: 404 })
     }
 
+    const allowed = await canViewTestRun(user.id, row.userId, row.workspaceId)
+    if (!allowed) {
+      return NextResponse.json({ error: 'Test run not found' }, { status: 404 })
+    }
+
+    const ownerId = row.userId
     const [test_failures, qa_findings, generationJob] = await Promise.all([
-      loadFailuresForRun(row.id, user.id),
-      loadQaFindingsForRun(row.id, user.id),
-      loadLatestGenerationJob(row.id, user.id),
+      loadFailuresForRun(row.id, ownerId),
+      loadQaFindingsForRun(row.id, ownerId),
+      loadLatestGenerationJob(row.id, ownerId),
     ])
     const data = {
       id: row.id,

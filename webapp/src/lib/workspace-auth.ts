@@ -17,7 +17,12 @@ export type AuthedUser = {
  *  - x-api-key header  (MCP / programmatic access)
  *  - Supabase session cookie  (dashboard UI)
  *
- * Enforces paid-tier gate for both paths.
+ * Every workspace member must be on a paid plan with an active subscription.
+ * That's a product decision: the whole point of workspaces is paid team
+ * collaboration. We enforce it here so a free-plan teammate of a paid owner
+ * gets a clear 403 → the MCP can surface a "buy paid plan" message instead
+ * of silently falling back to solo mode.
+ *
  * Returns { user } on success, or { error: NextResponse } to return early.
  */
 export async function requireWorkspaceAuth(

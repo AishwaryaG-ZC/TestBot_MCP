@@ -1390,7 +1390,8 @@ module.exports = defineConfig({
       for (const file of files) {
         const fullPath = path.join(generatedDir, file);
         const content = fs.readFileSync(fullPath, 'utf-8');
-        if (phaseTwoTagPattern.test(content)) {
+        const contentWithoutLineComments = content.replace(/\/\/[^\n]*/g, '');
+        if (phaseTwoTagPattern.test(contentWithoutLineComments)) {
           return true;
         }
       }
@@ -1475,11 +1476,41 @@ module.exports = defineConfig({
       };
     }
 
-    const phaseTwo = await this.executePlaywright({ 
-      grep: gatePattern,
-      outputDir: phase2OutputDir
-    });
-    
+    let phaseTwo;
+    try {
+      phaseTwo = await this.executePlaywright({
+        grep: gatePattern,
+        outputDir: phase2OutputDir,
+      });
+    } catch (err) {
+      if (err?.code === 'NO_TESTS_TO_RUN') {
+        Logger.info('PlaywrightIntegration', 'Phase 2 grep matched no test titles (tag likely in a comment only); returning phase 1 results.', { gatePattern });
+        return {
+          ...phaseOne,
+          phaseResults: {
+            phase1: {
+              status: phaseOne.failed > 0 ? 'failed' : 'passed',
+              total: Number(phaseOne.total || 0),
+              passed: Number(phaseOne.passed || 0),
+              failed: Number(phaseOne.failed || 0),
+              skipped: Number(phaseOne.skipped || 0),
+              duration: Number(phaseOne.duration || 0),
+            },
+            phase2: {
+              status: 'skipped',
+              total: 0,
+              passed: 0,
+              failed: 0,
+              skipped: 0,
+              duration: 0,
+              reason: 'no_tests_matching_phase2_grep',
+            },
+          },
+        };
+      }
+      throw err;
+    }
+
     return this.combinePhaseResults(phaseOne, phaseTwo);
   }
 

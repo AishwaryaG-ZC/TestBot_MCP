@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 import Link from 'next/link';
 import type { TestRun } from '@/lib/types/database';
@@ -133,6 +133,8 @@ type CorpusStatus = 'all' | 'active' | 'flake-quarantine' | 'soft-deleted';
 
 export default function AllTestsPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const urlWorkspaceId = searchParams.get('workspace_id');
   const [tests, setTests] = useState<TestRun[]>([]);
   const [total, setTotal] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
@@ -180,14 +182,22 @@ export default function AllTestsPage() {
         list.sort((a, b) => a.projectName.localeCompare(b.projectName));
         if (cancelled) return;
         setWorkspaces(list);
-        if (list.length > 0) setActiveWorkspaceId(list[0].id);
+        // Respect ?workspace_id=<id> from the URL when present so links from
+        // the workspace overview land on the right workspace; otherwise default
+        // to the first alphabetically.
+        if (list.length > 0) {
+          const fromUrl = urlWorkspaceId && list.find((w) => w.id === urlWorkspaceId)
+            ? urlWorkspaceId
+            : list[0].id;
+          setActiveWorkspaceId(fromUrl);
+        }
         setWorkspaceLoaded(true);
       } catch {
         if (!cancelled) setWorkspaceLoaded(true);
       }
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [urlWorkspaceId]);
 
   // When the active workspace changes, fetch its members for the contributor
   // filter dropdown. Members endpoint enforces membership server-side.

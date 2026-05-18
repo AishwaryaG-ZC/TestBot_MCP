@@ -58,21 +58,84 @@ function sha256(str) {
 }
 
 /**
+ * Resolve a custom SSH config host alias (e.g. "pers" in
+ * `Host pers / HostName github.com` from ~/.ssh/config) to its real hostname.
+ *
+ * Returns the resolved hostname (e.g. "github.com") or null if `ssh -G` isn't
+ * available or the alias resolves to itself. We deliberately ignore the
+ * resolved User — git remotes don't include it in the canonical form we hash.
+ *
+ * Why this exists: shreyes (and many teammates with multiple GitHub identities)
+ * configure ~/.ssh/config like `Host pers / HostName github.com / User git`
+ * and clone with `pers:owner/repo.git`. Without this resolution the MCP hashes
+ * `pers/owner/repo` instead of `github.com/owner/repo` and the workspace
+ * resolve call 404s, silently dropping the run into solo mode.
+ */
+function resolveSshHostAlias(alias) {
+  if (!alias || typeof alias !== 'string') return null;
+  try {
+    const out = execSync(`ssh -G ${alias}`, { stdio: 'pipe', timeout: 3000 })
+      .toString()
+      .split(/\r?\n/);
+    for (const line of out) {
+      const m = line.match(/^hostname\s+(.+)$/i);
+      if (m) {
+        const resolved = m[1].trim().toLowerCase();
+        // If `ssh -G unknownalias` doesn't find a match, it echoes the alias
+        // back as the hostname. Treat that as "no resolution".
+        if (resolved && resolved !== alias.toLowerCase()) return resolved;
+        return null;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Try to read git remote origin from projectPath.
- * Returns the normalised remote string or null.
+ * Returns { normalized, raw } or null. `raw` is the literal output of
+ * `git remote get-url origin` (after a best-effort SSH alias resolution),
+ * useful as a fallback hint when normalisation produces a hash the server
+ * can't match.
  */
 function tryGitRemote(projectPath) {
   if (!projectPath) return null;
+  let raw;
   try {
-    const raw = execSync('git remote get-url origin', {
+    raw = execSync('git remote get-url origin', {
       cwd: projectPath,
       stdio: 'pipe',
       timeout: 5000,
     }).toString().trim();
-    return normalizeGitRemote(raw);
   } catch {
     return null;
   }
+  if (!raw) return null;
+  const rawOriginal = raw;
+
+  // Custom SSH host alias shape: `alias:owner/repo(.git)?` — no protocol,
+  // no `git@` prefix, no `:` inside a host segment. If we can resolve the
+  // alias via `ssh -G` to a real hostname, rewrite to the canonical SSH form
+  // so normalizeGitRemote produces the same hash as every teammate using
+  // the standard URL form.
+  const aliasMatch = raw.match(/^([A-Za-z0-9._-]+):([^:/].*)$/);
+  if (aliasMatch && !raw.startsWith('git@') && !raw.startsWith('ssh://') && !raw.includes('://')) {
+    const [, aliasOrHost, repoPath] = aliasMatch;
+    const resolvedHost = resolveSshHostAlias(aliasOrHost);
+    if (resolvedHost) {
+      Logger.info('WorkspaceSync', 'Resolved SSH host alias from ~/.ssh/config', {
+        alias: aliasOrHost,
+        resolvedHost,
+      });
+      raw = `git@${resolvedHost}:${repoPath}`;
+    }
+  }
+
+  const normalized = normalizeGitRemote(raw);
+  if (!normalized) return null;
+  return { normalized, raw: rawOriginal };
 }
 
 /**
@@ -120,10 +183,19 @@ function detectProjectKey(projectPath) {
   }
 
   // 2. Git remote
-  const gitRemote = tryGitRemote(projectPath);
-  if (gitRemote) {
-    Logger.info('WorkspaceSync', 'Derived project key from git remote', { gitRemote });
-    return { projectKey: sha256(gitRemote), gitRemote, source: 'git' };
+  const gitRemoteResult = tryGitRemote(projectPath);
+  if (gitRemoteResult) {
+    const { normalized, raw } = gitRemoteResult;
+    Logger.info('WorkspaceSync', 'Derived project key from git remote', {
+      normalized,
+      rawDiffers: raw !== normalized ? raw : undefined,
+    });
+    return {
+      projectKey: sha256(normalized),
+      gitRemote: normalized,
+      gitRemoteRaw: raw,
+      source: 'git',
+    };
   }
 
   // 3. package.json

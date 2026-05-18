@@ -402,12 +402,16 @@ async function resolveWorkspaceContext({ projectPath, client } = {}) {
 
   let workspaceId = envWorkspaceId;
   let resolution = null;
+  // Pass the raw git_remote (pre-SSH-alias-resolution) as a fallback hint so
+  // the server can derive alternate hashes when the client-side normalization
+  // doesn't match (e.g. custom SSH host aliases without an ~/.ssh/config entry).
+  const gitRemoteForResolve = detected?.gitRemoteRaw || detected?.gitRemote || null;
   if (envWorkspaceId) {
     Logger.info('PipelineWorker', 'Using HEALIX_WORKSPACE_ID override', { workspaceId: envWorkspaceId });
     // Still attempt resolve() so we can downgrade to solo on 404 (W2-T5).
     if (client && projectKey) {
       try {
-        resolution = await client.resolveWorkspace({ projectKey });
+        resolution = await client.resolveWorkspace({ projectKey, gitRemote: gitRemoteForResolve });
         if (resolution && resolution.found === false) {
           Logger.warn('PipelineWorker', 'HEALIX_WORKSPACE_ID set but /api/workspaces/resolve returned 404 — running in solo mode', {
             envWorkspaceId,
@@ -423,9 +427,14 @@ async function resolveWorkspaceContext({ projectPath, client } = {}) {
     }
   } else if (client && projectKey) {
     try {
-      resolution = await client.resolveWorkspace({ projectKey });
+      resolution = await client.resolveWorkspace({ projectKey, gitRemote: gitRemoteForResolve });
       if (resolution && resolution.workspaceId && resolution.member !== false && resolution.found !== false) {
         workspaceId = resolution.workspaceId;
+      } else if (resolution && resolution.paidPlanRequired) {
+        Logger.warn('PipelineWorker', 'Workspace access requires a paid plan — running in solo mode. Upgrade at /plan-billing to share runs with your workspace.', {
+          projectKey,
+          message: resolution.message || null,
+        });
       } else if (resolution && resolution.found === false) {
         Logger.info('PipelineWorker', 'No workspace exists for this project — running in solo mode', { projectKey });
       }
@@ -9217,13 +9226,67 @@ async function maybeRunFailureTriage({ config, testResults, runBudget, runId }) 
  * Returns { workspaceId, filesWritten, teamCoverage } or null if solo mode.
  */
 async function runWorkspacePreflight({ client, config, testsDir }) {
-  if (!client) return null;
+  if (!client) {
+    Logger.info('WorkspaceSync', 'Skipping workspace preflight — no Healix webapp client (HEALIX_API_KEY missing)');
+    return { skipped: true, reason: 'no_api_key' };
+  }
   try {
     const identity = detectProjectKey(config.projectPath);
-    if (!identity) return null;
+    if (!identity) {
+      Logger.warn('WorkspaceSync', 'Skipping workspace preflight — no git remote or package.json identity. Set HEALIX_PROJECT_KEY to bind this repo to a workspace.', {
+        projectPath: config.projectPath,
+      });
+      return { skipped: true, reason: 'no_project_identity' };
+    }
 
-    const workspace = await client.resolveWorkspace({ projectKey: identity.projectKey });
-    if (!workspace || !workspace.found || !workspace.member) return null;
+    const workspace = await client.resolveWorkspace({
+      projectKey: identity.projectKey,
+      gitRemote: identity.gitRemoteRaw || identity.gitRemote || null,
+    });
+    if (!workspace) {
+      Logger.warn('WorkspaceSync', 'Workspace resolution returned no payload — running in solo mode. Run will land in personal test list, not the workspace.', {
+        projectKey: identity.projectKey,
+        gitRemote: identity.gitRemote,
+        source: identity.source,
+        hint: 'Check HEALIX_API_KEY, network, and that this account is a member of the workspace.',
+      });
+      return { skipped: true, reason: 'resolution_failed', projectKey: identity.projectKey };
+    }
+    if (workspace.found === false) {
+      Logger.warn('WorkspaceSync', 'No workspace exists for this project — running in solo mode. Create one in the Healix dashboard and bind it to this project key.', {
+        projectKey: identity.projectKey,
+        gitRemote: identity.gitRemote,
+        source: identity.source,
+      });
+      return { skipped: true, reason: 'workspace_not_found', projectKey: identity.projectKey };
+    }
+    if (workspace.paidPlanRequired) {
+      // The server requires every workspace member to be on a paid plan.
+      // Surface this clearly so the user understands they need to upgrade —
+      // not silently drop the run into solo mode and let them wonder why.
+      Logger.warn('WorkspaceSync', 'Workspace access requires a paid plan — running in solo mode. Upgrade at /plan-billing to share runs with this workspace.', {
+        projectKey: identity.projectKey,
+        message: workspace.message || null,
+      });
+      return {
+        skipped: true,
+        reason: 'paid_plan_required',
+        message: workspace.message || 'Team workspaces are available on paid plans. Upgrade at /plan-billing to share runs with your team.',
+      };
+    }
+    if (!workspace.member) {
+      Logger.warn('WorkspaceSync', 'Workspace exists but this account is not a member — running in solo mode. Join via invite code in the dashboard.', {
+        projectKey: identity.projectKey,
+        workspaceId: workspace.workspaceId || null,
+        projectName: workspace.projectName || null,
+      });
+      return {
+        skipped: true,
+        reason: 'not_a_member',
+        projectKey: identity.projectKey,
+        message: workspace.message || 'You are not a member of this workspace. Join via invite code in the dashboard.',
+      };
+    }
 
     const workspaceId = workspace.workspaceId;
     Logger.info('WorkspaceSync', 'Workspace found — syncing team test files', {
@@ -10052,8 +10115,9 @@ async function runPipeline(config, runId) {
     // tests/generated/ so the planner + coverage top-up see teammates' work.
     // Completely non-blocking — any failure falls back to solo mode.
     const testsDir = path.join(config.projectPath, 'tests', 'generated');
-    workspaceState = await runWorkspacePreflight({ client: durableClient, config, testsDir });
-    if (workspaceState) {
+    const preflightResult = await runWorkspacePreflight({ client: durableClient, config, testsDir });
+    if (preflightResult && !preflightResult.skipped) {
+      workspaceState = preflightResult;
       updateStatus(statusDir, 'workspace_sync', {
         runId,
         message: workspaceState.filesWritten > 0
@@ -10062,6 +10126,29 @@ async function runPipeline(config, runId) {
         workspaceId: workspaceState.workspaceId,
         filesWritten: workspaceState.filesWritten,
         coveredRoutes: (workspaceState.teamCoverage?.routes || []).length,
+      }, telemetryReporter);
+    } else {
+      // Solo-mode visibility. Pick a reason-specific message so the user sees
+      // exactly why this run won't be shared with the workspace — the most
+      // common cause is needing a paid plan, which has its own clear copy.
+      workspaceState = null;
+      const reason = preflightResult?.reason || 'unknown';
+      const reasonMessages = {
+        paid_plan_required: preflightResult?.message
+          || 'This run is NOT being shared with any workspace because your account needs a paid plan with an active subscription. Every workspace member must be on a paid plan. Upgrade at /plan-billing in the Healix dashboard.',
+        not_a_member: preflightResult?.message
+          || 'This run is NOT being shared with any workspace because this account is not a member. Join via the invite code in the Healix dashboard.',
+        workspace_not_found: 'This run is NOT being shared with any workspace because no workspace is bound to this project yet. Create one in the Healix dashboard.',
+        no_project_identity: 'This run is NOT being shared with any workspace because no git remote or package.json identity was found. Set HEALIX_PROJECT_KEY to bind this repo to a workspace.',
+        no_api_key: 'This run is NOT being shared with any workspace because HEALIX_API_KEY is not set in the MCP environment.',
+        resolution_failed: 'This run is NOT being shared with any workspace because workspace resolution failed. Check MCP logs.',
+        unknown: 'This run is NOT being shared with any workspace. Check MCP logs for the reason.',
+      };
+      updateStatus(statusDir, 'workspace_skipped', {
+        runId,
+        reason,
+        paidPlanRequired: reason === 'paid_plan_required',
+        message: reasonMessages[reason] || reasonMessages.unknown,
       }, telemetryReporter);
     }
     if (workspaceState?.teamCoverage) {
@@ -11663,6 +11750,18 @@ async function runPipeline(config, runId) {
         // W1 — link the ingested test_run row to the team workspace so
         // /workspace/[id]/coverage and /all-tests?workspaceId=X show it.
         workspaceId: workspaceState?.workspaceId || config?._workspaceId || null,
+        // When the run was NOT attached to a workspace, pass the skip reason
+        // through so the dashboard's run-detail page can render a clear
+        // "this run was not shared because X" banner — saves users from
+        // hunting through MCP stderr.
+        workspaceSkip: !workspaceState && preflightResult?.skipped
+          ? {
+              reason: preflightResult.reason || null,
+              message: preflightResult.message || null,
+              projectKey: preflightResult.projectKey || null,
+              paidPlanRequired: preflightResult.reason === 'paid_plan_required',
+            }
+          : null,
       });
     });
     recordRunDecision(statusDir, telemetryReporter, {

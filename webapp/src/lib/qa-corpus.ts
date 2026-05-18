@@ -1,6 +1,6 @@
 import type { NextRequest } from 'next/server'
 import { createHash } from 'crypto'
-import { and, desc, eq, sql } from 'drizzle-orm'
+import { and, desc, eq, inArray, sql } from 'drizzle-orm'
 import { db } from '@/lib/db'
 import {
   apiKeys,
@@ -1519,6 +1519,141 @@ export async function loadQaCorpusForProject(userId: string, projectFingerprint:
       captured_at: row.capturedAt?.toISOString() ?? null,
     })),
     findings: findingRows.map(mapFindingRow),
+    finding_summary: summary,
+  }
+}
+
+/**
+ * Workspace-aware QA corpus load. Returns the union of every workspace
+ * member's qa_test_cases / qa_findings / qa_contract_snapshots for the given
+ * projectFingerprint, deduplicated by case_key / fingerprint / snapshot_hash
+ * (newest wins). This is what a teammate doing a fresh run needs to see —
+ * without it, the pipeline regenerates work that other members already did.
+ *
+ * Membership MUST be checked by the caller before invoking — this loader
+ * trusts that the caller has already authorized the workspaceId.
+ */
+export async function loadQaCorpusForWorkspace(workspaceId: string, projectFingerprint: string) {
+  const memberRows = await db
+    .select({ userId: workspaceMembers.userId })
+    .from(workspaceMembers)
+    .where(eq(workspaceMembers.workspaceId, workspaceId))
+  const memberIds = memberRows.map((m) => m.userId).filter(Boolean) as string[]
+  if (memberIds.length === 0) {
+    return {
+      project_fingerprint: projectFingerprint,
+      test_cases: [],
+      contract_snapshots: [],
+      findings: [],
+      finding_summary: buildFindingSummary([]),
+    }
+  }
+
+  const [testCaseRows, snapshotRows, findingRows] = await Promise.all([
+    db
+      .select()
+      .from(qaTestCases)
+      .where(and(inArray(qaTestCases.userId, memberIds), eq(qaTestCases.projectFingerprint, projectFingerprint)))
+      .orderBy(desc(qaTestCases.lastSeenAt))
+      .limit(2000),
+    db
+      .select()
+      .from(qaContractSnapshots)
+      .where(and(inArray(qaContractSnapshots.userId, memberIds), eq(qaContractSnapshots.projectFingerprint, projectFingerprint)))
+      .orderBy(desc(qaContractSnapshots.capturedAt))
+      .limit(80),
+    db
+      .select()
+      .from(qaFindings)
+      .where(and(inArray(qaFindings.userId, memberIds), eq(qaFindings.projectFingerprint, projectFingerprint)))
+      .orderBy(desc(qaFindings.lastSeenAt))
+      .limit(800),
+  ])
+
+  // Dedupe by case_key (keep the most recently seen row).
+  const seenCases = new Set<string>()
+  const dedupedCases = []
+  for (const row of testCaseRows) {
+    if (seenCases.has(row.caseKey)) continue
+    seenCases.add(row.caseKey)
+    dedupedCases.push(row)
+    if (dedupedCases.length >= 500) break
+  }
+
+  // Dedupe contract snapshots by snapshot_hash (newest wins).
+  const seenHashes = new Set<string>()
+  const dedupedSnapshots = []
+  for (const row of snapshotRows) {
+    if (row.snapshotHash && seenHashes.has(row.snapshotHash)) continue
+    if (row.snapshotHash) seenHashes.add(row.snapshotHash)
+    dedupedSnapshots.push(row)
+    if (dedupedSnapshots.length >= 20) break
+  }
+
+  // Dedupe findings by fingerprint (newest wins).
+  const seenFingerprints = new Set<string>()
+  const dedupedFindings = []
+  for (const row of findingRows) {
+    if (row.fingerprint && seenFingerprints.has(row.fingerprint)) continue
+    if (row.fingerprint) seenFingerprints.add(row.fingerprint)
+    dedupedFindings.push(row)
+    if (dedupedFindings.length >= 200) break
+  }
+
+  const summary = buildFindingSummary(dedupedFindings.map((row) => {
+    const normalized = {
+      severity: row.severity,
+      status: row.status,
+      category: row.category,
+      findingType: row.findingType,
+    }
+    return {
+      fingerprint: row.fingerprint,
+      title: row.title,
+      severity: row.severity,
+      status: row.status,
+      category: row.category,
+      findingType: row.findingType,
+      testName: row.testName,
+      testFile: row.testFile,
+      caseKey: null,
+      recommendation: row.recommendation,
+      evidence: row.evidence,
+      rawFinding: row.rawFinding,
+      isReal: isRealFinding(normalized),
+    }
+  }))
+
+  return {
+    project_fingerprint: projectFingerprint,
+    workspace_id: workspaceId,
+    test_cases: dedupedCases.map((row) => ({
+      id: row.id,
+      project_fingerprint: row.projectFingerprint,
+      case_key: row.caseKey,
+      title: row.title,
+      suite: row.suite,
+      file_path: row.filePath,
+      test_type: row.testType,
+      category: row.category,
+      tags: row.tags ?? [],
+      source: row.source,
+      metadata: row.metadata ?? null,
+      contributor_user_id: row.userId,
+      first_seen_at: row.firstSeenAt?.toISOString() ?? null,
+      last_seen_at: row.lastSeenAt?.toISOString() ?? null,
+    })),
+    contract_snapshots: dedupedSnapshots.map((row) => ({
+      id: row.id,
+      test_run_id: row.testRunId,
+      project_fingerprint: row.projectFingerprint,
+      snapshot_hash: row.snapshotHash,
+      source: row.source,
+      contracts: row.contracts,
+      summary: row.summary ?? null,
+      captured_at: row.capturedAt?.toISOString() ?? null,
+    })),
+    findings: dedupedFindings.map(mapFindingRow),
     finding_summary: summary,
   }
 }
