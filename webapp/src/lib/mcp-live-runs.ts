@@ -40,6 +40,7 @@ type LiveRunSnapshot = {
   message: string | null
   durationMs: number
   metadata: Record<string, unknown>
+  workspaceId: string | null
   firstSeenAt: Date
   lastSeenAt: Date
   liveTests: LiveTest[] | null
@@ -273,6 +274,8 @@ export async function getLiveRunSnapshotsForUser(userId: string, options?: {
   runId?: string
   windowHours?: number
   limit?: number
+  workspaceId?: string
+  soloOnly?: boolean
 }): Promise<LiveRunSnapshot[]> {
   const windowHours = Math.max(1, Math.min(72, Number(options?.windowHours || DEFAULT_WINDOW_HOURS)))
   const limit = Math.max(100, Math.min(3000, Number(options?.limit || DEFAULT_EVENT_LIMIT)))
@@ -334,6 +337,7 @@ export async function getLiveRunSnapshotsForUser(userId: string, options?: {
         message: clampText(row.message) || null,
         durationMs: clampNumber(row.durationMs, 0),
         metadata: meta,
+        workspaceId: clampText(meta.workspaceId) || null,
         firstSeenAt: occurredAt,
         lastSeenAt: occurredAt,
         liveTests: eventType === 'test_results' && Array.isArray(meta.tests)
@@ -347,6 +351,9 @@ export async function getLiveRunSnapshotsForUser(userId: string, options?: {
     }
 
     const existing = byRunId.get(runId)!
+    if (!existing.workspaceId && meta.workspaceId) {
+      existing.workspaceId = clampText(meta.workspaceId) || null
+    }
     if (occurredAt < existing.firstSeenAt) {
       existing.firstSeenAt = occurredAt
     }
@@ -359,13 +366,21 @@ export async function getLiveRunSnapshotsForUser(userId: string, options?: {
     }
   }
 
-  return [...byRunId.values()].map(resolveOrphanedSnapshot)
+  let snapshots = [...byRunId.values()].map(resolveOrphanedSnapshot)
+  if (options?.workspaceId) {
+    snapshots = snapshots.filter(s => s.workspaceId === options.workspaceId)
+  } else if (options?.soloOnly) {
+    snapshots = snapshots.filter(s => !s.workspaceId)
+  }
+  return snapshots
 }
 
 export async function getLiveRunsForUser(userId: string, options?: {
   runId?: string
   windowHours?: number
   limit?: number
+  workspaceId?: string
+  soloOnly?: boolean
 }) {
   const snapshots = await getLiveRunSnapshotsForUser(userId, options)
   return snapshots

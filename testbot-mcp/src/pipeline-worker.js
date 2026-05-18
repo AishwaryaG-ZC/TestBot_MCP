@@ -991,6 +991,24 @@ function listGeneratedTestFiles(projectPath) {
     .map((name) => path.join(generatedDir, name));
 }
 
+// Seed the `used` filename Set with every spec already on disk so that
+// agents writing fixed names (smoke.spec.ts, api-backend.spec.ts, etc.) can't
+// silently clobber files pulled from the workspace during preflight. The
+// existing collision-rename logic in safeWriteGeneratedTest will push new
+// agent output into -1/-2 variants instead, preserving teammate tests.
+function seedUsedFilenamesFromDisk(testsDir) {
+  const used = new Set();
+  try {
+    if (!testsDir || !fs.existsSync(testsDir)) return used;
+    for (const name of fs.readdirSync(testsDir)) {
+      if (GENERATED_SPEC_FILE_PATTERN.test(name)) {
+        used.add(name.toLowerCase());
+      }
+    }
+  } catch { /* best-effort */ }
+  return used;
+}
+
 function extractBracketMarkers(text, prefix) {
   const markers = [];
   const pattern = new RegExp(`\\[${prefix}:([^\\]]+)\\]`, 'gi');
@@ -3650,6 +3668,35 @@ function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
 
+const HEALIX_GITIGNORE_ENTRIES = [
+  '# Healix — generated test artifacts (auto-managed, do not commit)',
+  '.healix/',
+  '.healix-server.pid',
+  '.healix-worker.pid',
+  'tests/generated/',
+  'tests/.healix-quarantine/',
+  'tests/.healix-validation/',
+  'healix-reports/',
+  'playwright.config.ts',
+  'playwright.auth.config.ts',
+];
+const HEALIX_GITIGNORE_MARKER = '# Healix — generated test artifacts (auto-managed, do not commit)';
+
+function ensureHealixGitignore(projectPath) {
+  const gitignorePath = path.join(projectPath, '.gitignore');
+  let existing = '';
+  try {
+    existing = fs.readFileSync(gitignorePath, 'utf-8');
+  } catch {
+    // file doesn't exist yet — will be created below
+  }
+  if (existing.includes(HEALIX_GITIGNORE_MARKER)) return;
+  const separator = existing.length > 0 && !existing.endsWith('\n') ? '\n\n' : (existing.length > 0 ? '\n' : '');
+  const block = HEALIX_GITIGNORE_ENTRIES.join('\n') + '\n';
+  fs.writeFileSync(gitignorePath, existing + separator + block, 'utf-8');
+  Logger.info('PipelineWorker', '.gitignore updated with Healix entries', { gitignorePath });
+}
+
 function isVideoCursorEnabled(config = {}) {
   if (config.showMouseCursorInVideo === false) {
     return false;
@@ -4007,7 +4054,7 @@ function ensureQaContractSpecPersistent(args = {}) {
   return result;
 }
 
-function resetGeneratedTestsDir(projectPath) {
+function resetGeneratedTestsDir(projectPath, pulledFiles = null) {
   // Tier-0 specs are persistent and must survive Tier-1 (AI) resets.
   // We reset the ephemeral Tier-1 dir, then rebuild the legacy
   // `tests/generated/` union view from whatever Tier-0 emitted before us.
@@ -4022,6 +4069,30 @@ function resetGeneratedTestsDir(projectPath) {
   // reset and the rest of the pipeline (which still reads tests/generated)
   // sees them.
   try { TierIsolation.syncLegacyView(projectPath, { clear: false }); } catch { /* best effort */ }
+  // Re-write workspace-pulled files after the wipe. Without this they get
+  // destroyed by fs.rmSync above, so teammate tests would never reach
+  // Playwright. pulledFiles is a Map<fileName, { content, contentHash }>
+  // populated during workspace preflight.
+  if (pulledFiles instanceof Map && pulledFiles.size > 0) {
+    let restored = 0;
+    for (const [fileName, payload] of pulledFiles.entries()) {
+      try {
+        if (!fileName || !payload?.content) continue;
+        const safeName = path.basename(fileName);
+        const target = path.join(testsDir, safeName);
+        fs.writeFileSync(target, payload.content, 'utf-8');
+        restored += 1;
+      } catch (writeErr) {
+        Logger.warn('PipelineWorker', 'Failed to restore workspace-pulled file after reset', {
+          fileName,
+          reason: writeErr?.message,
+        });
+      }
+    }
+    if (restored > 0) {
+      Logger.info('PipelineWorker', `Restored ${restored} workspace-pulled test file(s) after generated-dir reset`);
+    }
+  }
   return testsDir;
 }
 
@@ -5470,6 +5541,10 @@ function extractAssertedLiteralText(content) {
     }
   }
   return [...new Set(values)];
+}
+
+function normalizeTextForAudit(text) {
+  return String(text || '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
 function sourceFileContainsLiteral(projectPath, sourceRef, literal) {
@@ -6924,7 +6999,7 @@ async function runPhase1FanOut({
   planSliceFor,
   backendGenerationSkippedReason = null,
 }) {
-  const used = new Set();
+  const used = seedUsedFilenamesFromDisk(testsDir);
   const files = [];
   const agentFailures = [];
   const agentsCompleted = [];
@@ -7382,7 +7457,7 @@ async function runAsyncGenerationPath({
     const syncPayload = enqueueResp.payload || {};
     const syncTests = Array.isArray(syncPayload.tests) ? syncPayload.tests : null;
     if (syncTests) {
-      const used = new Set();
+      const used = seedUsedFilenamesFromDisk(testsDir);
       const files = [];
       const seen = new Set();
       for (const t of syncTests) {
@@ -7494,7 +7569,7 @@ async function runAsyncGenerationPath({
     try { runBudget.abortSignals.push(abortController); } catch { /* noop */ }
   }
 
-  const used = new Set();
+  const used = seedUsedFilenamesFromDisk(testsDir);
   const files = [];
   const seenFilenames = new Set();
 
@@ -8884,7 +8959,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
   };
 
   const result = await tryGenerator('saas', async () => {
-    const testsDir = resetGeneratedTestsDir(config.projectPath);
+    const testsDir = resetGeneratedTestsDir(config.projectPath, config._workspacePulledFiles || null);
     // W2: pass the corpus-filtered context so Tier-0 doesn't re-emit
     // invariants the persisted corpus already covers.
     deterministicTier0Pack = ensureQaContractSpecPersistent({
@@ -9318,10 +9393,26 @@ async function runWorkspacePreflight({ client, config, testsDir }) {
     }
     Logger.info('WorkspaceSync', `Preflight sync complete`, { filesWritten, totalRemote: remoteFiles.length });
 
+    // Build a map of fileName → contentHash for every file we pulled from the
+    // workspace. runWorkspacePostGenSync uses this to skip re-uploading files
+    // that the generator did not touch (they're already up-to-date in the workspace).
+    // pulledFiles also keeps the raw content so resetGeneratedTestsDir can
+    // re-write them after wiping tests/generated/ for the AI generation pass.
+    const pulledFileHashes = new Map();
+    const pulledFiles = new Map();
+    for (const rf of remoteFiles) {
+      if (rf.fileName && rf.contentHash) {
+        pulledFileHashes.set(rf.fileName, rf.contentHash);
+      }
+      if (rf.fileName && rf.content) {
+        pulledFiles.set(rf.fileName, { content: rf.content, contentHash: rf.contentHash || null });
+      }
+    }
+
     // Pull coverage manifest
     const teamCoverage = await client.pullWorkspaceCoverage({ workspaceId });
 
-    return { workspaceId, filesWritten, teamCoverage: teamCoverage?.covered || null, identity };
+    return { workspaceId, filesWritten, teamCoverage: teamCoverage?.covered || null, identity, pulledFileHashes, pulledFiles };
   } catch (err) {
     Logger.warn('WorkspaceSync', 'Workspace preflight failed — continuing in solo mode', { message: err.message });
     return null;
@@ -9333,7 +9424,7 @@ async function runWorkspacePreflight({ client, config, testsDir }) {
  * Reads each file in testsDir, extracts coverage signals, pushes batch.
  * Fire-and-forget — never throws.
  */
-async function runWorkspacePostGenSync({ client, workspaceId, testsDir, runId, config }) {
+async function runWorkspacePostGenSync({ client, workspaceId, testsDir, runId, config, pulledFileHashes }) {
   if (!client || !workspaceId) return;
   try {
     const specFiles = listGeneratedTestFiles(config.projectPath);
@@ -9341,15 +9432,22 @@ async function runWorkspacePostGenSync({ client, workspaceId, testsDir, runId, c
 
     const { createHash } = require('crypto');
     const filesToPush = [];
+    // pulledFileHashes: Map<fileName, contentHash> built during preflight.
+    // Skip any file whose content is unchanged from what the workspace already
+    // has — those were pulled during preflight and not touched by the generator,
+    // so re-uploading them would silently inflate the corpus each run.
+    const pulled = pulledFileHashes instanceof Map ? pulledFileHashes : new Map();
     for (const filePath of specFiles) {
       try {
         const content = fs.readFileSync(filePath, 'utf-8');
         const fileName = path.basename(filePath);
+        const contentHash = createHash('sha256').update(content).digest('hex');
+        if (pulled.get(fileName) === contentHash) continue; // already up-to-date in workspace
         const signals = extractSpecSignals(content, fileName);
         filesToPush.push({
           fileName,
           content,
-          contentHash: createHash('sha256').update(content).digest('hex'),
+          contentHash,
           agent: null,
           testType: config.testType || 'both',
           runId: runId || null,
@@ -9365,7 +9463,9 @@ async function runWorkspacePostGenSync({ client, workspaceId, testsDir, runId, c
 
     if (filesToPush.length > 0) {
       await client.pushWorkspaceTestFiles({ workspaceId, files: filesToPush });
-      Logger.info('WorkspaceSync', `Pushed ${filesToPush.length} test files to workspace`, { workspaceId });
+      Logger.info('WorkspaceSync', `Pushed ${filesToPush.length} new/updated test files to workspace`, { workspaceId, skipped: specFiles.length - filesToPush.length });
+    } else {
+      Logger.info('WorkspaceSync', 'No new or changed test files to push to workspace', { workspaceId });
     }
   } catch (err) {
     Logger.warn('WorkspaceSync', 'Post-gen workspace push failed (non-blocking)', { message: err.message });
@@ -10037,6 +10137,7 @@ async function runWorkspaceCoveragePush({ client, workspaceId, runId, testResult
 async function runPipeline(config, runId) {
   const statusDir = path.join(config.projectPath, 'healix-reports', '.runs', runId);
   ensureDir(statusDir);
+  ensureHealixGitignore(config.projectPath);
   const telemetryReporter = new MCPTelemetryReporter();
 
   // Localhost + HEALIX_GEN_ASYNC is off-path. The async route was added to
@@ -10118,6 +10219,9 @@ async function runPipeline(config, runId) {
     const preflightResult = await runWorkspacePreflight({ client: durableClient, config, testsDir });
     if (preflightResult && !preflightResult.skipped) {
       workspaceState = preflightResult;
+      if (workspaceState.workspaceId) {
+        telemetryReporter.setWorkspaceId(workspaceState.workspaceId);
+      }
       updateStatus(statusDir, 'workspace_sync', {
         runId,
         message: workspaceState.filesWritten > 0
@@ -10151,29 +10255,51 @@ async function runPipeline(config, runId) {
         message: reasonMessages[reason] || reasonMessages.unknown,
       }, telemetryReporter);
     }
-    if (workspaceState?.teamCoverage) {
-      const tc = workspaceState.teamCoverage;
+    if (workspaceState?.teamCoverage || workspaceState?.workspaceId) {
+      const tc = workspaceState.teamCoverage || {};
+      // Build a full local-disk manifest from the workspace-pulled files. This
+      // gives the generator test titles + per-file detail (richer than just
+      // covered routes/apis), so initial-pass agents can avoid regenerating
+      // surfaces teammates already test.
+      let diskManifest = null;
+      try {
+        diskManifest = buildExistingSuiteManifest({
+          projectPath: config.projectPath,
+          context: config.context || {},
+          parsedPRD: config.parsedPRD || null,
+        });
+      } catch (manifestErr) {
+        Logger.warn('PipelineWorker', 'buildExistingSuiteManifest after preflight failed (non-blocking)', { reason: manifestErr.message });
+      }
+      const coveredFromDisk = diskManifest?.covered || {};
+      const mergedCovered = {
+        routes: [...new Set([...(coveredFromDisk.routes || []), ...(tc.routes || [])])],
+        apiEndpoints: [...new Set([...(coveredFromDisk.apiEndpoints || []), ...(tc.apiEndpoints || [])])],
+        catMarkers: [...new Set([...(coveredFromDisk.catMarkers || []), ...(tc.categories || [])])],
+        reqMarkers: [...new Set([...(coveredFromDisk.reqMarkers || []), ...(tc.requirements || [])])],
+        testTitles: coveredFromDisk.testTitles || [],
+        qacMarkers: coveredFromDisk.qacMarkers || [],
+        sourceRefs: coveredFromDisk.sourceRefs || [],
+      };
       config = {
         ...config,
         _workspaceId: workspaceState.workspaceId,
         _workspaceTeamCoverage: tc,
+        _workspacePulledFiles: workspaceState.pulledFiles || null,
         generationFeedback: {
           ...(config.generationFeedback || {}),
           existingSuiteManifest: {
             ...(config.generationFeedback?.existingSuiteManifest || {}),
-            covered: {
-              routes: tc.routes || [],
-              apiEndpoints: tc.apiEndpoints || [],
-              catMarkers: tc.categories || [],
-              reqMarkers: tc.requirements || [],
-            },
+            ...(diskManifest || {}),
+            covered: mergedCovered,
           },
         },
       };
-      Logger.info('PipelineWorker', 'Injected team coverage manifest into planner context', {
-        coveredRoutes: (tc.routes || []).length,
-        coveredApis: (tc.apiEndpoints || []).length,
-        coveredCategories: (tc.categories || []).length,
+      Logger.info('PipelineWorker', 'Injected existing suite manifest into generator context', {
+        coveredRoutes: mergedCovered.routes.length,
+        coveredApis: mergedCovered.apiEndpoints.length,
+        coveredCategories: mergedCovered.catMarkers.length,
+        coveredTitles: mergedCovered.testTitles.length,
       });
     }
 
@@ -11487,6 +11613,7 @@ async function runPipeline(config, runId) {
         testsDir: path.join(config.projectPath, 'tests', 'generated'),
         runId,
         config,
+        pulledFileHashes: workspaceState.pulledFileHashes,
       });
     }
 

@@ -1343,10 +1343,26 @@ IMPORTANT: Return ONLY valid JSON.`
 
     // Build auth context so the model knows exactly which roles have verified
     // storage states and which tests must be skipped.
-    const verifiedRoles = (this.roles || [])
+    const verifiedRoleEntries = (this.roles || [])
       .filter((r) => r && r.loginVerified && r.storageStatePath)
-      .map((r) => normalizeRoleLabel(r.name || r.role || 'user'))
+    const verifiedRoles = verifiedRoleEntries.map((r) => normalizeRoleLabel(r.name || r.role || 'user'))
     const availableRoles = [...new Set(verifiedRoles)]
+    // roleAliases maps PRD/business labels (e.g. "customer", "administrator") to
+    // the normalized labels that appear in availableRoles ("user", "admin").
+    // Without this, a test for "customer places an order" sees no "customer" in
+    // availableRoles and incorrectly self-skips with "missing auth context".
+    const roleAliases: Record<string, string> = {}
+    for (const r of verifiedRoleEntries) {
+      const normalized = normalizeRoleLabel(r.name || r.role || 'user')
+      const candidates = [r.originalCredentialRole, r.role, r.name]
+        .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+        .map((v) => v.trim().toLowerCase())
+      for (const candidate of candidates) {
+        if (candidate && candidate !== normalized) {
+          roleAliases[candidate] = normalized
+        }
+      }
+    }
     const credentialFixtures = (this.roles || [])
       .filter((r) => r && r.loginVerified && r.storageStatePath && r.username && r.password)
       .map((r) => ({
@@ -1364,6 +1380,7 @@ IMPORTANT: Return ONLY valid JSON.`
     const hasCredentials = availableRoles.length > 0
     const authContext = {
       availableRoles,
+      roleAliases,
       hasCredentials,
       credentialFixtures,
       credentialPolicy: credentialFixtures.length > 0
@@ -1509,6 +1526,26 @@ IMPORTANT: Return ONLY valid JSON.`
           'Return only new append-only files named healix-topup-*.spec.ts. Do not overwrite or restate any existing filename, test title, [REQ:*], route-only smoke check, or API endpoint already covered in existingSuiteManifest.covered.',
           'Every top-up test must target at least one item in existingSuiteManifest.missing: a missing route, API endpoint, category, or new requirement marker. If a QA contract is missing, do not write [QAC:*] tests; Healix emits deterministic QA-contract specs separately.',
         )
+      } else {
+        // Coverage-aware initial generation: when workspace pull or a prior local
+        // run populated existingSuiteManifest.covered, the LLM must skip surfaces
+        // teammates already test. This keeps the team corpus additive instead of
+        // having every member regenerate the same smoke/api/frontend tests.
+        const covered = (generationFeedback as { existingSuiteManifest?: { covered?: { routes?: unknown[]; apiEndpoints?: unknown[]; catMarkers?: unknown[]; reqMarkers?: unknown[]; testTitles?: unknown[] } } })?.existingSuiteManifest?.covered
+        const hasCoverage = covered && (
+          (Array.isArray(covered.routes) && covered.routes.length > 0) ||
+          (Array.isArray(covered.apiEndpoints) && covered.apiEndpoints.length > 0) ||
+          (Array.isArray(covered.catMarkers) && covered.catMarkers.length > 0) ||
+          (Array.isArray(covered.reqMarkers) && covered.reqMarkers.length > 0) ||
+          (Array.isArray(covered.testTitles) && covered.testTitles.length > 0)
+        )
+        if (hasCoverage) {
+          promptRequirements.push(
+            'Coverage-aware generation: CONTEXT_JSON.meta.generationFeedback.existingSuiteManifest.covered lists routes, API endpoints, categories, requirement markers, and test titles already covered by teammates’ specs in tests/generated/. Do not regenerate tests for any surface already in covered — focus exclusively on gaps.',
+            'Specifically: skip any route in covered.routes, any endpoint in covered.apiEndpoints, any category in covered.catMarkers, and any requirement marker in covered.reqMarkers. Do not reuse test titles in covered.testTitles.',
+            'If existingSuiteManifest.missing is present, prioritize its routes, apiEndpoints, categories, and requirements as the surfaces to test. If no missing items exist for your agent type, return an empty file list rather than producing redundant tests.',
+          )
+        }
       }
       for (const instruction of generationFeedback.instructions || []) {
         promptRequirements.push(String(instruction))
@@ -1862,6 +1899,7 @@ Return only the JSON array of generated files.`
 
 ## Auth Gating Rules (check CONTEXT_JSON.meta.authContext before generating any test)
 - CONTEXT_JSON.meta.authContext.availableRoles lists every role that has a verified Playwright storageState for this run. Values are normalized lower-case labels such as "user" and "admin". If it is an empty array, NO authentication context exists.
+- CONTEXT_JSON.meta.authContext.roleAliases maps PRD/business wording to availableRoles labels. The label normalizer collapses "customer"/"member"/"authed"/"authenticated" → "user" and "administrator"/"superadmin" → "admin". BEFORE wrapping a test in test.skip() for a missing role, resolve the PRD/business label through roleAliases — for example, if the PRD says "customer" and roleAliases is { customer: "user" }, the required role is "user", and the test MUST run (tagged @auth @tierB) when "user" is in availableRoles. Never skip a test because the PRD's exact spelling is absent from availableRoles when a roleAliases entry resolves it.
 - CONTEXT_JSON.meta.authContext.credentialFixtures lists actual user-provided test credentials when API login setup is allowed. Use exact values from this list only; never synthesize an email/password from "user", "customer", "admin", or a domain guess.
 - CONTEXT_JSON.meta.routeAccess is authoritative for route accessibility. Routes listed in publicRoutes or observedRoutes with requiresAuth:false are public and MUST have runnable tests; do not add test.skip() to those tests because credentials are absent.
 - Any test that navigates to a route proven protected by routeAccess.protectedRoutes, an observed route with requiresAuth:true, or a real auth-only/admin-only surface MUST first check whether the required role is in availableRoles. If it is NOT, wrap only that protected-route test body in: test.skip('Requires <role> credentials — not available in this run').
@@ -1870,8 +1908,9 @@ Return only the JSON array of generated files.`
 - If routeAccess.authMode is "public_app", generate public-first runnable coverage for the observed public routes and do not infer authentication from labels such as Dashboard, Projects, Calendar, Settings, Admin, Widget Library, Edit, Calendar, Logout, or role/admin wording in the PRD when exploration reached the route without redirecting.
 - If routeAccess.authMode is "public_app" and protectedRoutes is empty, authRequired/role/admin hints in PRD acceptance criteria are lower priority than routeAccess. Do NOT skip those tests for credentials; test the reachable public UI behavior instead.
 - NEVER hardcode guessed test user credentials (e.g. email: 'user@app.test', password: 'Password123!'). These accounts almost certainly do not exist in the target database. If no credentialFixture exists for a role, test unauthenticated negative behavior or skip only that auth-scoped case.
-- Admin-only routes (/admin/**): skip unconditionally unless "admin" is listed in availableRoles.
-- Signed-in customer/user routes must run when any non-admin authenticated role such as "user" is listed in availableRoles.`
+- Admin-only routes (/admin/**): if "admin" is in availableRoles, the test MUST include @auth and @tierB in the test() title string (example: test('Admin can view dashboard @auth @tierB', ...)). If "admin" is NOT in availableRoles, wrap in test.skip(). Never navigate to /admin/** in a test whose name lacks @auth @tierB — the Healix fixture skips storageState injection for untagged tests, causing the middleware to redirect to /login.
+- Signed-in customer/user routes must run when any non-admin authenticated role such as "user" is listed in availableRoles.
+- Heading-grounding rule: before asserting page.getByRole('heading', { name: ... }) on any protected or admin route, check route.headings in CONTEXT_JSON for that route. If route.headings is empty or does not contain the asserted text, do not assert a heading — assert visible structural elements, landmark regions, or stable buttons/links observed in context instead.`
 
     if (prefix === 'api') {
       return `${shared}
@@ -2169,6 +2208,23 @@ Return JSON array only.`
         return "page.locator('main h3, h3').first()"
       },
     )
+    // Auto-repair: if any test in this file navigates to /admin/* but the file
+    // has no @auth/@tierB tags, append them to every untagged test() name.
+    // The Healix fixture only injects storageState for tests whose title contains
+    // @auth or @tierB — without the tag the test runs unauthenticated and hits
+    // the login redirect.
+    if (
+      /page\.goto\s*\(\s*['"`][^'"`]*\/admin/i.test(normalized) &&
+      !/@auth|@tierB/i.test(normalized)
+    ) {
+      normalized = normalized.replace(
+        /(\btest\s*\(\s*)(['"`])([^'"`]+)(\2\s*,)/g,
+        (_match, testOpen: string, quote: string, name: string, end: string) => {
+          if (/@auth|@tierB/i.test(name)) return _match
+          return `${testOpen}${quote}${name} @auth @tierB${end}`
+        },
+      )
+    }
     return normalized
   }
 
@@ -2411,6 +2467,15 @@ Return JSON array only.`
         !/add\s+to\s+cart|cart\/items|\/api\/cart|request\.(?:post|put|patch)\(|localStorage\.setItem|sessionStorage\.setItem/i.test(content)
       if (cartFilledStateWithoutSetup) {
         errors.push('Cart filled-state tests must add an item or seed cart state before asserting subtotal/checkout/line items')
+      }
+
+      const adminRouteWithoutAuthTag =
+        /page\.goto\s*\(\s*['"`][^'"`]*\/admin[^'"`]*['"`]/i.test(content) &&
+        !/@auth|@tierB/i.test(content)
+      if (adminRouteWithoutAuthTag) {
+        errors.push(
+          'Tests navigating to /admin routes must include @auth and @tierB in the test() name string; Healix fixture only injects storageState for tests tagged this way'
+        )
       }
 
       const authStateNavMismatch =

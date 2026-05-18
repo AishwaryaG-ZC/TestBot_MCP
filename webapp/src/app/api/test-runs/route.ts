@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth/session'
 import { db } from '@/lib/db'
 import { testRuns, workspaceMembers, profiles } from '@/lib/db/schema'
-import { eq, and, desc, asc, count, sql, inArray } from 'drizzle-orm'
+import { eq, and, desc, asc, count, sql, inArray, isNull } from 'drizzle-orm'
 import { getLiveRunsForUser } from '@/lib/mcp-live-runs'
 
 function compareRows(
@@ -75,8 +75,9 @@ export async function GET(request: NextRequest) {
       if (scope === 'me') conditions.push(eq(testRuns.userId, user.id))
       else if (contributorId) conditions.push(eq(testRuns.userId, contributorId))
     } else {
-      // Solo / legacy mode: per-user view (back-compat).
+      // Solo / legacy mode: per-user view, exclude workspace-tagged runs.
       conditions.push(eq(testRuns.userId, user.id))
+      conditions.push(isNull(testRuns.workspaceId))
     }
 
     if (status) conditions.push(eq(testRuns.status, status))
@@ -163,9 +164,14 @@ export async function GET(request: NextRequest) {
     let mergedData: typeof mappedData = mappedData
     let mergedTotal = total ?? 0
 
-    // Live-run merging is per-user only — skip it in workspace team mode.
-    if (includeLive && page === 1 && !workspaceId) {
-      const liveRuns = await getLiveRunsForUser(user.id, { windowHours: 6, limit: 300 })
+    if (includeLive && page === 1) {
+      // In workspace mode: show the current user's in-progress runs that are tagged to this workspace.
+      // In solo mode: show all personal live runs (no workspaceId).
+      const liveRuns = await getLiveRunsForUser(user.id, {
+        windowHours: 6,
+        limit: 300,
+        ...(workspaceId ? { workspaceId } : { soloOnly: true }),
+      })
       const existingRunIds = new Set(
         mappedData
           .map((row) => String(row.run_id || '').trim())

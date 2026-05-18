@@ -185,7 +185,7 @@ function WorkspaceCard({ ws, onRefreshInvite, onViewCoverage, onDeleted }: {
           disabled={loadingMembers}
           className="flex-1 text-[10px] font-mono font-bold uppercase tracking-widest border border-[#333] hover:border-[#666] text-[#888] hover:text-white py-1.5 transition-colors disabled:opacity-40"
         >
-          {loadingMembers ? '...' : membersOpen ? 'HIDE MEMBERS' : 'MEMBERS'}
+          {loadingMembers ? '...' : membersOpen ? 'HIDE SETTINGS' : 'SETTINGS'}
         </button>
         <button
           onClick={() => setSetupOpen((v) => !v)}
@@ -364,7 +364,7 @@ export default function WorkspacePage() {
   };
 
   const handleCreate = async () => {
-    if (!createForm.projectName.trim()) return;
+    if (!createForm.projectName.trim() || !createForm.gitRemote.trim()) return;
     setCreating(true);
     try {
       const projectKey = createForm.projectKey.trim() || createForm.gitRemote.trim() || createForm.projectName.trim();
@@ -467,7 +467,7 @@ export default function WorkspacePage() {
               />
             </div>
             <div>
-              <label className="text-[9px] font-mono text-[#505050] uppercase tracking-widest block mb-1">Git Remote URL (recommended)</label>
+              <label className="text-[9px] font-mono text-[#505050] uppercase tracking-widest block mb-1">Git Remote URL *</label>
               <input
                 type="text"
                 value={createForm.gitRemote}
@@ -481,7 +481,7 @@ export default function WorkspacePage() {
           <div className="flex gap-2">
             <button
               onClick={handleCreate}
-              disabled={creating || !createForm.projectName.trim()}
+              disabled={creating || !createForm.projectName.trim() || !createForm.gitRemote.trim()}
               className="text-[10px] font-mono font-bold uppercase tracking-widest border border-white text-white hover:bg-white hover:text-black px-4 py-2 transition-colors disabled:opacity-40"
             >
               {creating ? 'CREATING...' : 'CREATE'}
@@ -567,7 +567,7 @@ export default function WorkspacePage() {
         <div className="text-[9px] font-mono text-[#505050] uppercase tracking-widest font-black">How it works</div>
         <div className="space-y-1.5 text-[10px] font-mono text-[#505050]">
           <div className="flex gap-2"><span className="text-[#333] font-black">01</span><span>Create a workspace for your repo using the git remote URL</span></div>
-          <div className="flex gap-2"><span className="text-[#333] font-black">02</span><span>Share the invite code with teammates — they join once</span></div>
+          <div className="flex gap-2"><span className="text-[#333] font-black">02</span><span>Add teammates or share the invite code with teammates — they join once</span></div>
           <div className="flex gap-2"><span className="text-[#333] font-black">03</span><span>Every Healix run auto-pulls teammates&apos; test files before generating</span></div>
           <div className="flex gap-2"><span className="text-[#333] font-black">04</span><span>Generation runs only for uncovered routes, APIs, and categories</span></div>
           <div className="flex gap-2"><span className="text-[#333] font-black">05</span><span>New tests are pushed back so the next teammate benefits immediately</span></div>

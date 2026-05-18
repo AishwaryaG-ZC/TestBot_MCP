@@ -89,15 +89,23 @@ class MCPTelemetryReporter {
     this.queue = [];
     this.processing = false;
     this.drainResolvers = [];
+    this.workspaceId = config.workspaceId || null;
   }
 
   isEnabled() {
     return this.config.enabled;
   }
 
+  setWorkspaceId(wsId) {
+    this.workspaceId = wsId || null;
+  }
+
   sanitizeEvent(input = {}) {
     const status = inferStatus(input);
     const occurredAt = input.occurredAt ? new Date(input.occurredAt) : new Date();
+    const rawMetadata = this.workspaceId
+      ? { workspaceId: this.workspaceId, ...(input.metadata && typeof input.metadata === 'object' ? input.metadata : {}) }
+      : input.metadata;
 
     return {
       source: clampString(this.config.source, 80),
@@ -111,7 +119,7 @@ class MCPTelemetryReporter {
       reason: clampString(input.reason, 500),
       message: clampString(input.message, MAX_MESSAGE_LENGTH),
       durationMs: Number.isFinite(Number(input.durationMs)) ? Number(input.durationMs) : undefined,
-      metadata: normalizeMetadata(input.metadata),
+      metadata: normalizeMetadata(rawMetadata),
       occurredAt: Number.isNaN(occurredAt.getTime()) ? new Date().toISOString() : occurredAt.toISOString(),
     };
   }
