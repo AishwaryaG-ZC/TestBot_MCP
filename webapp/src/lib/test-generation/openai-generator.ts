@@ -12,6 +12,11 @@
 import { z } from 'zod'
 import { OpenAIClient } from './openai-client'
 import { resolveConfiguredOpenAIModel } from '@/lib/model-defaults'
+import {
+  validateGrounding,
+  renderGroundingErrors,
+  buildGroundingCorrection,
+} from './grounding-validator'
 import type {
   AgentName,
   CapturedContext,
@@ -104,6 +109,12 @@ export class OpenAITestGenerator {
   totalCompletionTokens: number
   totalTokensUsed: number
   lastModelUsed: string | null
+  // Set by parseTestResponse when a grounding-validation rejection happens.
+  // The retry loop in callOpenAIForTests reads this and appends it to the
+  // correction prompt so the model gets a structured, literal-by-literal
+  // list of what to fix on the next attempt. Cleared at the start of each
+  // callOpenAIForTests invocation.
+  lastGroundingCorrection: string = ''
   parsedPRD: ParsedPRD | null = null
   explorationArtifact: ExplorationArtifact | null = null
   roles: Role[] = []
@@ -718,7 +729,7 @@ Rules:
 - Generate additional tests only (do not duplicate existing tests).
 - Add requirement trace tags [REQ:...] whenever PRD context exists.
 - Add explicit category tags [CAT:...] in test titles/comments.
-- Include deep checks tagged with @phase2 for stress/heavy scenarios.
+- Include deep checks tagged with @phase2 for stress/heavy scenarios. The @phase2 tag MUST appear INSIDE the test title string itself (e.g. \`test('@phase2 deep checkout flow', ...)\`), NEVER as a code comment like \`// @phase2\`. Playwright's --grep only matches tags inside test titles; tags in comments are invisible and will cause Phase 2 to crash with "No tests found".
 - Prefer deterministic selectors and assertions only.`
 
     const userPrompt = this.buildStructuredUserPrompt({
@@ -809,6 +820,19 @@ await page.goto(href!)
 \`\`\`
 If you see UUID-shaped paths in the OBSERVED_FLOWS context (e.g., \`/shop/11111111-…\`), those were captured during exploration and **may no longer be valid**. Do not copy them verbatim into \`page.goto\` calls.
 
+## Abstention Rule — Do Not Invent
+If a specific route, UI element, button name, or data state is NOT explicitly present in \`CONTEXT_JSON\`, you MUST NOT invent or assume it exists. When grounding fails, fall back in this priority order:
+1. **URL reachability** (always works, never strict-mode issues): \`await expect(page).toHaveURL(/\\/expected-path/)\`
+2. **Single-element structural locator**: \`await expect(page.locator('main').first()).toBeVisible()\` — use ONE landmark, not a list. If \`main\` may not exist, use \`page.locator('[role="main"]').first()\` instead. Picking a single tag avoids the strict-mode failure mode of multi-match selectors.
+3. **Console error absence** (already covered by listeners)
+
+HARD BANS in abstention fallbacks:
+- **Never use comma-separated CSS** like \`locator('main, form, body')\` or \`locator('nav, header')\` with \`toBeVisible()\`. Comma CSS matches multiple elements → strict-mode violation → test fails. If you genuinely need either-or, use \`.or()\` chaining: \`page.locator('main').or(page.locator('[role="main"]')).first()\`.
+- **Never use raw \`.first()\` on broad selectors** like \`locator('a, button').first()\` or \`getByRole('link').first()\` — \`.first()\` picks DOM order, often a hidden header/logo. If you must use \`.first()\`, scope it tightly: \`page.locator('main').getByRole('link').first()\` AND/OR chain \`.filter({ visible: true })\` when the framework supports it. For visibility checks, prefer a scoped landmark over a generic-element \`.first()\`.
+- **Never** fall back to \`getByRole('heading', { name: /something/i })\` with invented text — that re-introduces the hallucination this rule is meant to prevent.
+
+Silence (no assertion) is better than a hallucinated or strict-mode-violating selector.
+
 ## Output Format
 Return a JSON array of test files:
 [
@@ -835,6 +859,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks or explanations.`
         'Cover application load, main route navigation, and key UI landmarks.',
         'Include console error assertions and one mobile viewport check.',
         'Prefer robust locators and deterministic assertions only.',
+        'Use bounded or defensive assertions for anything potentially dynamic: prefer `expect(locator).not.toBeEmpty()` over `expect(locator).toHaveText(\'Welcome\')` unless the exact string appears verbatim in CONTEXT_JSON. Never assert exact item counts or exact user-generated text strings unless they are explicitly present in CONTEXT_JSON.',
       ],
       payload,
     })
@@ -1099,7 +1124,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`
         'Convert workflow steps into executable actions (navigate, fill, click, assert).',
         'Avoid placeholders and fixed waits.',
         'Assert route transitions and completion indicators for each workflow.',
-        'Tag workflow suites with [CAT:workflow_journey] and include at least one @phase2 deep-path test.',
+        'Tag workflow suites with [CAT:workflow_journey] and include at least one @phase2 deep-path test. The @phase2 tag MUST be embedded INSIDE the test title string (e.g. `test(\'@phase2 [CAT:workflow_journey] full checkout journey\', ...)`). Placing @phase2 in a code comment (`// @phase2`) is invisible to Playwright --grep and will cause the Phase 2 run to fail with "No tests found".',
       ],
       payload,
     })
@@ -1685,6 +1710,9 @@ Return only the JSON array of generated files.`
 
     let lastError: Error | null = null
     let correctionPrompt = ''
+    // Reset per-call so a previous agent's grounding rejection doesn't bleed
+    // into this one.
+    this.lastGroundingCorrection = ''
 
     // Per-agent telemetry accumulators (reset per `callOpenAIForTests` invocation
     // so each agent's run record reflects only its own tokens/latency/model).
@@ -1772,6 +1800,10 @@ Return only the JSON array of generated files.`
 
           if (remainingAttempts > 0) {
             correctionPrompt = this.buildCorrectionPrompt(prefix, lastError.message)
+            if (this.lastGroundingCorrection) {
+              correctionPrompt = `${correctionPrompt}${this.lastGroundingCorrection}`
+              this.lastGroundingCorrection = ''
+            }
             const delay = baseDelay * Math.pow(2, attempt)
             await this.sleep(delay)
           }
@@ -1809,7 +1841,15 @@ Return only the JSON array of generated files.`
   }
 
   buildGenerationContract(prefix: string): string {
-    const shared = `## Mandatory Response Contract
+    const shared = `## HIGHEST-PRIORITY RULE — Hallucination Prevention
+NEVER invent heading text, link labels, button names, status text, or dashboard/admin widget labels from PRD wording, role names, or domain knowledge. If a specific literal is NOT present in CONTEXT_JSON.context.routeAccess.observedRoutes or CONTEXT_JSON.context.sourceContext.assertableText, you MUST NOT use it as a selector name/text argument.
+- Forbidden invented examples (these failed in prior runs): /log in/i heading, /access denied/i heading, /dashboard|admin/i heading, /low stock/i link, /unread enquiries/i link, /critical/i text, /admin panel/i heading. The PRD mentioning a feature does NOT prove the UI label exists.
+- When you don't have proven text for what you want to assert: assert structural presence only (e.g., \`await expect(page.locator('h1').first()).toBeVisible()\` or \`await expect(page).toHaveURL(/\\/expected-path/)\`) and add a \`// Grounded in: structural fallback - exact text not in CONTEXT_JSON\` comment. Do NOT make up plausible-looking text.
+- Bounded-assertion rule: never use \`toHaveText('literal')\`, exact \`toHaveCount(N)\` for N>1, or \`getByText('literal', { exact: true })\` unless that exact literal appears verbatim in CONTEXT_JSON.context.sourceContext.assertableText or routeAccess.observedRoutes. For potentially dynamic content prefer \`not.toBeEmpty()\`, \`toBeVisible()\`, or regex-based partial matches.
+- Strict-mode safety: NEVER write \`locator('a, b, c')\` (comma-separated CSS) followed by \`toBeVisible()\` / \`toBeHidden()\`. Comma CSS matches multiple DOM nodes; Playwright's strict mode requires exactly one. Use a single tag (\`locator('main')\`), use \`.or()\` chaining when you genuinely need either-or fallback, or scope to a container first. Same rule for \`locator('nav, header')\`, \`locator('main, form, body')\`, etc. — every example of comma CSS with toBeVisible is a guaranteed strict-mode failure.
+- Visible \`.first()\` rule: \`.first()\` picks DOM order, not visible-element order. Broad-selector \`.first()\` calls like \`page.locator('a, button').first()\`, \`page.getByRole('link').first()\`, or \`page.locator('main').locator('a').first()\` frequently land on hidden header/logo/skip-link elements and fail with "received: hidden". When you need a representative element: (a) scope to a meaningful container first (e.g. \`page.locator('main')\`), (b) prefer role+name with proven text, or (c) skip the assertion entirely.
+
+## Mandatory Response Contract
 - Return a strict JSON array as the full response. A single fenced json block is tolerated only if there is no text outside it.
 - Schema (every entry is required):
   {"filename":"${prefix}-name.spec.ts","content":"full Playwright TypeScript test file"}
@@ -1877,7 +1917,13 @@ Return only the JSON array of generated files.`
 - Include explicit category tags across suite: [CAT:api_contract], [CAT:api_auth], [CAT:api_negative], [CAT:api_stress].`
     }
 
-    if (['frontend', 'workflow', 'smoke', 'error'].includes(prefix)) {
+    if (prefix === 'smoke') {
+      return `${shared}
+- Avoid exact absolute URL equality assertions (prefer path/regex-based URL checks).
+- Assertion grounding rule: every UI interaction or assertion (\`click\`, \`fill\`, \`expect\`) MUST include an inline comment citing the exact CONTEXT_JSON key that justifies it. Example: \`await page.goto('/login') // Grounded in: CONTEXT_JSON.meta.routeAccess.publicRoutes['/login']\`. Assertions without a grounding comment are a contract violation.`
+    }
+
+    if (['frontend', 'workflow', 'error'].includes(prefix)) {
       return `${shared}
 - Avoid exact absolute URL equality assertions (prefer path/regex-based URL checks).`
     }
@@ -1946,24 +1992,57 @@ Return JSON array only.`
       syntaxErrors: string[]
     }> = []
 
+    // Grounding validator modes:
+    //   'enforce' — failed grounding rejects the file (counts toward retry)
+    //   'report'  — failed grounding is logged in telemetry but does NOT reject
+    //   'off'     — validator is skipped entirely
+    // Default is 'report' so the upgrade ships safely; ops flip to 'enforce'
+    // once project-specific corpora are well-tuned.
+    const groundingMode = (process.env.HEALIX_GROUNDING_VALIDATOR || 'report').toLowerCase()
+    const groundingEnabled = groundingMode !== 'off'
+    const groundingEnforces = groundingMode === 'enforce'
+
     schemaResult.data.forEach((file, index) => {
       const filename = this.sanitizeFilename(file.filename, prefix, index)
       const normalizedContent = this.normalizeGeneratedContent(file.content)
       const qualityCheck = this.validateGeneratedContent(normalizedContent, prefix, generationContext)
       const syntaxCheck = this.validateTypeScriptSyntax(normalizedContent, filename)
+      const groundingCheck = groundingEnabled
+        ? validateGrounding(normalizedContent, generationContext.context, prefix)
+        : { valid: true, confidence: 1, totalLiterals: 0, groundedLiterals: 0, ungrounded: [] }
 
-      if (!qualityCheck.valid || !syntaxCheck.valid) {
-        rejectedFiles.push({
-          filename,
-          qualityErrors: qualityCheck.errors,
-          syntaxErrors: syntaxCheck.errors,
-        })
+      // Always record grounding telemetry (even in report mode) so the
+      // dashboard can show hallucination trends without blocking generation.
+      if (groundingEnabled && !groundingCheck.valid) {
         this.generationMeta?.rejections.push({
           filename,
           prefix,
-          qualityErrors: qualityCheck.errors,
+          qualityErrors: [
+            `[grounding-${groundingEnforces ? 'rejected' : 'report-only'}] ${renderGroundingErrors(groundingCheck).join(' | ')}`,
+          ],
+          syntaxErrors: [],
+        })
+      }
+
+      const blocksOnGrounding = groundingEnforces && !groundingCheck.valid
+      if (!qualityCheck.valid || !syntaxCheck.valid || blocksOnGrounding) {
+        const groundingErrors = blocksOnGrounding ? renderGroundingErrors(groundingCheck) : []
+        rejectedFiles.push({
+          filename,
+          qualityErrors: [...qualityCheck.errors, ...groundingErrors],
           syntaxErrors: syntaxCheck.errors,
         })
+        if (!qualityCheck.valid || !syntaxCheck.valid) {
+          this.generationMeta?.rejections.push({
+            filename,
+            prefix,
+            qualityErrors: qualityCheck.errors,
+            syntaxErrors: syntaxCheck.errors,
+          })
+        }
+        if (blocksOnGrounding) {
+          this.lastGroundingCorrection = buildGroundingCorrection(groundingCheck)
+        }
         return
       }
 

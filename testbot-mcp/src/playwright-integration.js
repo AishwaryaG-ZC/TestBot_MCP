@@ -451,25 +451,71 @@ module.exports = defineConfig({
   }
 
   ensurePlaywrightBrowsersInstalled() {
-    const browsersPath = process.env.PLAYWRIGHT_BROWSERS_PATH ||
-      path.join(process.env.HOME || process.env.USERPROFILE || '', '.cache', 'ms-playwright');
-
-    let hasChromium = false;
+    // Check if the exact browser executable expected by the current @playwright/test version exists.
+    // Checking for any chromium* directory is not enough — a stale version directory won't have the
+    // right binary (e.g. chromium_headless_shell-1208 vs an older chromium-XXXX directory).
+    let needsInstall = true;
     try {
-      if (fs.existsSync(browsersPath)) {
-        hasChromium = fs.readdirSync(browsersPath).some(dir => dir.startsWith('chromium'));
+      const result = execSync('npx playwright show-browser-path --browser chromium', {
+        cwd: this.config.projectPath,
+        stdio: 'pipe',
+        timeout: 15000,
+      });
+      const executablePath = result.toString().trim();
+      if (executablePath && fs.existsSync(executablePath)) {
+        needsInstall = false;
+      } else {
+        Logger.info('PlaywrightIntegration', 'Chromium binary not found at expected path', { executablePath });
       }
     } catch {
-      // If we can't read the directory, assume browsers are missing
+      // show-browser-path failed — also try the headless shell variant used in newer playwright
+      try {
+        const result = execSync('npx playwright show-browser-path --browser chromium --headless', {
+          cwd: this.config.projectPath,
+          stdio: 'pipe',
+          timeout: 15000,
+        });
+        const executablePath = result.toString().trim();
+        if (executablePath && fs.existsSync(executablePath)) {
+          needsInstall = false;
+        }
+      } catch {
+        // Could not determine path — fall back to directory scan as a last resort
+        try {
+          const browsersPath = process.env.PLAYWRIGHT_BROWSERS_PATH ||
+            path.join(process.env.HOME || process.env.USERPROFILE || '', '.cache', 'ms-playwright');
+          if (fs.existsSync(browsersPath)) {
+            // Look for an actual executable inside any chromium* directory, not just the directory itself
+            const chromiumDirs = fs.readdirSync(browsersPath).filter(dir => dir.startsWith('chromium'));
+            for (const dir of chromiumDirs) {
+              const dirPath = path.join(browsersPath, dir);
+              const subdirs = fs.readdirSync(dirPath).filter(d => d.includes('chrome'));
+              for (const sub of subdirs) {
+                const binCandidates = ['chrome', 'chrome-headless-shell', 'chromium', 'chromium-browser'];
+                for (const bin of binCandidates) {
+                  if (fs.existsSync(path.join(browsersPath, dir, sub, bin))) {
+                    needsInstall = false;
+                    break;
+                  }
+                }
+                if (!needsInstall) break;
+              }
+              if (!needsInstall) break;
+            }
+          }
+        } catch {
+          // If everything fails, attempt the install anyway
+        }
+      }
     }
 
-    if (!hasChromium) {
-      Logger.info('PlaywrightIntegration', 'Chromium browser not found. Installing via playwright install...');
+    if (needsInstall) {
+      Logger.info('PlaywrightIntegration', 'Chromium browser not found or version mismatch. Installing via playwright install chromium...');
       try {
         execSync('npx playwright install chromium', {
           cwd: this.config.projectPath,
-          stdio: 'pipe',
-          timeout: 180000,
+          stdio: 'inherit',
+          timeout: 300000,
         });
         Logger.info('PlaywrightIntegration', 'Chromium browser installed successfully');
       } catch (error) {
@@ -1386,12 +1432,25 @@ module.exports = defineConfig({
 
       const files = fs.readdirSync(generatedDir).filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name));
       const phaseTwoTagPattern = /@phase2|@deep|@stress|@matrix|@load|@api-stress|@api-negative|@api-auth|@api-contract/i;
+      // Match Playwright's --grep semantics: only tags that actually appear
+      // inside a test title (or describe title) get picked up. A comment
+      // containing "@phase2" is NOT a real tag and must not gate Phase 2,
+      // otherwise Playwright runs --grep against zero matches and exits 1
+      // with "No tests found" → NO_TESTS_TO_RUN pipeline failure.
+      const testTitleRe = /\b(?:test|test\.skip|test\.only|test\.fixme|describe|describe\.skip|describe\.only|test\.describe(?:\.skip|\.only)?)\s*\(\s*(['"`])((?:\\.|(?!\1).)*)\1/g;
+      const stripComments = (src) =>
+        String(src || '')
+          .replace(/\/\*[\s\S]*?\*\//g, '')
+          .replace(/(^|[^:\\])\/\/[^\n]*/g, '$1');
 
       for (const file of files) {
         const fullPath = path.join(generatedDir, file);
-        const content = fs.readFileSync(fullPath, 'utf-8');
-        if (phaseTwoTagPattern.test(content)) {
-          return true;
+        const content = stripComments(fs.readFileSync(fullPath, 'utf-8'));
+        for (const match of content.matchAll(testTitleRe)) {
+          const title = match[2] || '';
+          if (phaseTwoTagPattern.test(title)) {
+            return true;
+          }
         }
       }
     } catch (error) {

@@ -207,7 +207,11 @@ class ContextGatherer {
       richContext.apiEndpoints,
       richContext.forms
     );
-    richContext.sourceContext = this.extractSourceContext(projectPath, richContext.pages);
+    richContext.sourceContext = this.extractSourceContext(
+      projectPath,
+      richContext.pages,
+      richContext.projectStructure?.framework
+    );
     richContext.qaContracts = this.extractQaContracts(projectPath, richContext);
     richContext.extractionConfidence = {
       selectorHints: richContext.selectorHints.length > 0 ? 0.9 : 0.5,
@@ -2121,7 +2125,7 @@ class ContextGatherer {
     return 'source';
   }
 
-  extractSourceContext(projectPath, pages = []) {
+  extractSourceContext(projectPath, pages = [], framework = null) {
     const candidates = new Set();
     const addFile = (filePath) => {
       if (!filePath) return;
@@ -2231,6 +2235,29 @@ class ContextGatherer {
       return a.file.localeCompare(b.file);
     });
 
+    // Role-aware element extraction — framework-agnostic dispatch. When the
+    // current framework has no registered extractor (e.g. plain JS app or
+    // unrecognized stack), `extractRoleAware` returns supported:false and we
+    // simply omit `elements` from the result. Downstream consumers fall back
+    // to the legacy flat assertableText corpus and the run is not blocked.
+    let roleAwareElements = [];
+    try {
+      const { extractRoleAware } = require('./source-extractors');
+      const absoluteFiles = [...candidates].slice(0, 120);
+      const roleResult = extractRoleAware({
+        projectPath,
+        files: absoluteFiles,
+        framework: framework || 'unknown',
+        projectInfo: { routingMode: hashRoutingDetected ? 'hash' : 'path' },
+      });
+      if (roleResult.supported) {
+        // Cap to avoid bloating the context payload sent to the model.
+        roleAwareElements = (roleResult.elements || []).slice(0, 400);
+      }
+    } catch {
+      // Best-effort: never let role-aware extraction break the legacy path.
+    }
+
     return {
       files: files.slice(0, 40),
       assertableText: [...assertableText].slice(0, 220),
@@ -2238,6 +2265,8 @@ class ContextGatherer {
       testIds: [...testIds].slice(0, 120),
       sourceFilesAnalyzed: files.length,
       routingMode: hashRoutingDetected ? 'hash' : 'path',
+      // Role-aware tuples (framework-agnostic). Empty when no extractor matched.
+      elements: roleAwareElements,
     };
   }
 

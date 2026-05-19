@@ -5056,6 +5056,10 @@ function extractAssertedLiteralText(content) {
   return [...new Set(values)];
 }
 
+function normalizeTextForAudit(text) {
+  return String(text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
 function sourceFileContainsLiteral(projectPath, sourceRef, literal) {
   try {
     const cleanRef = String(sourceRef || '').replace(/^\/+/, '');

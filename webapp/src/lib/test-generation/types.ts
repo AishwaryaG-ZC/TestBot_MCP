@@ -47,6 +47,16 @@ export interface SourceContextFile {
   assertableText?: string[]
 }
 
+export interface RoleAwareElement {
+  role: string
+  accessibleName: string
+  isDynamic: boolean
+  attributes?: Record<string, string | number | undefined>
+  sourceFile?: string
+  route?: string | null
+  conditional?: string | null
+}
+
 export interface SourceContext {
   files?: SourceContextFile[]
   assertableText?: string[]
@@ -54,6 +64,8 @@ export interface SourceContext {
   testIds?: string[]
   sourceFilesAnalyzed?: number
   routingMode?: 'hash' | 'path' | string | null
+  /** Framework-agnostic role+name tuples extracted from source files. */
+  elements?: RoleAwareElement[]
 }
 
 export interface ApiEndpoint {
