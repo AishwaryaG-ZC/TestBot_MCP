@@ -2794,9 +2794,35 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
     ? quality.retainedSuite
     : null;
   const retainedEffectiveFloor = Number(retainedSuite?.effectiveRunnableFloor);
-  const usefulFloor = Number.isFinite(retainedEffectiveFloor) && retainedEffectiveFloor > 0
-    ? Math.min(originalUsefulFloor, retainedEffectiveFloor)
-    : originalUsefulFloor;
+  // R5: quarantine-aware floor (only when retainedSuite isn't already
+  // adjusting). When G47/G52/G53/G54 quarantine 40%+ of specs because
+  // they had dead locators, type errors, or contract drift, the
+  // pre-quarantine floor of 12 becomes punishing — a run that
+  // LEGITIMATELY produced 20 specs but kept only 10 after honest QC gets
+  // rejected as "insufficient runnable coverage", losing all the useful
+  // tests.
+  //
+  // When `retainedSuite` is set the worker already computed an
+  // effectiveRunnableFloor for that path — don't double-adjust. Only
+  // apply R5 when retainedSuite is null (i.e., gates ran inline without
+  // a hard-quarantine recovery cycle).
+  const ABSOLUTE_HARD_FLOOR = 5;
+  let usefulFloor;
+  if (Number.isFinite(retainedEffectiveFloor) && retainedEffectiveFloor > 0) {
+    // Pre-R5 path: respect the recovery-adjusted floor exactly.
+    usefulFloor = Math.min(originalUsefulFloor, retainedEffectiveFloor);
+  } else {
+    // R5 path: derive quarantine rate from quality counts.
+    const generatedTotal = quality.totalTests || 0;
+    const runnableTotal = quality.runnableTests || 0;
+    const inferredQuarantine = Math.max(0, generatedTotal - runnableTotal);
+    const quarantineRate = generatedTotal > 0
+      ? Math.min(1, inferredQuarantine / generatedTotal)
+      : 0;
+    usefulFloor = quarantineRate >= 0.4
+      ? Math.max(ABSOLUTE_HARD_FLOOR, Math.ceil(originalUsefulFloor * (1 - quarantineRate * 0.7)))
+      : originalUsefulFloor;
+  }
   const minSelectorQuality = profile === 'balanced' ? 0.35 : (profile === 'exhaustive' ? 0.6 : 0.5);
   const minRunnableRatio = profile === 'balanced' ? 0.25 : 0.5;
   const buildQualityEnvelope = (status, extra = {}) => ({
