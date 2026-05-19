@@ -395,16 +395,30 @@ class ArtifactUploader {
   }
 
   /**
-   * Upload artifacts to backend storage using multipart/form-data
+   * G68: Upload artifacts via per-file POSTs with concurrency cap.
+   *
+   * Pre-G68 we built one massive multipart body containing every artifact
+   * (~70 files, ~50MB) and POSTed it all in a single request. Two failure
+   * modes:
+   *   1. busboy on the receiving side intermittently emits "Unexpected end
+   *      of form" when the body straddles Node's stream-chunk boundaries
+   *      mid-multipart.
+   *   2. Vercel's 25MB body cap kills the whole batch on production.
+   *
+   * Per-file POSTs eliminate both: each request has exactly ONE artifact
+   * (artifact_0 + artifact_0_meta), so each multipart body is small and
+   * the busboy parser sees a complete, well-formed boundary every time.
+   * Concurrency 4 keeps total wall-clock close to the old approach while
+   * trading single-failure mode for partial-success semantics.
    */
   async uploadArtifacts(runId, artifacts) {
     Logger.info('ArtifactUploader', `uploadArtifacts called`, {
       runId,
       artifactCount: artifacts.length,
       hasApiKey: !!this.config.apiKey,
-      dashboardUrl: this.config.dashboardUrl
+      dashboardUrl: this.config.dashboardUrl,
     });
-    
+
     if (!this.config.apiKey) {
       Logger.error('ArtifactUploader', 'No API key configured, cannot upload artifacts');
       return { success: false, reason: 'no_api_key' };
@@ -412,37 +426,35 @@ class ArtifactUploader {
 
     if (artifacts.length === 0) {
       Logger.warn('ArtifactUploader', 'No artifacts to upload - collection found 0 artifacts');
-      return { success: true, uploaded: 0 };
+      return { success: true, uploaded: 0, failed: 0 };
     }
 
-    // CRITICAL: Must use node-fetch, not global fetch
-    // Global fetch doesn't handle form-data library streams properly
+    // Phase D deny-list belt-and-braces: filter credential files out before
+    // we expand the workload.
+    const filtered = artifacts.filter((a) => {
+      if (isCredentialFile(a.fullPath, a.fileName)) {
+        Logger.warn('ArtifactUploader', 'Refusing to upload credential file', { fileName: a.fileName });
+        return false;
+      }
+      return true;
+    });
+
+    if (filtered.length === 0) {
+      return { success: true, uploaded: 0, failed: 0 };
+    }
+
+    Logger.info('ArtifactUploader',
+      `Uploading ${filtered.length} artifact(s) one-per-request to ${this.config.dashboardUrl}/api/upload-artifacts (concurrency ${this.uploadConcurrency || 4})`);
+
     const fetchFn = require('node-fetch');
+    const concurrency = Math.max(1, Math.min(this.uploadConcurrency || 4, 8));
+    const failures = [];
+    const successes = [];
 
-    Logger.info('ArtifactUploader', `Uploading ${artifacts.length} artifacts to ${this.config.dashboardUrl} via multipart`);
-
-    try {
-      // Create multipart form data
-      const form = new FormData();
-      form.append('api_key', this.config.apiKey);
-      form.append('run_id', runId);
-
-      // Add each artifact as a file with metadata
-      for (let i = 0; i < artifacts.length; i++) {
-        const artifact = artifacts[i];
-
-        // Phase D deny-list: never upload credential files. Belt-and-braces
-        // check here in addition to collect-time filtering — if someone hands
-        // this function a credentials file directly, we still refuse.
-        if (isCredentialFile(artifact.fullPath, artifact.fileName)) {
-          Logger.warn('ArtifactUploader', 'Refusing to upload credential file', {
-            fileName: artifact.fileName,
-          });
-          continue;
-        }
-
-        // Compress based on type
-        let fileBuffer;
+    const uploadOne = async (artifact) => {
+      // 1. Resolve the file bytes (with format-specific compression).
+      let fileBuffer;
+      try {
         if (artifact.type === 'screenshot') {
           fileBuffer = await this.compressImage(artifact.fullPath);
         } else if (artifact.type === 'video') {
@@ -450,59 +462,97 @@ class ArtifactUploader {
         } else {
           fileBuffer = fs.readFileSync(artifact.fullPath);
         }
-
-        // Append file
-        form.append(`artifact_${i}`, fileBuffer, {
-          filename: artifact.fileName,
-          contentType: artifact.contentType,
-        });
-
-        // Append metadata as JSON string
-        form.append(`artifact_${i}_meta`, JSON.stringify({
-          test_name: artifact.testName,
-          type: artifact.type,
-          metadata: {
-            file_size: fileBuffer.length,
-            uploaded_at: new Date().toISOString(),
-          },
-        }));
-
-        Logger.debug('ArtifactUploader', `Added artifact ${i}: ${artifact.fileName} (${fileBuffer.length} bytes)`);
+      } catch (err) {
+        return { ok: false, artifact, reason: 'read_failed', error: err?.message || String(err) };
       }
 
-      // Upload with multipart/form-data
-      // IMPORTANT: Don't set Content-Type header - let FormData set it with boundary
-      const headers = form.getHeaders ? form.getHeaders() : undefined;
-      
-      const response = await fetchFn(`${this.config.dashboardUrl}/api/upload-artifacts`, {
-        method: 'POST',
-        body: form,
-        ...(headers && { headers }), // Only include headers for node-fetch with form-data
+      // 2. Build a single-artifact multipart body using the SAME field
+      // shape the existing /api/upload-artifacts route accepts.
+      const form = new FormData();
+      form.append('api_key', this.config.apiKey);
+      form.append('run_id', runId);
+      form.append('artifact_0', fileBuffer, {
+        filename: artifact.fileName,
+        contentType: artifact.contentType,
       });
+      form.append('artifact_0_meta', JSON.stringify({
+        test_name: artifact.testName,
+        type: artifact.type,
+        metadata: {
+          file_size: fileBuffer.length,
+          uploaded_at: new Date().toISOString(),
+        },
+      }));
 
-      if (!response.ok) {
-        const text = await response.text().catch(() => '');
-        Logger.error('ArtifactUploader', `Upload failed (HTTP ${response.status})`, { error: text });
-        return { success: false, reason: `http_${response.status}`, error: text };
+      // 3. POST it. Retry once on 5xx (transient Supabase / Vercel hiccup).
+      const headers = form.getHeaders ? form.getHeaders() : undefined;
+      const url = `${this.config.dashboardUrl}/api/upload-artifacts`;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const response = await fetchFn(url, { method: 'POST', body: form, ...(headers && { headers }) });
+          if (response.ok) {
+            return { ok: true, artifact };
+          }
+          const text = await response.text().catch(() => '');
+          if (response.status >= 500 && attempt === 1) {
+            // Transient — wait briefly and retry once.
+            await new Promise((r) => setTimeout(r, 250));
+            continue;
+          }
+          return { ok: false, artifact, reason: `http_${response.status}`, error: text };
+        } catch (err) {
+          if (attempt === 1) {
+            await new Promise((r) => setTimeout(r, 250));
+            continue;
+          }
+          return { ok: false, artifact, reason: 'network_error', error: err?.message || String(err) };
+        }
       }
+      return { ok: false, artifact, reason: 'unknown_failure' };
+    };
 
-      const result = await response.json();
-      Logger.info('ArtifactUploader', `Successfully uploaded ${result.uploaded}/${result.total} artifacts (${result.failed || 0} failed)`);
-      
-      if (result.errors && result.errors.length > 0) {
-        Logger.warn('ArtifactUploader', 'Some artifacts failed:', result.errors);
+    // Simple fixed-concurrency pool: walk the artifacts array with `concurrency`
+    // workers, each pulling the next index. No third-party deps.
+    let cursor = 0;
+    const workers = Array.from({ length: concurrency }, async () => {
+      while (true) {
+        const myIdx = cursor++;
+        if (myIdx >= filtered.length) return;
+        const result = await uploadOne(filtered[myIdx]);
+        if (result.ok) {
+          successes.push(result);
+          Logger.debug('ArtifactUploader', `Uploaded ${result.artifact.fileName}`);
+        } else {
+          failures.push(result);
+          Logger.warn('ArtifactUploader', `Upload failed for ${result.artifact.fileName}`, {
+            reason: result.reason,
+            error: result.error?.slice?.(0, 200),
+          });
+        }
       }
-      
-      return { 
-        success: result.uploaded > 0, 
-        uploaded: result.uploaded,
-        failed: result.failed || 0,
-        artifacts: result.artifacts 
-      };
-    } catch (error) {
-      Logger.error('ArtifactUploader', 'Upload failed', { error: error.message });
-      return { success: false, reason: 'network_error', error: error.message };
-    }
+    });
+    await Promise.all(workers);
+
+    const uploaded = successes.length;
+    const failed = failures.length;
+    const success = uploaded > 0 && failed === 0;
+
+    Logger.info('ArtifactUploader',
+      `Per-file upload complete: ${uploaded} uploaded, ${failed} failed (of ${filtered.length})`);
+
+    return {
+      success,
+      uploaded,
+      failed,
+      // Surface the first 5 failure reasons for diagnostics; don't dump
+      // hundreds of stack traces.
+      failureSamples: failures.slice(0, 5).map((f) => ({
+        fileName: f.artifact.fileName,
+        reason: f.reason,
+        error: typeof f.error === 'string' ? f.error.slice(0, 200) : null,
+      })),
+      reason: success ? undefined : (failed === filtered.length ? 'all_failed' : 'partial_failure'),
+    };
   }
 
   /**

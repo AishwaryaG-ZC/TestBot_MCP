@@ -284,8 +284,58 @@ class ReportGenerator {
     }
   }
 
+  // G57: collapse multiple entries for the same logical test (same file +
+  // suite + title) that were artificially inflated by the results-merger's
+  // per-project + per-attempt keying. Same test across tierA-public and
+  // tierB-auth-admin = ONE canonical row. Best status wins (passed > flaky
+  // > skipped > failed). The original entries are retained on
+  // `canonical.projectStatuses[]` so per-tier UI drilldown still works.
+  //
+  // Status precedence rule: if ANY project's final attempt passed, the
+  // canonical row is "passed" (a test that works in one tier is generally
+  // a working test). "failed" only when EVERY project's final attempt
+  // failed. This matches how a human QA would summarize.
+  buildCanonicalTestsList(rawTests) {
+    if (!Array.isArray(rawTests) || rawTests.length === 0) return [];
+    const STATUS_RANK = { passed: 3, flaky: 2, skipped: 1, failed: 0 };
+    const canonicalize = (s) => String(s || '').toLowerCase();
+    const groups = new Map();
+    for (const t of rawTests) {
+      const file = String(t.file || '').trim().toLowerCase();
+      const suite = String(t.suite || '').trim().toLowerCase();
+      const title = String(t.title || '').trim().toLowerCase();
+      const key = `${file}::${suite}::${title}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(t);
+    }
+    const canonical = [];
+    for (const entries of groups.values()) {
+      // pick the entry with the highest-ranked status as the canonical row
+      let best = entries[0];
+      let bestRank = STATUS_RANK[canonicalize(best.status)] ?? -1;
+      for (const e of entries) {
+        const r = STATUS_RANK[canonicalize(e.status)] ?? -1;
+        if (r > bestRank) { best = e; bestRank = r; }
+      }
+      // attach per-project breakdown
+      const projectStatuses = entries.map((e) => ({
+        project: e.projectName || e.project || e.browser || 'default',
+        status: canonicalize(e.status),
+        duration: Number(e.duration || 0),
+        retries: Number(e.retries || 0),
+      }));
+      canonical.push({ ...best, projectStatuses });
+    }
+    return canonical;
+  }
+
   buildTestsList(testResults, aiAnalysis, jiraData) {
-    const tests = testResults.tests || [];
+    // G57: dedupe first, then normalize. The raw `testResults.tests` array
+    // can have the same logical test repeated per Playwright project; the
+    // dashboard's top-line count should reflect unique tests, not Cartesian
+    // (project × attempt) entries.
+    const rawTests = testResults.tests || [];
+    const tests = this.buildCanonicalTestsList(rawTests);
 
     return tests.map((test) => {
       let errorStr = null;
@@ -461,13 +511,23 @@ class ReportGenerator {
       const category = this.inferQaCategory(test);
       byCategory[category] = (byCategory[category] || 0) + 1;
       const text = `${test.error || test.errorMessage || test.title || ''}`;
-      const reason = /fixture|sample|dynamic|No live fixture/i.test(text)
-        ? 'missing_fixture_or_dynamic_sample'
-        : /auth|storage|role/i.test(text)
-          ? 'missing_auth_context'
-          : /skip/i.test(text)
-            ? 'explicit_skip'
-            : 'unspecified_skip';
+      // G39: tier-aware skip classification. `missing_auth_context` only makes
+      // sense in Tier A public projects — if the test ran in Tier B (where
+      // auth IS configured), an auth-related skip is a setup failure, not a
+      // missing-context skip. The tier comes from the Playwright project tag
+      // (e.g. `tierA-public`, `tierB-auth-admin`, `tierC-backend`).
+      const tierTag = String(test.tier || test.project || '').toLowerCase();
+      const isTierB = tierTag.startsWith('tierb');
+      let reason;
+      if (/fixture|sample|dynamic|No live fixture/i.test(text)) {
+        reason = 'missing_fixture_or_dynamic_sample';
+      } else if (/auth|storage|role/i.test(text)) {
+        reason = isTierB ? 'auth_setup_failed' : 'missing_auth_context';
+      } else if (/skip/i.test(text)) {
+        reason = 'explicit_skip';
+      } else {
+        reason = 'unspecified_skip';
+      }
       byReason[reason] = (byReason[reason] || 0) + 1;
       if (examples.length < 8) {
         examples.push({
@@ -690,23 +750,98 @@ class ReportGenerator {
         findingSummary,
         skipSummary,
       },
-      stats: {
-        total: Number(testResults.total || 0),
-        passed: Number(testResults.passed || 0),
-        failed: Number(testResults.failed || 0),
-        skipped: Number(testResults.skipped || 0),
-        runnable: Math.max(0, Number(testResults.total || 0) - Number(testResults.skipped || 0)),
-        flaky: Number(flakyCount ?? testResults.flaky ?? 0),
-        duration: Number(testResults.duration || 0),
-        passRate: testResults.total > 0
-          ? Math.round((testResults.passed / testResults.total) * 100)
-          : 0,
-      },
+      // G49: honest pass rate. Failures are partitioned by the
+      // classifier verdict into three buckets:
+      //   - appBugFailures: real product defects (verdict=app_is_wrong, or
+      //     unclassified high-confidence "ambiguous" — treated as app bugs
+      //     unless we have evidence otherwise).
+      //   - pipelineNoiseFailures: verdict=test_is_wrong (generator wrote a
+      //     bad spec) OR verdict=environment (setup/auth issue, not a real
+      //     product bug).
+      //   - flakyFailures: verdict=flake (intermittent — not a definitive
+      //     signal either way).
+      // The dashboard's headline "Failed" count uses appBugFailures so the
+      // pass rate reflects the actual codebase quality, not the pipeline's
+      // own test-generation noise. The buckets are exposed separately so
+      // operators can drill in.
+      stats: (() => {
+        // G57: counts are computed from the CANONICAL (deduped by file+suite+title)
+        // test list, not from Playwright's raw cartesian (per-project × per-attempt)
+        // total. A test that runs in tierA AND tierB = ONE canonical test. A test
+        // that passes after one retry = passed (not failed-then-passed). The raw
+        // totals are kept under `raw` for transparency.
+        const canonicalTests = this.buildCanonicalTestsList(testResults.tests || []);
+        const canonStatus = (s) => String(s || '').toLowerCase();
+        const total = canonicalTests.length || Number(testResults.total || 0);
+        const totalPassed = canonicalTests.filter((t) => canonStatus(t.status) === 'passed').length;
+        const totalFailedAll = canonicalTests.filter((t) => canonStatus(t.status) === 'failed').length;
+        const totalSkipped = canonicalTests.filter((t) => ['skipped', 'pending'].includes(canonStatus(t.status))).length;
+        const flaky = Number(flakyCount ?? testResults.flaky ?? canonicalTests.filter((t) => canonStatus(t.status) === 'flaky').length);
+        const cv = Array.isArray(classifierVerdicts) ? classifierVerdicts : [];
+        const noiseVerdicts = new Set(['test_is_wrong', 'environment']);
+        const appBugCount = cv.filter((v) => String(v?.verdict || '') === 'app_is_wrong').length;
+        const noiseCount = cv.filter((v) => noiseVerdicts.has(String(v?.verdict || ''))).length;
+        const ambiguousCount = cv.filter((v) => String(v?.verdict || '') === 'ambiguous').length;
+        // Failures with no classifier verdict (verdict-less) are treated as app bugs
+        // to avoid silently hiding signal.
+        const unclassifiedCount = Math.max(0, totalFailedAll - cv.length);
+        const honestFailed = Math.min(totalFailedAll, appBugCount + ambiguousCount + unclassifiedCount);
+        const honestRunnable = Math.max(0, total - totalSkipped);
+        const honestPassRate = honestRunnable > 0
+          ? Math.round(((totalPassed + noiseCount) / honestRunnable) * 100)
+          : 0;
+        return {
+          total,
+          passed: totalPassed,
+          failed: honestFailed,
+          skipped: totalSkipped,
+          runnable: honestRunnable,
+          flaky,
+          duration: Number(testResults.duration || 0),
+          passRate: honestPassRate,
+          // G49 + G57 transparency fields — surface both the verdict-partition
+          // AND the canonicalization delta so anyone reading the report can
+          // see what the un-filtered Playwright totals were.
+          appBugFailures: appBugCount + ambiguousCount + unclassifiedCount,
+          pipelineNoiseFailures: noiseCount,
+          raw: {
+            // Playwright's reported total (per-project × per-attempt).
+            total: Number(testResults.total || 0),
+            failed: Number(testResults.failed || 0),
+            passed: Number(testResults.passed || 0),
+            skipped: Number(testResults.skipped || 0),
+            passRate: Number(testResults.total || 0) > 0
+              ? Math.round((Number(testResults.passed || 0) / Number(testResults.total || 0)) * 100)
+              : 0,
+            // How many redundant rows G57 collapsed.
+            duplicatesCollapsed: Math.max(0, Number(testResults.total || 0) - total),
+          },
+        };
+      })(),
       tests: this.buildTestsList(testResults, aiAnalysis, jiraData),
       aiSummary: Array.isArray(aiAnalysis) && aiAnalysis.length > 0 ? this.buildAISummary(aiAnalysis) : null,
       jiraSummary: jiraData ? this.buildJiraSummary(jiraData) : null,
       generationQuality: this.stripAnsiAndNormalize(generationQuality || null),
-      requirementsCoverage: this.stripAnsiAndNormalize(requirementsCoverage || null),
+      // G38: reconcile requirementsCoverage with acCoverage so the dashboard
+      // doesn't show "3/3" and "17/22" side by side. When acCoverage is
+      // present and richer, derive a requirementsCoverage shape from it; both
+      // fields now describe the same population (covered AC IDs / total ACs).
+      requirementsCoverage: (() => {
+        const ac = generationMeta?.acCoverage;
+        if (ac && typeof ac === 'object') {
+          const covered = Array.isArray(ac.covered) ? ac.covered : (Array.isArray(ac.coveredAcIds) ? ac.coveredAcIds : null);
+          const total = Number.isFinite(ac.totalAcTags) ? ac.totalAcTags : (Number.isFinite(ac.total) ? ac.total : null);
+          if (covered && total != null) {
+            return this.stripAnsiAndNormalize({
+              coveredAcIds: covered,
+              totalAcIds: total,
+              ratio: total > 0 ? covered.length / total : 0,
+              source: 'derived_from_acCoverage',
+            });
+          }
+        }
+        return this.stripAnsiAndNormalize(requirementsCoverage || null);
+      })(),
       phaseResults: this.stripAnsiAndNormalize(phaseResults || testResults.phaseResults || null),
       tierResults: tierResults || testResults.tierResults || null,
       pipelineError: pipelineError ? this.stripAnsiAndNormalize(pipelineError) : null,
@@ -731,6 +866,16 @@ class ReportGenerator {
       // execution with incomplete coverage (`coverage_degraded`).
       failureBreakdown: this.stripAnsiAndNormalize(generationMeta?.failureBreakdown || null),
       runStatus: generationMeta?.runStatus || null,
+      // F6 / G75: surface specQuarantineHistory at the top level so the
+      // dashboard can read it without spelunking into generationMeta.
+      // Each entry: { file, gate, action, reason, iter, ts }.
+      specQuarantineHistory: Array.isArray(generationMeta?.specQuarantineHistory)
+        ? generationMeta.specQuarantineHistory
+        : [],
+      // F6 / G66: ordered list of validation gates that ran this run.
+      gateStageOrder: Array.isArray(generationMeta?.gateStageOrder)
+        ? generationMeta.gateStageOrder
+        : [],
     };
 
     const reportFilename = `report-${timestamp.replace(/[:.]/g, '-')}.json`;
@@ -741,69 +886,98 @@ class ReportGenerator {
     fs.writeFileSync(latestPath, JSON.stringify(report, null, 2), 'utf-8');
 
     let dashboardLink = `file://${reportPath}`;
+    let ingestSucceeded = false;
+    let ingestLastStatus = null;
+    let ingestLastError = null;
     if (api_key && dashboard_url) {
-      try {
-        const fetchFn = global.fetch || require('node-fetch');
-        const response = await fetchFn(`${dashboard_url}/api/test-runs/ingest`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            api_key,
-            creation_name: projectName || path.basename(projectPath),
-            run_id: runId || null,
-            report,
-            project_path: projectPath,
-            tier_results: report.tierResults || null,
-            pipeline_error: report.pipelineError || null,
-            failures: report.failures || [],
-            flaky_count: report.stats.flaky || 0,
-            classifier_verdicts: report.classifierVerdicts || [],
-            failure_clusters: report.failureClusters || [],
-            qa_findings: report.qaFindings || [],
-            qa_test_case_runs: report.qaTestCaseRuns || [],
-            finding_summary: report.findingSummary || null,
-            // CL3-B — when the iteration controller exits with
-            // `stop_qa_cycle_complete`, the worker stamps
-            // `report.runStatus = 'qa_cycle_complete'`. The ingest route
-            // honors it instead of inferring from pass/fail counts.
-            run_status: report.runStatus || null,
-            // CL3-A — broadcast the failure classification breakdown so the
-            // dashboard can render "5 real bugs / 12 ungrounded tests / 1 env".
-            failure_breakdown: report.failureBreakdown || null,
-            // W1 — link this run to the resolved workspace so the team
-            // dashboard, coverage matrix, and activity stream include it.
-            // The /api/test-runs/ingest route accepts either body or
-            // x-healix-workspace-id header; we send body for backwards-compat.
-            workspace_id: workspaceId || null,
-            workspaceId: workspaceId || null,
-            // WS-2 — if this is a top-up run, populate parent_run_id on the
-            // child test_runs row so the dashboard can render the parent →
-            // children tree.
-            parent_test_run_id: parentTestRunId || null,
-            parentTestRunId: parentTestRunId || null,
-            // WS-LIVE — if pipeline-worker pre-created a stub test_runs row,
-            // tell the ingest route to UPDATE that row instead of inserting
-            // a duplicate. The live phase telemetry stays attached.
-            existing_test_run_id: existingTestRunId || null,
-            existingTestRunId: existingTestRunId || null,
-          }),
-        });
+      const fetchFn = global.fetch || require('node-fetch');
+      const ingestBody = JSON.stringify({
+        api_key,
+        creation_name: projectName || path.basename(projectPath),
+        run_id: runId || null,
+        report,
+        project_path: projectPath,
+        tier_results: report.tierResults || null,
+        pipeline_error: report.pipelineError || null,
+        failures: report.failures || [],
+        flaky_count: report.stats.flaky || 0,
+        classifier_verdicts: report.classifierVerdicts || [],
+        failure_clusters: report.failureClusters || [],
+        qa_findings: report.qaFindings || [],
+        qa_test_case_runs: report.qaTestCaseRuns || [],
+        finding_summary: report.findingSummary || null,
+        run_status: report.runStatus || null,
+        failure_breakdown: report.failureBreakdown || null,
+        workspace_id: workspaceId || null,
+        workspaceId: workspaceId || null,
+        parent_test_run_id: parentTestRunId || null,
+        parentTestRunId: parentTestRunId || null,
+        existing_test_run_id: existingTestRunId || null,
+        existingTestRunId: existingTestRunId || null,
+      });
 
-        if (response.ok) {
-          const payload = await response.json();
-          dashboardLink = `${dashboard_url}${payload.dashboard_url}`;
-          // Store the actual test_run_id returned by the server
-          if (payload.test_run_id) {
-            report.metadata.actualRunId = payload.test_run_id;
-            Logger.info('ReportGenerator', `Test run ingested with ID: ${payload.test_run_id}`);
+      // G59: retry-with-backoff. Pre-G59 the call was best-effort with a
+      // warn-on-failure and no retries, which meant a single transient 5xx
+      // (e.g. Supabase blip, gateway timeout) left the dashboard row with
+      // total_tests=0/passed_tests=0 even though local results were fine.
+      // 3 attempts with 1s, 3s, 9s backoff covers the typical blip.
+      const maxAttempts = 3;
+      const baseDelayMs = 1000;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          const response = await fetchFn(`${dashboard_url}/api/test-runs/ingest`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: ingestBody,
+          });
+          ingestLastStatus = response.status;
+          if (response.ok) {
+            const payload = await response.json();
+            dashboardLink = `${dashboard_url}${payload.dashboard_url}`;
+            if (payload.test_run_id) {
+              report.metadata.actualRunId = payload.test_run_id;
+              Logger.info('ReportGenerator', `Test run ingested with ID: ${payload.test_run_id}`, { attempt });
+            }
+            ingestSucceeded = true;
+            break;
           }
-        } else {
-          Logger.warn('ReportGenerator', 'Dashboard sync failed', { status: response.status });
+          // 4xx is a permanent failure (validation, auth) — don't retry.
+          if (response.status >= 400 && response.status < 500) {
+            Logger.warn('ReportGenerator', 'Dashboard sync failed (non-retryable)', { status: response.status, attempt });
+            break;
+          }
+          Logger.warn('ReportGenerator', 'Dashboard sync transient failure', { status: response.status, attempt, maxAttempts });
+        } catch (error) {
+          ingestLastError = error.message;
+          Logger.warn('ReportGenerator', 'Dashboard sync threw error', { reason: error.message, attempt, maxAttempts });
         }
-      } catch (error) {
-        Logger.warn('ReportGenerator', 'Dashboard sync threw error', { reason: error.message });
+        if (attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(3, attempt - 1)));
+        }
+      }
+      if (!ingestSucceeded) {
+        Logger.warn('ReportGenerator', 'Dashboard sync exhausted retries — dashboard row will lack counts until reconciled', {
+          lastStatus: ingestLastStatus,
+          lastError: ingestLastError,
+        });
+        // Persist the ingest failure to the local report so a reconciler
+        // job (or an operator) can find it later and replay. Local report
+        // file is the source of truth — write the failure metadata in
+        // beside it for easy discovery.
+        try {
+          const failureMarkerPath = path.join(reportsDir, 'dashboard-ingest-failed.json');
+          fs.writeFileSync(failureMarkerPath, JSON.stringify({
+            timestamp: new Date().toISOString(),
+            runId,
+            existingTestRunId: existingTestRunId || null,
+            reportPath,
+            latestPath,
+            lastStatus: ingestLastStatus,
+            lastError: ingestLastError,
+            attempts: maxAttempts,
+            stats: report.stats,
+          }, null, 2), 'utf-8');
+        } catch { /* best-effort */ }
       }
     }
 
@@ -812,6 +986,11 @@ class ReportGenerator {
       latestPath,
       url: dashboardLink,
       actualRunId: report.metadata.actualRunId || runId,
+      dashboardIngest: {
+        succeeded: ingestSucceeded,
+        lastStatus: ingestLastStatus,
+        lastError: ingestLastError,
+      },
     };
   }
 }

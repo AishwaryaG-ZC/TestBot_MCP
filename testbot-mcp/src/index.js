@@ -36,6 +36,7 @@ const ConfigUILauncher = require('./config-ui-launcher');
 const MCPTelemetryReporter = require('./mcp-telemetry');
 const WebappClient = require('./webapp-client');
 const { detectProjectKey: _detectProjectKeyMod } = require('./detect-project-key');
+const LocalSetup = require('./local-setup');
 
 const CREDENTIAL_SCHEMA = z.object({
   role: z.string().max(100).optional(),
@@ -107,6 +108,7 @@ function resolveBoolean(value, fallback) {
 class HealixMCPServer {
   constructor() {
     Logger.initialize();
+    this.localSetup = this.ensureLocalSetup();
     console.error('[DEBUG] Healix MCP Server starting - VERSION WITH ZOD SCHEMAS');
     this.server = new McpServer({
       name: "healix-mcp",
@@ -116,6 +118,24 @@ class HealixMCPServer {
 
     this.registerTools();
     this.setupErrorHandling();
+  }
+
+  ensureLocalSetup() {
+    if (process.env.HEALIX_POSTINSTALL_SETUP === 'false' && process.env.HEALIX_STARTUP_SETUP === 'false') {
+      return { ok: true, skipped: true, reason: 'disabled' };
+    }
+    try {
+      return LocalSetup.ensureLocalSetup({
+        projectPath: process.cwd(),
+        reason: 'mcp_startup',
+        installPlaywright: process.env.HEALIX_SETUP_INSTALL_PLAYWRIGHT !== 'false',
+      });
+    } catch (err) {
+      Logger.warn('Index', 'Healix local setup failed during startup; continuing with runtime preflight', {
+        message: err?.message,
+      });
+      return { ok: false, reason: err?.message || 'setup_failed' };
+    }
   }
 
   createAutoDetector() {

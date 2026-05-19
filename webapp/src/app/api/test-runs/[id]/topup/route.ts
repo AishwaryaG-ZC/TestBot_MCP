@@ -29,6 +29,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import { getCurrentUser } from '@/lib/auth/session'
 import { db } from '@/lib/db'
+import { computeFingerprints } from '@/lib/source-fingerprint'
 import {
   projectSourceFingerprints,
   projectClaudeSessions,
@@ -280,34 +281,22 @@ function selectTopupSurfaces(diff: {
 }
 
 /**
- * Compute current fingerprints from disk. Requires `testbot-mcp` to be
- * resolvable (local dev only). On any error returns []. The fingerprinter
- * itself is no-op on missing paths so this is safe to call unconditionally.
+ * G70: compute current fingerprints using the webapp-local fingerprinter.
+ * Previously this used `require(candidate)` to dynamically import the
+ * helper out of `testbot-mcp/`, but Next.js 16/Turbopack rejects the
+ * static analysis of that dynamic path even though it resolves correctly
+ * at runtime. The fingerprinter has been lifted into
+ * `webapp/src/lib/source-fingerprint.ts` so the import is static.
  */
 function computeCurrentFingerprintsFromDisk(projectPath: string): FingerprintLike[] {
   if (!projectPath || !fs.existsSync(projectPath)) return []
-  // Same candidate search pattern as `findPipelineWorkerPath` — the
-  // fingerprinter lives alongside it.
-  const candidates = [
-    path.join(process.cwd(), '..', 'testbot-mcp', 'src', 'source-fingerprint.js'),
-    path.join(process.cwd(), 'testbot-mcp', 'src', 'source-fingerprint.js'),
-    path.join(process.cwd(), '..', '..', 'testbot-mcp', 'src', 'source-fingerprint.js'),
-  ]
-  for (const candidate of candidates) {
-    try {
-      if (!fs.existsSync(candidate)) continue
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const mod = require(candidate)
-      if (typeof mod?.computeFingerprints === 'function') {
-        const out = mod.computeFingerprints(projectPath)
-        if (out && Array.isArray(out.fingerprints)) {
-          return out.fingerprints as FingerprintLike[]
-        }
-      }
-    } catch (err) {
-      console.warn('[topup] computeFingerprints failed', (err as Error).message)
-      return []
+  try {
+    const out = computeFingerprints(projectPath)
+    if (out && Array.isArray(out.fingerprints)) {
+      return out.fingerprints as FingerprintLike[]
     }
+  } catch (err) {
+    console.warn('[topup] computeFingerprints failed', (err as Error).message)
   }
   return []
 }

@@ -52,8 +52,7 @@ function getLadder(task) {
   const override = envOverride && Array.isArray(envOverride[task]) ? envOverride[task] : null;
   const ladder = override || DEFAULT_LADDERS[task] || DEFAULT_LADDERS.parse_prd;
   // Filter out models marked unavailable this run.
-  const filtered = ladder.filter((m) => !_unavailable.has(m));
-  return filtered.length > 0 ? filtered : ladder;
+  return ladder.filter((m) => !_unavailable.has(m));
 }
 
 function markUnavailable(model, reason) {
@@ -69,11 +68,29 @@ function markUnavailable(model, reason) {
   } catch { /* best effort */ }
 }
 
-function isLadderAdvanceableError(error) {
+function isSharedCapacityError(error) {
   if (!error) return false;
   const status = Number(error.status || error.statusCode || error.code);
-  if (status >= 400 && status < 500) return true;
+  const msg = String(error.message || error.reason || error.code || '').toLowerCase();
+  return (
+    status === 429 ||
+    /concurrent_limit_exceeded|rate[\s_-]*limit|too many requests|quota exceeded|billing|insufficient[_\s-]*quota/.test(msg)
+  );
+}
+
+function isLadderAdvanceableError(error) {
+  if (!error) return false;
+  if (isSharedCapacityError(error)) return false;
+  const status = Number(error.status || error.statusCode || error.code);
   const msg = String(error.message || error.reason || '').toLowerCase();
+  if (status === 404) return true;
+  if (status === 400 || status === 422) {
+    return (
+      /model.*(not\s*found|does\s*not\s*exist|unknown|unsupported|deprecated)/i.test(msg) ||
+      /temperature.*not\s*supported|parameter.*unsupported|invalid.*model|unrecognized.*parameter/i.test(msg) ||
+      /not_found_error|model_not_found|invalid_request_error/i.test(msg)
+    );
+  }
   return (
     /model.*(not\s*found|does\s*not\s*exist|unknown|unsupported|deprecated)/i.test(msg) ||
     /temperature.*not\s*supported|parameter.*unsupported|invalid.*model|unrecognized.*parameter/i.test(msg) ||
@@ -121,4 +138,5 @@ module.exports = {
   markUnavailable,
   runWithLadder,
   isLadderAdvanceableError,
+  isSharedCapacityError,
 };

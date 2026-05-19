@@ -27,8 +27,7 @@ import { and, eq, sql } from 'drizzle-orm'
 import { db } from '@/lib/db'
 import { apiKeys, testRuns, workspaceMembers } from '@/lib/db/schema'
 import { hashApiKey } from '@/lib/utils/api-keys'
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+import { resolveTestRunId } from '@/lib/test-run-ids'
 
 const POLL_TOTAL_MS = 30_000
 const POLL_INTERVAL_MS = 1_000
@@ -51,6 +50,28 @@ function json(body: unknown, status = 200): NextResponse {
  * window is closed within a single statement — no need for an explicit
  * transaction.
  */
+// G23: non-consuming variant of drainPendingAnswer. Returns the answer (if any)
+// without setting consumed_at. Used by diagnostic curls / dashboard preview;
+// the worker never calls this.
+async function peekPendingAnswer(
+  runId: string,
+  questionId: string
+): Promise<string | null> {
+  const rows = (await db.execute(sql`
+    SELECT answer
+      FROM run_pending_answers
+     WHERE run_id = ${runId}
+       AND question_id = ${questionId}
+       AND consumed_at IS NULL
+     ORDER BY created_at ASC
+     LIMIT 1
+  `)) as unknown as Array<{ answer: string }>
+  if (Array.isArray(rows) && rows.length > 0) {
+    return rows[0].answer ?? null
+  }
+  return null
+}
+
 async function drainPendingAnswer(
   runId: string,
   questionId: string
@@ -118,8 +139,10 @@ export async function GET(
     return json({ error: 'Missing api_key' }, 401)
   }
 
-  const { id: runId } = await params
-  if (!UUID_RE.test(runId)) {
+  const { id: rawId } = await params
+  // G21: shared resolver handles UUID / mcp_... / live-mcp_... forms uniformly.
+  const runId = await resolveTestRunId(rawId)
+  if (!runId) {
     return json({ error: 'Invalid run id' }, 400)
   }
 
@@ -131,6 +154,11 @@ export async function GET(
   if (questionId.length > 200) {
     return json({ error: 'questionId too long' }, 400)
   }
+  // G23: ?peek=1 returns the queued answer (if any) WITHOUT marking it
+  // consumed, so debugging curls don't steal the answer the worker is
+  // long-polling for. Reserved for diagnostic tooling — the worker path
+  // continues to use the destructive drain.
+  const peek = url.searchParams.get('peek') === '1' || url.searchParams.get('peek') === 'true'
 
   // ── API key auth ──────────────────────────────────────────────────────────
   const keyHash = hashApiKey(rawKey)
@@ -159,6 +187,12 @@ export async function GET(
   const authorized = await authorizeRunForApiKey(runId, keyRecord.userId)
   if (!authorized) {
     return json({ error: 'Forbidden' }, 403)
+  }
+
+  // G23: peek mode — single non-consuming read, no long-poll.
+  if (peek) {
+    const peeked = await peekPendingAnswer(runId, questionId)
+    return peeked === null ? noContent() : json({ answer: peeked, peeked: true })
   }
 
   // ── Long-poll loop ────────────────────────────────────────────────────────

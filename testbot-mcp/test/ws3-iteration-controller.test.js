@@ -4,7 +4,7 @@
  * WS-3 — Iteration controller decision priority + uncovered-AC bug fix.
  *
  * Confirms the new short-circuits land in the right order:
- *   stop_aborted > stop_self_done > stop_max_iterations > stop_success > ...
+ *   stop_aborted > max_iterations > stop_self_done > stop_success > ...
  * AND that the original bug — `totalAcTags=1, uncovered=0` trivially
  * satisfying the coverage stop — is gone.
  */
@@ -29,6 +29,21 @@ test('CL2-C: selfDone with low passRate is OVERRIDDEN — controller refuses pre
   assert.equal(r.selfDoneOverridden, true);
 });
 
+test('Claude token guard: maxIterations caps premature selfDone instead of continuing', () => {
+  const r = IC.decide({
+    passRate: 0.4,
+    iteration: 1,
+    maxIterations: 1,
+    selfDone: true,
+    totalTests: 5,
+    executedTests: 5,
+    totalAcTags: 20,
+    uncoveredAcTagsCount: 15,
+  });
+  assert.equal(r.decision, 'stop_coverage_degraded');
+  assert.match(r.reason, /reached max iterations/);
+});
+
 test('WS-3: selfDone trumps a passRate that would otherwise be stop_success', () => {
   const r = IC.decide({
     passRate: 0.99,
@@ -36,6 +51,7 @@ test('WS-3: selfDone trumps a passRate that would otherwise be stop_success', ()
     selfDone: true,
     totalAcTags: 20,
     uncoveredAcTagsCount: 0,
+    maxIterations: 10,
   });
   assert.equal(r.decision, 'stop_self_done');
 });
@@ -107,6 +123,7 @@ test('WS-3: totalAcTags >= 5 with uncovered=0 (and low passRate) IS a real cover
     uncoveredAcTagsCount: 0,
     previousPassRate: 0.4,
     previousUncoveredCount: 5,
+    maxIterations: 10,
   });
   assert.equal(r.decision, 'stop_success');
 });

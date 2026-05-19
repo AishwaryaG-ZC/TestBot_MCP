@@ -25,12 +25,16 @@ function isNoise(line) {
   return false;
 }
 
-// Default model + reasoning effort for the Claude session. Sonnet 4.6 at
-// medium effort is the production sweet spot for QA test generation today:
-// strong at structured codegen, ~3x cheaper than Opus, fast enough to iterate.
-// Both are overridable per-process via env. Per-call overrides go through
-// args.model / args.effort.
+// Default model + reasoning effort for the Claude session.
+//
+// Per-pass split: the plan pass benefits from Sonnet's reasoning depth, but
+// the write pass is mechanical Playwright-spec authoring where Haiku 4.5
+// matches quality at ~1/3 the token cost. Each pass falls back to the legacy
+// HEALIX_CLAUDE_MODEL (and finally DEFAULT_MODEL) if its specific env var is
+// unset, preserving backwards compat. Per-call overrides via args.model still win.
 const DEFAULT_MODEL = process.env.HEALIX_CLAUDE_MODEL || 'claude-sonnet-4-6';
+const DEFAULT_PLAN_MODEL = process.env.HEALIX_CLAUDE_PLAN_MODEL || process.env.HEALIX_CLAUDE_MODEL || 'claude-sonnet-4-6';
+const DEFAULT_WRITE_MODEL = process.env.HEALIX_CLAUDE_WRITE_MODEL || process.env.HEALIX_CLAUDE_MODEL || 'claude-haiku-4-5';
 const DEFAULT_EFFORT = process.env.HEALIX_CLAUDE_EFFORT || 'medium';
 
 /**
@@ -45,6 +49,10 @@ const DEFAULT_EFFORT = process.env.HEALIX_CLAUDE_EFFORT || 'medium';
  * @param {object} [args.env]               - env override
  * @param {string} [args.systemPrompt]      - --append-system-prompt inline text
  * @param {string} [args.systemPromptFile]  - --append-system-prompt-file path
+ * @param {string} [args.permissionMode]    - --permission-mode value, e.g. "plan"
+ * @param {boolean} [args.dangerouslySkipPermissions] - pass --dangerously-skip-permissions (default true unless permissionMode is set)
+ * @param {string[]} [args.allowedTools]    - optional --allowedTools values
+ * @param {string[]} [args.disallowedTools] - optional --disallowedTools values
  * @param {function} [args.spawnFn]         - test-injection hook
  * @param {function} [args.onEvent]         - shortcut: forwarded onto parser 'event'
  * @returns {{
@@ -65,6 +73,10 @@ function spawnClaude(args = {}) {
     env,
     systemPrompt,
     systemPromptFile,
+    permissionMode = null,
+    dangerouslySkipPermissions = permissionMode ? false : true,
+    allowedTools = null,
+    disallowedTools = null,
     spawnFn = spawn,
     onEvent,
   } = args;
@@ -80,9 +92,20 @@ function spawnClaude(args = {}) {
     '--print', '-',
     '--output-format', 'stream-json',
     '--verbose',
-    '--dangerously-skip-permissions',
     '--add-dir', projectPath,
   ];
+  if (dangerouslySkipPermissions) {
+    cliArgs.push('--dangerously-skip-permissions');
+  }
+  if (permissionMode) {
+    cliArgs.push('--permission-mode', permissionMode);
+  }
+  if (Array.isArray(allowedTools) && allowedTools.length > 0) {
+    cliArgs.push('--allowedTools', allowedTools.join(','));
+  }
+  if (Array.isArray(disallowedTools) && disallowedTools.length > 0) {
+    cliArgs.push('--disallowedTools', disallowedTools.join(','));
+  }
   if (model) {
     cliArgs.push('--model', model);
   }
@@ -107,6 +130,8 @@ function spawnClaude(args = {}) {
     cwd: projectPath,
     promptBytes: prompt.length,
     resume: Boolean(sessionId),
+    permissionMode,
+    dangerouslySkipPermissions,
   });
 
   let child;
@@ -192,6 +217,10 @@ function spawnClaude(args = {}) {
 
 module.exports = {
   spawnClaude,
+  DEFAULT_MODEL,
+  DEFAULT_PLAN_MODEL,
+  DEFAULT_WRITE_MODEL,
+  DEFAULT_EFFORT,
   // Exposed for tests
   _internals: { isNoise, KNOWN_STDERR_NOISE },
 };

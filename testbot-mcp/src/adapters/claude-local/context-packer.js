@@ -242,6 +242,26 @@ function acceptanceCriteriaRows(parsedPRD) {
   return rows;
 }
 
+// G45: normalize a heading/button entry to a clean visible-text string so
+// routes.csv doesn't get filled with `[object Object]` or raw JSX expressions
+// (e.g. `setSelectedSize(size)} className="..."`). Anything that doesn't
+// collapse to a sensible label is dropped — Claude shouldn't see code as
+// "context" pretending to be UI text.
+function normalizeUiLabel(entry) {
+  if (entry == null) return '';
+  if (typeof entry === 'string') {
+    // Strip raw JSX expression bleed: lines containing `} className=`,
+    // `setX(...)`, callback-arrow `=>`, and other code tokens.
+    if (/[{}<>]|=>|className=|onClick=|\bconst\b|\blet\b/.test(entry)) return '';
+    return entry.trim().replace(/\s+/g, ' ').slice(0, 80);
+  }
+  if (typeof entry === 'object') {
+    const label = entry.text || entry.label || entry.name || entry.title || entry.accessibleName;
+    return typeof label === 'string' ? normalizeUiLabel(label) : '';
+  }
+  return '';
+}
+
 function routeRows(explorationArtifact, context) {
   const routes = [
     ...asArray(explorationArtifact?.routes),
@@ -255,8 +275,8 @@ function routeRows(explorationArtifact, context) {
       path: raw.path || raw.route || raw.url || '',
       auth: raw.requiresAuth === true ? 'auth' : raw.requiresAuth === false ? 'public' : '',
       sourceFile: raw.sourceFile || raw.filePath || '',
-      headings: asArray(raw.headings).slice(0, 5).join(' | '),
-      buttons: asArray(raw.buttons).slice(0, 6).join(' | '),
+      headings: asArray(raw.headings).slice(0, 5).map(normalizeUiLabel).filter(Boolean).join(' | '),
+      buttons: asArray(raw.buttons).slice(0, 6).map(normalizeUiLabel).filter(Boolean).join(' | '),
     };
   });
 }
@@ -275,6 +295,10 @@ function apiRows(explorationArtifact, context) {
       auth: raw.requiresAuth === true ? 'auth' : raw.requiresAuth === false ? 'public' : '',
       status: raw.status || raw.expectedStatus || '',
       sourceFile: raw.sourceFile || raw.filePath || '',
+      // G50: optional fields populated from exploration's response harvester.
+      // Truncated upstream; safe to embed in CSV (we URI-encode in toCsv).
+      responseShape: typeof raw.responseShape === 'string' ? raw.responseShape.slice(0, 600) : '',
+      sampleResponse: typeof raw.sampleResponse === 'string' ? raw.sampleResponse.slice(0, 1200) : '',
     };
   });
 }
@@ -337,7 +361,11 @@ function writeContextArtifacts({
   write('prd.md', `${redactString(prdContent || '')}\n`);
   write('acceptance-criteria.csv', toCsv(acceptanceCriteriaRows(parsedPRD), ['id', 'feature', 'story', 'text']));
   write('routes.csv', toCsv(routeRows(explorationArtifact, context), ['path', 'auth', 'sourceFile', 'headings', 'buttons']));
-  write('api.csv', toCsv(apiRows(explorationArtifact, context), ['method', 'path', 'auth', 'status', 'sourceFile']));
+  // G50: api.csv now includes `responseShape` (compact path:type sketch) and
+  // a truncated `sampleResponse` JSON string when exploration captured one.
+  // This is what makes nested-property assertions correct: Claude can see
+  // `user.email:string` instead of guessing `email`.
+  write('api.csv', toCsv(apiRows(explorationArtifact, context), ['method', 'path', 'auth', 'status', 'sourceFile', 'responseShape', 'sampleResponse']));
   write('forms.csv', toCsv(formRows(explorationArtifact, context), ['name', 'route', 'method', 'fields', 'sourceFile']));
   write('roles.csv', toCsv(roleRows(roles), ['role', 'verified', 'storageStatePath']));
   write('corpus.json', `${JSON.stringify(sanitizeValue({ corpusSeed, corpusGuidance }), null, 2)}\n`);

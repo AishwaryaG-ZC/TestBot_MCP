@@ -22,6 +22,7 @@
  */
 
 const FeedbackBuilder = require('./feedback-builder');
+const CoverageGuard = require('./coverage-guard');
 
 const FOCUS_DIRECTIVE = [
   "You are a senior QA engineer driving the Healix test-replacement pipeline.",
@@ -568,6 +569,25 @@ function renderIterationDelta({ iterationNumber, feedback, topupFocus, omitLoade
   return out.join('\n');
 }
 
+function renderClaudePlan(claudePlan) {
+  if (!claudePlan) return '';
+  const lines = [];
+  lines.push(`status: ${claudePlan.status || 'unknown'}`);
+  if (claudePlan.planPath) lines.push(`planPath: ${claudePlan.planPath}`);
+  if (claudePlan.validation?.warnings?.length) lines.push(`warnings: ${claudePlan.validation.warnings.join(', ')}`);
+  if (claudePlan.validation?.errors?.length) lines.push(`errors: ${claudePlan.validation.errors.join(', ')}`);
+  const parsed = claudePlan.parsedPlan || null;
+  if (parsed) {
+    lines.push('');
+    lines.push('Approved planning notes:');
+    lines.push(JSON.stringify(parsed, null, 2).slice(0, 6000));
+  } else if (claudePlan.planText) {
+    lines.push('');
+    lines.push(String(claudePlan.planText).slice(0, 4000));
+  }
+  return lines.join('\n').trim();
+}
+
 function buildPromptWithMetadata(args) {
   const {
     context = {},
@@ -586,6 +606,8 @@ function buildPromptWithMetadata(args) {
     contextArtifacts,
     compactSummary,
     skill,
+    coverageGuard,
+    claudePlan,
     omitLoadedContext = false,
   } = args || {};
 
@@ -598,6 +620,7 @@ function buildPromptWithMetadata(args) {
   stableParts.push(section('Roles + auth', renderRoles(roles)));
   stableParts.push(section('Context manifest', renderContextManifest(contextArtifacts, compactSummary, { omitLoadedContext })));
   stableParts.push(section('Surface focus', renderCompactSurface(compactSummary) || '(root surface)'));
+  stableParts.push(section('Coverage guard', CoverageGuard.renderCoverageGuard(coverageGuard) || '(no coverage risk detected)'));
   stableParts.push(section('Acceptance criteria preview', omitLoadedContext ? 'Use acceptance-criteria.csv from the context manifest if coverage details are needed.' : compactAcPreview(parsedPRD)));
   if (!contextArtifacts && !omitLoadedContext) {
     stableParts.push(section('PRD (fallback compact)', renderPRD(prdContent)));
@@ -609,6 +632,8 @@ function buildPromptWithMetadata(args) {
 
   const deltaParts = [];
   deltaParts.push(renderIterationDelta({ iterationNumber, feedback, topupFocus, omitLoadedContext }));
+  const planBlock = renderClaudePlan(claudePlan);
+  if (planBlock) deltaParts.push(section('Claude plan', planBlock));
   deltaParts.push(section('Task brief', renderTaskBrief()));
 
   const stablePrefix = scrubBugTokens(stableParts.join('\n'));
@@ -656,6 +681,7 @@ module.exports = {
     renderContextManifest,
     renderCompactSurface,
     renderIterationDelta,
+    renderClaudePlan,
     renderAcTaggingDirective,
     renderAcChecklist,
     collectAcIdsFromPRD,

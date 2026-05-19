@@ -1322,18 +1322,11 @@ class ContextGatherer {
     const langEndpoints = await this.findMultiLangEndpoints(projectPath);
     endpoints.push(...langEndpoints);
 
-    // If no endpoints found, add health check
-    if (endpoints.length === 0) {
-      endpoints.push({
-        method: 'GET',
-        path: '/api/health',
-        description: 'Health check endpoint',
-        requiresAuth: false,
-        synthetic: true,
-        source: 'healix_fallback',
-      });
-    }
-    
+    // G44: previously injected a synthetic `/api/health` when no endpoints
+    // were found. That fake endpoint flowed into api.csv → Tier-0 generated a
+    // test → target had no such endpoint → test failed and looked like a
+    // product bug. Refuse to synthesize: return an empty array and let
+    // downstream generators skip API contracts when there are no real ones.
     return endpoints;
   }
 

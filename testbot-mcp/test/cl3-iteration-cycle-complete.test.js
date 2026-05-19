@@ -45,6 +45,7 @@ test('CL3-B: zero failures of any kind → falls through to existing success pat
     uncoveredAcTagsCount: 0,
     previousUncoveredCount: 0,
     failureBreakdown: { real: 0, bad: 0, env: 0 },
+    maxIterations: 10,
   });
   assert.notEqual(result.decision, 'stop_qa_cycle_complete');
   assert.equal(result.decision, 'stop_success');

@@ -46,7 +46,7 @@ function parseKnownBugs(markdownContent) {
     // regex hit a real `### BUG-...` section, so the table is already
     // excluded automatically.
     const body = raw.slice(head.index + head[0].length);
-    const fields = { category: null, location: null, behavior: null, detectableBy: null };
+    const fields = { category: null, location: null, behavior: null, detectableBy: null, qacIds: [] };
     for (const line of body.split('\n')) {
       const m = BULLET_RE.exec(line);
       if (!m) continue;
@@ -56,6 +56,20 @@ function parseKnownBugs(markdownContent) {
       else if (label === 'location') fields.location = value;
       else if (label === 'behavior') fields.behavior = value;
       else if (label === 'detectableby') fields.detectableBy = value;
+      // G31: explicit QAC IDs map — comma-separated list of QAC test signatures
+      // that, when present and failing, count as detection. Beats route matching
+      // for accuracy because it matches the actual test infrastructure rather
+      // than fuzzy substring overlap on file paths.
+      else if (label === 'qacids' || label === 'qac') {
+        fields.qacIds = value.split(/[,\s]+/).map((q) => q.trim()).filter(Boolean);
+      }
+    }
+    // G31 fallback: if no explicit qacIds bullet was given, harvest any
+    // `qac-...` tokens that appear in the Detectable-by description so the
+    // author can keep using the existing field.
+    if (fields.qacIds.length === 0 && fields.detectableBy) {
+      const harvested = String(fields.detectableBy).match(/qac-[a-z0-9_-]+/gi) || [];
+      fields.qacIds = [...new Set(harvested.map((q) => q.toLowerCase()))];
     }
     bugs.push({ id, title, ...fields });
   }
@@ -113,6 +127,7 @@ function scoreBugs({ knownBugs, testResults }) {
 
 function findEvidence(bug, tests, failures) {
   const locationKeys = extractLocationKeys(bug.location);
+  const qacIds = Array.isArray(bug?.qacIds) ? bug.qacIds.map((q) => String(q).toLowerCase()) : [];
 
   // Direct ID match — scan all tests (passed or failed). Bug ID hits in the
   // title generally mean a regression test was specifically written for this
@@ -127,6 +142,27 @@ function findEvidence(bug, tests, failures) {
     const errMsg = errorMessageOf(f);
     if (errMsg.includes(bug.id)) {
       return { matchKind: 'id_in_error', title: f?.testName || f?.title || '', file: f?.file || null };
+    }
+  }
+
+  // G31: QAC test-signature match. Pulls FAILING tests first (a passing QAC
+  // means the contract held → no detection event) — only count the bug as
+  // caught when the deterministic contract test actually flipped to failed.
+  if (qacIds.length > 0) {
+    const isMatch = (text) => qacIds.some((qid) => text.toLowerCase().includes(qid));
+    for (const f of failures) {
+      const title = String(f?.testName || f?.title || '');
+      if (isMatch(title)) {
+        return { matchKind: 'qac_signature_failed', title, file: f?.file || null };
+      }
+    }
+    for (const t of tests) {
+      const status = String(t?.status || '').toLowerCase();
+      if (status !== 'failed') continue;
+      const title = String(t?.title || t?.name || '');
+      if (isMatch(title)) {
+        return { matchKind: 'qac_signature_failed', title, file: t?.file || null };
+      }
     }
   }
 

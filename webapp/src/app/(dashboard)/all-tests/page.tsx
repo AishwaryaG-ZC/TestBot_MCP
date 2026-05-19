@@ -153,7 +153,9 @@ export default function AllTestsPage() {
   // projectName), set as soon as `workspaces` arrives.
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
   const [members, setMembers] = useState<WorkspaceMember[]>([]);
-  const [contributorFilter, setContributorFilter] = useState<string>('all'); // 'all' | 'me' | userId
+  // Default to 'me' so the all-tests view opens to the caller's own runs
+  // rather than the entire workspace (less noisy, more relevant on landing).
+  const [contributorFilter, setContributorFilter] = useState<string>('me'); // 'all' | 'me' | userId
   const [tierFilter, setTierFilter] = useState<TierFilter>('all');
   const [corpusStatusFilter, setCorpusStatusFilter] = useState<CorpusStatus>('all');
 
@@ -422,8 +424,8 @@ export default function AllTestsPage() {
                   onChange={(e) => { setContributorFilter(e.target.value); setPage(1); }}
                   className="input-glass px-3 py-2 text-sm rounded-xl text-[#8BA4C8] cursor-pointer"
                 >
+                  <option value="me">My runs</option>
                   <option value="all">All teammates</option>
-                  <option value="me">Current user only</option>
                   {members.map((m) => (
                     <option key={m.userId} value={m.userId}>
                       {m.fullName || m.email}

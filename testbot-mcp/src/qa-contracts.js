@@ -650,6 +650,80 @@ function buildPayloadFieldList(requiredFields) {
   }));
 }
 
+// G35: collect concrete dynamic-route example values from multiple sources.
+// Returns a map { paramName -> string[] } where paramName matches the
+// placeholder in dynamic routes (`slug`, `id`, `projectSlug`, etc.).
+function collectDynamicRouteExamples(context = {}) {
+  const out = new Map();
+  const push = (key, val) => {
+    if (!val || typeof val !== 'string') return;
+    const norm = String(val).trim();
+    if (!norm || norm.length > 80) return;
+    if (!out.has(key)) out.set(key, []);
+    if (!out.get(key).includes(norm)) out.get(key).push(norm);
+  };
+  // PRD/parsed AC examples — seededExamples on parsed PRD, or explicit map.
+  const seed = context.parsedPRD?.seededExamples || context.seededExamples || {};
+  if (seed && typeof seed === 'object') {
+    for (const [k, v] of Object.entries(seed)) {
+      if (Array.isArray(v)) for (const item of v) push(k, item);
+      else push(k, v);
+    }
+  }
+  // Exploration artifact's discovered concrete routes — extract the path
+  // segment values where a known dynamic param fits.
+  const discovered = Array.isArray(context.discoveredRoutes) ? context.discoveredRoutes
+    : Array.isArray(context.explorationArtifact?.routes) ? context.explorationArtifact.routes
+    : [];
+  for (const r of discovered) {
+    const route = typeof r === 'string' ? r : (r?.path || r?.url || '');
+    if (!route) continue;
+    const segs = route.split('/').filter(Boolean);
+    if (segs.length >= 2) {
+      // First non-/api segment is usually the resource type; the segment after
+      // is the candidate concrete value for that resource's slug.
+      const resource = segs[0].toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (segs.length >= 2 && resource && !/^\[|^:/.test(segs[1])) {
+        push('slug', segs[1]);
+        push(`${resource}Slug`, segs[1]);
+        push(`${resource}Id`, segs[1]);
+      }
+    }
+  }
+  return out;
+}
+
+// G35: produce concrete routes by substituting placeholder segments
+// (`/projects/:slug`, `/projects/[slug]`) with each known example value.
+function expandDynamicRoutes(routes, examplesMap) {
+  if (!Array.isArray(routes) || !examplesMap || examplesMap.size === 0) return [];
+  const out = [];
+  const PLACEHOLDER_RE = /:([A-Za-z_][\w-]*)\b|\[([^\]]+)\]/g;
+  for (const route of routes) {
+    if (typeof route !== 'string' || !route.includes('/')) continue;
+    if (!PLACEHOLDER_RE.test(route)) continue;
+    PLACEHOLDER_RE.lastIndex = 0;
+    // For each placeholder param, try the first known example as the
+    // substitution. We only emit ONE concrete expansion per template to keep
+    // the a11y suite small and high-signal.
+    let concrete = route.replace(PLACEHOLDER_RE, (_full, colonName, bracketName) => {
+      const name = colonName || bracketName || '';
+      const cands = examplesMap.get(name)
+        || examplesMap.get('slug')
+        || examplesMap.get('id')
+        || examplesMap.get(`${name}Slug`)
+        || examplesMap.get(`${name}Id`)
+        || null;
+      return cands && cands.length > 0 ? cands[0] : _full;
+    });
+    // Skip if no substitution actually happened (still contains placeholders).
+    if (concrete !== route && !/:[\w-]+|\[[^\]]+\]/.test(concrete)) {
+      out.push(concrete);
+    }
+  }
+  return out;
+}
+
 function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
   const endpoints = Array.isArray(context.apiEndpoints) ? context.apiEndpoints : [];
   const forms = Array.isArray(context.forms) ? context.forms : [];
@@ -666,8 +740,24 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
     ...pages.map(pageRouteFromEntry),
     ...((context.routes || []).map(pageRouteFromEntry)),
   ].filter(Boolean);
-  for (const route of uniq(knownPageRoutes).slice(0, 40)) {
+
+  // G35: promote concrete dynamic-route examples into the a11y target list.
+  // Pulls candidate substitutions from (a) PRD-seeded examples (slugs and IDs
+  // referenced in acceptance criteria) and (b) the exploration artifact's
+  // discoveredRoutes. Without this, /projects/[slug] templates are tested as
+  // their template form (which never renders a real page) and concrete pages
+  // like /projects/polished-mobile never see an accessibility audit.
+  const dynamicExamples = collectDynamicRouteExamples(context);
+  const allRoutes = uniq([
+    ...knownPageRoutes,
+    ...expandDynamicRoutes(knownPageRoutes, dynamicExamples),
+  ]);
+
+  for (const route of allRoutes.slice(0, 40)) {
     if (/\.(?:d\.ts|map|json)$/i.test(route)) continue;
+    // Skip routes that still contain placeholder segments (e.g. `:slug`,
+    // `[id]`) — those will 404 or render an empty layout when navigated.
+    if (/(?::[A-Za-z_][\w-]*\b|\[[^\]]+\])/.test(route)) continue;
     const requiresAuth = routeRequiresAuth(route, pages);
     const id = contractId(['qac', 'a11y', route]);
     a11yContracts.push({

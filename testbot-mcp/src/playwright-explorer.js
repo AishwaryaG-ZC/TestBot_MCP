@@ -306,11 +306,106 @@ async function _walkRoutes({ browser, contextOptions, baseURL, origin, credentia
   const context = await browser.newContext(contextOptions);
   const page = await context.newPage();
 
+  // G63: action-trace capture. Wrap goto/click/fill/selectOption on the page
+  // object so every navigational action this walk does is recorded with the
+  // before/after URL. Downstream (G64) synthesizes Playwright spec replays
+  // from these traces. Target-agnostic: pure observation, no project naming.
+  const actionTrace = [];
+  const _origGoto = page.goto.bind(page);
+  const _origClick = page.click.bind(page);
+  const _origFill = page.fill.bind(page);
+  const _origSelectOption = page.selectOption.bind(page);
+  page.goto = async (url, opts) => {
+    const urlBefore = (() => { try { return page.url(); } catch { return null; } })();
+    const result = await _origGoto(url, opts);
+    actionTrace.push({
+      type: 'goto',
+      target: typeof url === 'string' ? url : String(url),
+      urlBefore,
+      urlAfter: page.url(),
+      ts: Date.now(),
+    });
+    return result;
+  };
+  page.click = async (selector, opts) => {
+    const urlBefore = page.url();
+    const result = await _origClick(selector, opts);
+    actionTrace.push({
+      type: 'click',
+      target: selector,
+      urlBefore,
+      urlAfter: page.url(),
+      ts: Date.now(),
+    });
+    return result;
+  };
+  page.fill = async (selector, value, opts) => {
+    const urlBefore = page.url();
+    const result = await _origFill(selector, value, opts);
+    actionTrace.push({
+      type: 'fill',
+      target: selector,
+      // never persist user input verbatim — placeholder string only.
+      value: typeof value === 'string' && value.length > 0 ? '[redacted]' : '',
+      urlBefore,
+      urlAfter: page.url(),
+      ts: Date.now(),
+    });
+    return result;
+  };
+  page.selectOption = async (selector, value, opts) => {
+    const urlBefore = page.url();
+    const result = await _origSelectOption(selector, value, opts);
+    actionTrace.push({
+      type: 'selectOption',
+      target: selector,
+      value: typeof value === 'string' ? value : null,
+      urlBefore,
+      urlAfter: page.url(),
+      ts: Date.now(),
+    });
+    return result;
+  };
+
   const observedErrors = [];
   page.on('console', (msg) => {
     if (msg.type() === 'error') observedErrors.push(`console: ${msg.text().slice(0, 200)}`);
   });
   page.on('pageerror', (err) => observedErrors.push(`pageerror: ${err.message.slice(0, 200)}`));
+
+  // G50: capture JSON API responses so downstream generators see actual
+  // response shapes instead of guessing. Dedupe by `${method} ${path}`.
+  const apiEndpoints = new Map();
+  page.on('response', async (resp) => {
+    try {
+      const url = new URL(resp.url());
+      if (url.origin !== origin) return;
+      if (!/^\/api\//.test(url.pathname)) return;
+      const method = String(resp.request().method() || 'GET').toUpperCase();
+      const status = resp.status();
+      const key = `${method} ${url.pathname}`;
+      if (apiEndpoints.has(key)) return; // first sample wins
+      const ct = String(resp.headers()['content-type'] || '');
+      const requiresAuth = status === 401 || status === 403;
+      const entry = {
+        method,
+        path: url.pathname,
+        status,
+        requiresAuth,
+        contentType: ct.split(';')[0].trim() || null,
+        sampleResponse: null,
+        responseShape: null,
+      };
+      if (/json/i.test(ct) && status >= 200 && status < 400) {
+        try {
+          const body = await resp.json();
+          entry.sampleResponse = truncateJson(body, 2_000);
+          entry.responseShape = describeJsonShape(body, 0, 3);
+        } catch { /* non-JSON-parseable or stream errored */ }
+      }
+      apiEndpoints.set(key, entry);
+    } catch { /* never let the listener break exploration */ }
+  });
 
   const visitedPaths = new Set();
   const routes = [];
@@ -425,10 +520,156 @@ async function _walkRoutes({ browser, contextOptions, baseURL, origin, credentia
       });
     }
 
-    return { routes, forms: formsOut, authFlow: sanitizeAuthFlow(authFlow), keyFlows, observedErrors };
+    return {
+      routes,
+      forms: formsOut,
+      authFlow: sanitizeAuthFlow(authFlow),
+      keyFlows,
+      observedErrors,
+      // G50: real API endpoints + sample responses from this walk.
+      apiEndpoints: [...apiEndpoints.values()],
+      // G63: raw action trace + multi-step flows grouped from it.
+      actionTrace,
+      actionTraces: groupActionTracesIntoFlows(actionTrace, baseURL),
+    };
   } finally {
     try { await context.close(); } catch { /* ignore */ }
   }
+}
+
+/**
+ * G63: turn a flat action-trace array into one-or-more "flows" — coherent
+ * sequences of click/fill/selectOption actions that culminate in a route
+ * change or form submission. Each flow becomes one synthesized workflow spec
+ * downstream (G64).
+ *
+ * Heuristic groupings:
+ *   - A `goto` to a new route starts a new flow (the prior is closed).
+ *   - Sequential clicks/fills on the same route accumulate into the open flow.
+ *   - The first `goto` of a new route ends the current flow.
+ *
+ * Flows shorter than 2 actions are dropped — they're not interesting workflows.
+ */
+function groupActionTracesIntoFlows(trace, baseURL) {
+  if (!Array.isArray(trace) || trace.length === 0) return [];
+  const flows = [];
+  let current = null;
+  let baseOrigin = null;
+  try { baseOrigin = new URL(baseURL).origin; } catch { baseOrigin = null; }
+  const pathOf = (url) => {
+    if (!url) return '/';
+    try {
+      const u = new URL(url, baseURL || 'http://x');
+      return u.pathname + u.search;
+    } catch { return String(url); }
+  };
+  for (const entry of trace) {
+    if (!entry || !entry.type) continue;
+    const isGoto = entry.type === 'goto';
+    const targetPath = pathOf(entry.target);
+    if (isGoto) {
+      if (current && current.steps.length >= 2) {
+        flows.push(current);
+      }
+      current = {
+        name: `flow-${flows.length + 1}-from-${slugifyPath(targetPath)}`,
+        startedAt: entry.ts,
+        startRoute: targetPath,
+        endRoute: targetPath,
+        steps: [{ action: 'goto', target: entry.target }],
+      };
+      continue;
+    }
+    if (!current) {
+      // No flow open — start one rooted at urlBefore.
+      current = {
+        name: `flow-${flows.length + 1}`,
+        startedAt: entry.ts,
+        startRoute: pathOf(entry.urlBefore),
+        endRoute: pathOf(entry.urlAfter),
+        steps: [{ action: 'goto', target: entry.urlBefore || '/' }],
+      };
+    }
+    current.steps.push({
+      action: entry.type,
+      target: entry.target,
+      ...(entry.value != null ? { value: entry.value } : {}),
+    });
+    current.endRoute = pathOf(entry.urlAfter);
+  }
+  if (current && current.steps.length >= 2) flows.push(current);
+  return flows;
+}
+
+function slugifyPath(p) {
+  return String(p || '/')
+    .replace(/[?#].*$/, '')
+    .replace(/^\/+|\/+$/g, '')
+    .replace(/[^A-Za-z0-9_-]+/g, '-')
+    .slice(0, 40) || 'root';
+}
+
+// G50: helpers for the response harvester. Both work on arbitrary JSON
+// without project-specific assumptions.
+
+// Truncate a JSON value so per-endpoint context never exceeds ~2KB.
+// Strings beyond `limit` are truncated with an ellipsis. Arrays beyond 5
+// items keep the first 5. Object keys are preserved up to depth 4.
+function truncateJson(value, byteLimit = 2_000) {
+  const seen = new WeakSet();
+  const walk = (v, depth) => {
+    if (v == null || typeof v !== 'object') {
+      if (typeof v === 'string' && v.length > 200) return v.slice(0, 200) + '…';
+      return v;
+    }
+    if (seen.has(v)) return '[Circular]';
+    seen.add(v);
+    if (depth >= 4) return Array.isArray(v) ? '[…]' : '{…}';
+    if (Array.isArray(v)) return v.slice(0, 5).map((x) => walk(x, depth + 1));
+    const out = {};
+    for (const [k, val] of Object.entries(v).slice(0, 25)) {
+      out[k] = walk(val, depth + 1);
+    }
+    return out;
+  };
+  try {
+    let s = JSON.stringify(walk(value, 0));
+    if (s && s.length > byteLimit) s = s.slice(0, byteLimit) + '…';
+    return s;
+  } catch {
+    return null;
+  }
+}
+
+// Produce a compact path:type schema sketch like
+// `user.email:string, user.role:string, items[].id:number`. Skips values
+// (only types and paths), so it's safe for log + prompt embedding.
+function describeJsonShape(value, depth = 0, maxDepth = 3) {
+  const lines = [];
+  const seen = new WeakSet();
+  const typeOf = (v) => {
+    if (v === null) return 'null';
+    if (Array.isArray(v)) return 'array';
+    return typeof v;
+  };
+  const walk = (v, path) => {
+    if (depth > maxDepth) return;
+    const t = typeOf(v);
+    if (t === 'object') {
+      if (seen.has(v)) return;
+      seen.add(v);
+      for (const [k, val] of Object.entries(v).slice(0, 25)) {
+        walk(val, path ? `${path}.${k}` : k);
+      }
+    } else if (t === 'array') {
+      if (v.length === 0) { lines.push(`${path}:array(empty)`); return; }
+      walk(v[0], `${path}[]`);
+    } else if (path) {
+      lines.push(`${path}:${t}`);
+    }
+  };
+  walk(value, '');
+  return lines.slice(0, 30).join(', ');
 }
 
 /**
@@ -442,6 +683,14 @@ function _mergeWalks(walks) {
   const keyFlowNames = new Set();
   const keyFlows = [];
   const errorSet = new Set();
+  // G50: merged apiEndpoints across all walks. Key by `${method} ${path}`,
+  // first sample wins, but a later walk's auth=true gets preserved.
+  const apiMap = new Map();
+  // G63: action traces accumulated across walks. Each walk's flows are kept;
+  // de-dupe by (startRoute, endRoute, stepCount) to avoid spec-bloat from
+  // re-walking the same flow per role.
+  const actionTraceKeys = new Set();
+  const actionTraces = [];
 
   for (const walk of walks) {
     for (const route of walk.routes || []) {
@@ -470,6 +719,27 @@ function _mergeWalks(walks) {
     for (const err of walk.observedErrors || []) {
       errorSet.add(err);
     }
+    for (const api of walk.apiEndpoints || []) {
+      const key = `${api.method} ${api.path}`;
+      const existing = apiMap.get(key);
+      if (!existing) {
+        apiMap.set(key, api);
+      } else if (api.sampleResponse && !existing.sampleResponse) {
+        // upgrade to a richer sample if we got one from a later walk
+        apiMap.set(key, { ...existing, sampleResponse: api.sampleResponse, responseShape: api.responseShape });
+      }
+      // requiresAuth = OR across walks (auth'd walk seeing 200 doesn't clear
+      // an unauth walk's 401 finding)
+      if (api.requiresAuth && existing) existing.requiresAuth = true;
+    }
+    // G63: collect deduped action traces.
+    for (const flow of walk.actionTraces || []) {
+      if (!flow || !Array.isArray(flow.steps)) continue;
+      const key = `${flow.startRoute || ''}→${flow.endRoute || ''}::${flow.steps.length}`;
+      if (actionTraceKeys.has(key)) continue;
+      actionTraceKeys.add(key);
+      actionTraces.push(flow);
+    }
   }
 
   return {
@@ -478,6 +748,10 @@ function _mergeWalks(walks) {
     authFlow: sanitizeAuthFlow(authFlow),
     keyFlows,
     observedErrors: Array.from(errorSet).slice(0, 20),
+    apiEndpoints: Array.from(apiMap.values()),
+    // G63: surface flows so the exploration artifact carries them through to
+    // workflow-synthesizer (G64).
+    actionTraces,
   };
 }
 

@@ -29,12 +29,67 @@ const AskUser = require('./ask-user');
 const ContextPacker = require('./context-packer');
 const SkillInstaller = require('./skill-installer');
 const SystemPrompt = require('./system-prompt');
+const PlanMode = require('./plan-mode');
+const CoverageGuard = require('./coverage-guard');
+const LocalSetup = require('../../local-setup');
 
-const DEFAULT_MODEL = process.env.HEALIX_CLAUDE_MODEL || 'claude-sonnet-4-6';
-const DEFAULT_EFFORT = process.env.HEALIX_CLAUDE_EFFORT || 'medium';
+const { DEFAULT_PLAN_MODEL, DEFAULT_WRITE_MODEL, DEFAULT_EFFORT } = Exec;
 
 function _sha(value) {
   return crypto.createHash('sha256').update(String(value || '')).digest('hex');
+}
+
+// G36: scan a generated spec for auth-related patterns. We deliberately use
+// conservative literal markers (rather than a broad regex) so we don't
+// false-positive on something like a string `"login"` inside test data.
+const AUTH_INDICATORS = [
+  /storageState\s*:/i,                              // playwright explicit storageState option
+  /auth-state-[a-z0-9_-]+\.json/i,                  // healix-emitted auth state file refs
+  /loginAs\s*\(|signIn\s*\(|authenticate\s*\(/i,    // common helper calls
+  /setExtraHTTPHeaders\s*\(\s*\{[^}]*Authorization/i,
+  /Cookie\s*:\s*['"`][^'"`]*session/i,
+  /@auth\b|@tierB\b/i,                              // already-tagged (idempotency check)
+];
+
+function _autoTagAuthTier1Specs({ files, projectPath }) {
+  if (!Array.isArray(files) || files.length === 0) return [];
+  const tagged = [];
+  for (const file of files) {
+    const relPath = file?.path;
+    if (typeof relPath !== 'string') continue;
+    const abs = path.isAbsolute(relPath) ? relPath : path.join(projectPath || '', relPath);
+    let content;
+    try { content = fs.readFileSync(abs, 'utf8'); } catch { continue; }
+    if (typeof content !== 'string' || !content.trim()) continue;
+
+    // Idempotency: skip if file already carries @auth or @tierB anywhere.
+    if (/@auth\b|@tierB\b/.test(content)) continue;
+
+    const hasAuthIndicator = AUTH_INDICATORS.slice(0, -1).some((re) => re.test(content));
+    if (!hasAuthIndicator) continue;
+
+    // Inject `@auth @tierB ` into the first `test.describe(...)` title literal
+    // OR each `test(...)` title literal if no top-level describe exists.
+    let mutated = content.replace(/(test\.describe\s*\(\s*)(['"`])([^'"`]+?)\2/, (m, head, q, title) => {
+      if (/@auth\b/.test(title) || /@tierB\b/.test(title)) return m;
+      return `${head}${q}@auth @tierB ${title}${q}`;
+    });
+    if (mutated === content) {
+      mutated = content.replace(/(\btest\s*\(\s*)(['"`])([^'"`]+?)\2/g, (m, head, q, title) => {
+        if (/@auth\b/.test(title) || /@tierB\b/.test(title)) return m;
+        return `${head}${q}@auth @tierB ${title}${q}`;
+      });
+    }
+    if (mutated !== content) {
+      try {
+        fs.writeFileSync(abs, mutated, 'utf8');
+        tagged.push(relPath);
+      } catch (err) {
+        Logger.warn('ClaudeLocal/AutoTag', 'failed to rewrite auth-tagged spec', { file: relPath, reason: err?.message });
+      }
+    }
+  }
+  return tagged;
 }
 
 function _jsonSha(value) {
@@ -42,26 +97,43 @@ function _jsonSha(value) {
 }
 
 function _writeStatus({ statusDir, runId, phase, message, metadata, telemetryReporter }) {
-  if (!statusDir) return;
+  if (statusDir) {
+    try {
+      // Inline status writer — we deliberately don't require pipeline-worker's
+      // updateStatus to keep the adapter self-contained.
+      const filePath = path.join(statusDir, 'status.json');
+      const payload = {
+        phase,
+        timestamp: new Date().toISOString(),
+        runId,
+        message: message || null,
+        ...(metadata || {}),
+      };
+      fs.writeFileSync(filePath, JSON.stringify(payload, null, 2));
+    } catch (err) {
+      Logger.warn('ClaudeLocal/Index', 'Failed to write status.json', { phase, message: err?.message });
+    }
+  }
+  // F2: support BOTH callable reporters (legacy `setDurablePhaseReporter`
+  // style) AND MCPTelemetryReporter instances that expose `.emit({ ... })`.
+  // Pre-F2 the worker passed an instance, the type check expected a function
+  // — telemetry was silently no-op'd for the entire claude-local flow.
+  // That's why `claude_local_iteration_complete` AND G77 `live_shard_*`
+  // events never reached `mcp_telemetry_events`.
+  if (!telemetryReporter) return;
   try {
-    // Inline status writer — we deliberately don't require pipeline-worker's
-    // updateStatus to keep the adapter self-contained.
-    const filePath = path.join(statusDir, 'status.json');
-    const payload = {
-      phase,
-      timestamp: new Date().toISOString(),
-      runId,
-      message: message || null,
-      ...(metadata || {}),
-    };
-    fs.writeFileSync(filePath, JSON.stringify(payload, null, 2));
-  } catch (err) {
-    Logger.warn('ClaudeLocal/Index', 'Failed to write status.json', { phase, message: err?.message });
-  }
-  if (telemetryReporter && typeof telemetryReporter === 'function') {
-    try { telemetryReporter({ phase, message: message || null, ...(metadata || {}) }); }
-    catch { /* non-blocking */ }
-  }
+    if (typeof telemetryReporter === 'function') {
+      telemetryReporter({ phase, message: message || null, ...(metadata || {}) });
+    } else if (typeof telemetryReporter.emit === 'function') {
+      telemetryReporter.emit({
+        phase,
+        runId,
+        eventType: 'phase_transition',
+        message: message || null,
+        metadata: metadata || null,
+      });
+    }
+  } catch { /* non-blocking */ }
 }
 
 function _safeReportPhase(client, payload) {
@@ -89,8 +161,10 @@ function _feedbackHasBlockingAmbiguity(feedback) {
 }
 
 function _shouldMountAskUserMcp({ iterationNumber, feedback, env = process.env } = {}) {
-  const min = Number.parseInt(env.HEALIX_CLAUDE_ASK_USER_MCP_MIN_ITERATION || '2', 10);
-  const threshold = Number.isFinite(min) && min > 0 ? min : 2;
+  const planMode = String(env.HEALIX_CLAUDE_PLAN_MODE || 'auto').toLowerCase();
+  const defaultMin = ['true', '1', 'on', 'always'].includes(planMode) ? '1' : '2';
+  const min = Number.parseInt(env.HEALIX_CLAUDE_ASK_USER_MCP_MIN_ITERATION || defaultMin, 10);
+  const threshold = Number.isFinite(min) && min > 0 ? min : Number(defaultMin);
   if (env.HEALIX_CLAUDE_ASK_USER_MCP === 'always') return { mount: true, reason: 'forced_always' };
   if (env.HEALIX_CLAUDE_ASK_USER_MCP === 'off') return { mount: false, reason: 'disabled' };
   if (_feedbackHasBlockingAmbiguity(feedback)) return { mount: true, reason: 'blocking_ambiguity_feedback' };
@@ -138,7 +212,9 @@ async function runClaudeGeneration(args = {}) {
     contextArtifacts: suppliedContextArtifacts = null,
     compactSummary: suppliedCompactSummary = null,
     promptBudget: suppliedPromptBudget = null,
-    model = DEFAULT_MODEL,
+    // Caller-passed model overrides BOTH passes (backwards compat). If unset,
+    // each pass picks its own default (DEFAULT_PLAN_MODEL / DEFAULT_WRITE_MODEL).
+    model = null,
     effort = DEFAULT_EFFORT,
     // ── Test-injection seams ────────────────────────────────────────────────
     _preflight = Preflight.preflight,
@@ -201,8 +277,17 @@ async function runClaudeGeneration(args = {}) {
   }
 
   let skillMeta;
+  let setupMeta = null;
   try {
-    skillMeta = SkillInstaller.installHealixSkill();
+    setupMeta = LocalSetup.ensureLocalSetup({
+      projectPath,
+      reason: 'claude_preflight',
+      installPlaywright: false,
+    });
+    skillMeta = setupMeta?.steps?.find((s) => s.name === 'claude_skill') || null;
+    if (!skillMeta || skillMeta.skillInstalled === false) {
+      skillMeta = SkillInstaller.installHealixSkill();
+    }
   } catch (err) {
     Logger.warn('ClaudeLocal/Index', 'Healix skill installation failed (non-blocking)', { message: err?.message });
     skillMeta = {
@@ -211,6 +296,7 @@ async function runClaudeGeneration(args = {}) {
       skillVersion: SkillInstaller.SKILL_VERSION,
       reason: err?.message || 'install_failed',
     };
+    setupMeta = setupMeta || { ok: false, reason: err?.message || 'setup_failed' };
   }
 
   // ── 2. Session resume resolution ────────────────────────────────────────
@@ -305,7 +391,26 @@ async function runClaudeGeneration(args = {}) {
     corpusGuidance,
     surface: surfaceFocus,
   });
-  const omitLoadedContext = Boolean(sessionId && iterationNumber >= 2 && iterationNumber <= 3);
+  let omitLoadedContext = Boolean(sessionId && iterationNumber >= 2 && iterationNumber <= 3);
+  let coverageGuard = CoverageGuard.evaluateCoverageGuard({
+    parsedPRD,
+    compactSummary,
+    contextArtifacts,
+    omitLoadedContext,
+  });
+  if (coverageGuard.recommendExpandedContext) {
+    omitLoadedContext = false;
+    coverageGuard = {
+      ...CoverageGuard.evaluateCoverageGuard({
+        parsedPRD,
+        compactSummary,
+        contextArtifacts,
+        omitLoadedContext,
+      }),
+      expandedContextUsed: true,
+      expansionReason: 'missing_context_artifact_for_compact_resume',
+    };
+  }
   const promptParts = PromptBuilder.buildPromptWithMetadata({
     context,
     projectPath,
@@ -323,13 +428,15 @@ async function runClaudeGeneration(args = {}) {
     contextArtifacts,
     compactSummary,
     skill: skillMeta,
+    coverageGuard,
     omitLoadedContext,
   });
-  const prompt = promptParts.prompt;
-  const promptTokenEstimate = PromptBuilder.estimatePromptTokens(prompt);
-  const promptHash = _sha(prompt);
-  const stablePrefixHash = _sha(promptParts.stablePrefix);
-  const deltaHash = _sha(promptParts.deltaTail);
+  let prompt = promptParts.prompt;
+  let activePromptParts = promptParts;
+  let promptTokenEstimate = PromptBuilder.estimatePromptTokens(prompt);
+  let promptHash = _sha(prompt);
+  let stablePrefixHash = _sha(promptParts.stablePrefix);
+  let deltaHash = _sha(promptParts.deltaTail);
   const contextArtifactBytes = contextArtifacts?.bytes || 0;
   Logger.info('ClaudeLocal/Index', 'Built prompt', {
     iteration: iterationNumber,
@@ -385,10 +492,10 @@ async function runClaudeGeneration(args = {}) {
     binary: _binary || 'claude',
   });
 
-  // ── 5. Spawn + stream-parse ────────────────────────────────────────────
   const filesEdited = new Map(); // absPath -> { tool, lastInput }
   const askUserPending = [];
   let pendingAskUser = null;
+  let eventMode = 'generation';
 
   const onEvent = (evt) => {
     const { name, payload } = evt;
@@ -405,9 +512,48 @@ async function runClaudeGeneration(args = {}) {
         phase: 'claude_assistant_message',
         metadata: { iteration: iterationNumber, text: (payload?.text || '').slice(0, 2000) },
       });
+      // Q11: Claude sometimes writes `[HEALIX:awaiting_user_question]` as PLAIN
+      // TEXT in an assistant message instead of calling the
+      // `ask_user_question` MCP tool. The dashboard's QuestionModal listens
+      // for `awaiting_user_question` events — which only fire on a real
+      // tool-call, not on text. Result: the run stalls indefinitely with no
+      // UI to answer.
+      //
+      // Detect the marker in the message text. If present, synthesize the
+      // same event the tool-call path emits so the modal appears.
+      const text = String(payload?.text || '');
+      if (/\[HEALIX:awaiting_user_question\]/i.test(text) && !pendingAskUser) {
+        // Strip the marker; the rest is the question prose.
+        const question = text.replace(/\[HEALIX:awaiting_user_question\]\s*/i, '').trim().slice(0, 1500);
+        // Extract `A) ...` / `B) ...` / etc options if present.
+        const opts = [];
+        const optRe = /\n\s*([A-Z])\)\s*([^\n]+)/g;
+        let m;
+        while ((m = optRe.exec(text)) !== null && opts.length < 6) {
+          opts.push(`${m[1]}) ${m[2].trim().slice(0, 240)}`);
+        }
+        const questionId = AskUser.generateQuestionId(runId, question);
+        const record = { questionId, question, options: opts, confidence: null };
+        askUserPending.push(record);
+        pendingAskUser = record;
+        _writeStatus({
+          statusDir,
+          runId,
+          phase: 'awaiting_user_question',
+          message: question.slice(0, 280),
+          metadata: { iteration: iterationNumber, questionId, question, options: opts, confidence: null, sessionId, synthesized: true },
+          telemetryReporter,
+        });
+        _safeReportPhase(client, {
+          runId,
+          phase: 'awaiting_user_question',
+          metadata: { iteration: iterationNumber, questionId, question, options: opts, confidence: null, sessionId, source: 'claude-local-synthesized' },
+        });
+      }
       return;
     }
     if (name === 'tool_use_edit' || name === 'tool_use_write') {
+      if (eventMode === 'planning') return;
       const filePath = _extractFilePath(payload?.input);
       if (filePath) {
         filesEdited.set(filePath, { tool: name, lastInput: payload?.input });
@@ -447,6 +593,134 @@ async function runClaudeGeneration(args = {}) {
     }
   };
 
+  // ── 4b. Planning pass (Claude permission-mode plan) ────────────────────
+  let claudePlan = null;
+  const planDecision = PlanMode.shouldRunPlanPass({
+    promptTokenEstimate,
+    iterationNumber,
+    surfaceKey,
+    compactSummary,
+    feedback,
+    topupFocus,
+  });
+  const planModeEnabled = planDecision.run;
+  const planModeSupported = planModeEnabled && PlanMode.supportsPlanMode({ binary: _binary || 'claude' });
+  if (planModeEnabled && planModeSupported) {
+    try {
+      eventMode = 'planning';
+      _writeStatus({
+        statusDir,
+        runId,
+        phase: 'claude_local_plan_started',
+        message: `Planning ${surfaceKey} before writing tests`,
+        metadata: { iteration: iterationNumber, surfaceKey, sessionId },
+        telemetryReporter,
+      });
+      claudePlan = await PlanMode.runPlanPass({
+        spawnClaude: _spawnClaude,
+        prompt,
+        projectPath,
+        testsDir,
+        surfaceKey,
+        runId,
+        mcpConfigPath,
+        sessionId,
+        model: model || DEFAULT_PLAN_MODEL,
+        effort,
+        systemPrompt: systemPromptOption.systemPrompt,
+        systemPromptFile: systemPromptOption.systemPromptFile,
+        binary: _binary,
+        spawnFn: _spawnFn,
+        contextArtifacts,
+        compactSummary,
+        coverageGuard,
+        baseURL: projectInfo?.baseURL,
+        expectedAcIds: coverageGuard.expectedAcIds,
+        onEvent,
+      });
+      eventMode = 'generation';
+      pendingAskUser = null;
+      if (claudePlan.sessionId) {
+        sessionId = claudePlan.sessionId;
+        sessionResumeSource = sessionResumeSource === 'fresh' ? 'plan_session' : sessionResumeSource;
+      }
+      coverageGuard = {
+        ...CoverageGuard.evaluateCoverageGuard({
+          parsedPRD,
+          compactSummary,
+          contextArtifacts,
+          omitLoadedContext,
+          planValidation: claudePlan.validation,
+        }),
+        expandedContextUsed: coverageGuard.expandedContextUsed === true,
+        planValidated: claudePlan.status,
+      };
+      activePromptParts = PromptBuilder.buildPromptWithMetadata({
+        context,
+        projectPath,
+        testsDir,
+        prdContent,
+        parsedPRD,
+        explorationArtifact,
+        roles,
+        projectInfo,
+        corpusSeed,
+        corpusGuidance,
+        feedback,
+        iterationNumber,
+        topupFocus,
+        contextArtifacts,
+        compactSummary,
+        skill: skillMeta,
+        coverageGuard,
+        claudePlan,
+        omitLoadedContext,
+      });
+      prompt = activePromptParts.prompt;
+      promptTokenEstimate = PromptBuilder.estimatePromptTokens(prompt);
+      promptHash = _sha(prompt);
+      stablePrefixHash = _sha(activePromptParts.stablePrefix);
+      deltaHash = _sha(activePromptParts.deltaTail);
+      _writeStatus({
+        statusDir,
+        runId,
+        phase: 'claude_local_plan_complete',
+        message: `Plan pass ${claudePlan.status}`,
+        metadata: {
+          iteration: iterationNumber,
+          surfaceKey,
+          planPath: claudePlan.planPath,
+          validation: claudePlan.validation,
+          sessionId,
+        },
+        telemetryReporter,
+      });
+    } catch (err) {
+      eventMode = 'generation';
+      Logger.warn('ClaudeLocal/Index', 'Claude plan pass failed; falling back to direct generation', {
+        surfaceKey,
+        message: err?.message,
+      });
+      claudePlan = {
+        status: 'skipped',
+        reason: err?.message || 'plan_failed',
+      };
+    }
+  } else if (planDecision.run) {
+    claudePlan = {
+      status: 'skipped',
+      reason: 'permission_mode_plan_unsupported',
+    };
+  } else if (PlanMode.enabled()) {
+    claudePlan = {
+      status: 'skipped',
+      reason: planDecision.reason,
+      mode: planDecision.mode,
+      tokenFloor: Number.parseInt(process.env.HEALIX_CLAUDE_PLAN_MIN_TOKENS || '12000', 10) || 12000,
+    };
+  }
+
+  // ── 5. Spawn + stream-parse ────────────────────────────────────────────
   let spawnResult;
   try {
     spawnResult = _spawnClaude({
@@ -454,7 +728,7 @@ async function runClaudeGeneration(args = {}) {
       projectPath,
       mcpConfigPath,
       sessionId,
-      model,
+      model: model || DEFAULT_WRITE_MODEL,
       effort,
       systemPrompt: systemPromptOption.systemPrompt,
       systemPromptFile: systemPromptOption.systemPromptFile,
@@ -578,6 +852,22 @@ async function runClaudeGeneration(args = {}) {
     };
   }
 
+  // G36: scan each generated spec for auth indicators and inject `@auth @tierB`
+  // tags so Playwright routes the test to the correct tier project. Without
+  // this, Claude specs that fetch with credentials run in Tier A public and
+  // 401-fail, polluting the failure list with bogus test-bugs.
+  const autoTaggedFiles = _autoTagAuthTier1Specs({ files, projectPath });
+  if (autoTaggedFiles.length > 0) {
+    _writeStatus({
+      statusDir,
+      runId,
+      phase: 'auto_tag_tier_b',
+      message: `Auto-tagged ${autoTaggedFiles.length} spec(s) with @auth @tierB based on auth indicators.`,
+      metadata: { taggedFiles: autoTaggedFiles, surfaceKey, iteration: iterationNumber },
+      telemetryReporter,
+    });
+  }
+
   _writeStatus({
     statusDir,
     runId,
@@ -590,11 +880,42 @@ async function runClaudeGeneration(args = {}) {
       sessionResumeSource,
       sessionDbId,
       files: files.map((f) => f.path),
+      autoTaggedFiles,
       usage: final?.usage || null,
       summary: final?.summary || null,
     },
     telemetryReporter,
   });
+
+  // G77: fire-and-forget per-shard live execution. The executor's queue
+  // serializes runs across all shards so we never have 4 simultaneous
+  // Playwright sessions hammering the target app. Disabled with
+  // HEALIX_LIVE_SHARD_EXEC=off. Best-effort: any error here logs warn and
+  // doesn't block the iteration; the final full-corpus run is canonical.
+  try {
+    const { enqueueShardRun } = require('../../live-shard-executor');
+    const runtimeConfigPath = path.join(projectPath, '.healix', 'playwright.config.runtime.ts');
+    enqueueShardRun({
+      projectPath,
+      files: files.map((f) => f.path),
+      shardKey: surfaceKey,
+      iteration: iterationNumber,
+      runId,
+      runtimeConfigPath,
+      emitStatus: (phase, payload) => {
+        _writeStatus({
+          statusDir,
+          runId,
+          phase,
+          message: payload?.message || null,
+          metadata: payload,
+          telemetryReporter,
+        });
+      },
+    });
+  } catch (err) {
+    Logger.warn('ClaudeLocal/Index', '[G77] live shard enqueue failed (non-blocking)', { reason: err?.message });
+  }
 
   return {
     status: 'ok',
@@ -629,14 +950,17 @@ async function runClaudeGeneration(args = {}) {
         cacheFriendlyPrefix: true,
         stablePrefixHash,
         deltaHash,
-        stablePrefixTokens: promptParts.stablePrefixTokens,
-        deltaTokens: promptParts.deltaTokens,
+        stablePrefixTokens: activePromptParts.stablePrefixTokens,
+        deltaTokens: activePromptParts.deltaTokens,
         contextArtifactBytes,
         contextArtifactRoot: contextArtifacts?.root || null,
         omitLoadedContext,
         suppliedPromptBudget: suppliedPromptBudget || null,
       },
       skill: skillMeta,
+      setup: setupMeta,
+      claudePlan,
+      coverageGuard,
       askUserMcpMounted: Boolean(mcpConfigPath),
       mcpMountReason: askUserMcp.reason,
       toolOverheadOptimized: true,
@@ -670,4 +994,6 @@ module.exports = {
   ContextPacker,
   SkillInstaller,
   SystemPrompt,
+  PlanMode,
+  CoverageGuard,
 };

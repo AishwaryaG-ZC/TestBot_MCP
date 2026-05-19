@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { apiKeys, testArtifacts, testRuns } from '@/lib/db/schema'
 import { eq, and } from 'drizzle-orm'
 import { hashApiKey } from '@/lib/utils/api-keys'
+import { resolveTestRunId } from '@/lib/test-run-ids'
 import { uploadArtifact, ensureBucketExists } from '@/lib/storage/supabase-storage'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { validateArtifacts } from '@/lib/validation'
@@ -234,11 +235,18 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(artifactValidationError, { status: 422 })
     }
 
-    // 5. Verify test run exists and belongs to user
+    // 5. Verify test run exists and belongs to user.
+    // G32: caller may pass the MCP runId string (mcp_...) — resolve to UUID
+    // via the shared helper before the testRuns.id lookup. Without this the
+    // route returns 404/500 and the dashboard loses all screenshots/videos.
+    const resolvedRunId = await resolveTestRunId(runId)
+    if (!resolvedRunId) {
+      return NextResponse.json({ error: 'Test run not found or unauthorized' }, { status: 404 })
+    }
     const [testRun] = await db
       .select({ id: testRuns.id })
       .from(testRuns)
-      .where(and(eq(testRuns.id, runId), eq(testRuns.userId, userId)))
+      .where(and(eq(testRuns.id, resolvedRunId), eq(testRuns.userId, userId)))
       .limit(1)
 
     if (!testRun) {
@@ -272,7 +280,7 @@ export async function POST(request: NextRequest) {
       // Store in database (local filesystem will be searched as fallback if needed)
       try {
         await db.insert(testArtifacts).values({
-          testRunId: runId,
+          testRunId: resolvedRunId,
           testName: artifact.testName,
           artifactType: artifact.artifactType,
           storageUrl: uploaded?.storageUrl || null,

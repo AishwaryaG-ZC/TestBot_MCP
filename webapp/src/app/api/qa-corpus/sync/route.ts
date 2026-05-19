@@ -9,6 +9,7 @@ import {
   prepareCorpusPromotionPayload,
   persistCorpusPromotion,
 } from '@/lib/qa-corpus'
+import { resolveTestRunId, UUID_RE } from '@/lib/test-run-ids'
 
 const ENDPOINT = '/api/qa-corpus/sync'
 
@@ -61,11 +62,25 @@ export async function POST(request: NextRequest) {
       if (!prepared.projectFingerprint) {
         return NextResponse.json({ error: 'projectFingerprint is required' }, { status: 400 })
       }
+      // G69: prepared.runId may be the MCP `mcp_…` form (NOT a UUID).
+      // `qa_test_cases.first_seen_run_id` / `last_seen_run_id` are UUID
+      // columns with FKs to `test_runs.id`, so passing the raw mcp_ string
+      // crashes the INSERT with a UUID-cast error → 500. Resolve to the
+      // canonical UUID via reportJson.mcpRunId; if the run hasn't been
+      // ingested yet, store null and let the FK stay nullable.
+      let resolvedRunId: string | null = null
+      if (prepared.runId) {
+        if (UUID_RE.test(prepared.runId)) {
+          resolvedRunId = prepared.runId
+        } else {
+          resolvedRunId = await resolveTestRunId(prepared.runId)
+        }
+      }
       const result = await persistCorpusPromotion({
         userId: auth.userId,
         contributorUserId: prepared.contributorUserId || auth.userId,
         projectFingerprint: prepared.projectFingerprint,
-        runId: prepared.runId,
+        runId: resolvedRunId,
         upserts: prepared.upserts,
         demotions: prepared.demotions,
         regressions: prepared.regressions,
@@ -76,6 +91,7 @@ export async function POST(request: NextRequest) {
         mode: 'promotion',
         projectFingerprint: prepared.projectFingerprint,
         workspaceId: prepared.workspaceId,
+        resolvedRunId,
         ...result,
       })
     }

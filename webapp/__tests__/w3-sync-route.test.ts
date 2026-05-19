@@ -38,6 +38,13 @@ vi.mock('@/lib/rate-limit', () => ({
   checkRateLimit: async () => ({ allowed: true }),
 }))
 
+// G69: the sync route now resolves non-UUID runId strings via this helper.
+// Stub it so this test stays focused on the persistence delegation.
+vi.mock('@/lib/test-run-ids', () => ({
+  resolveTestRunId: async (id: string) => id,
+  UUID_RE: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+}))
+
 import { POST } from '@/app/api/qa-corpus/sync/route'
 
 function makeReq(body: unknown): import('next/server').NextRequest {

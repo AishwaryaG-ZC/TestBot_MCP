@@ -28,26 +28,46 @@ import { NextRequest, NextResponse } from 'next/server'
 import { and, eq } from 'drizzle-orm'
 import { getCurrentUser } from '@/lib/auth/session'
 import { db } from '@/lib/db'
-import { runPendingAnswers, testRuns, workspaceMembers } from '@/lib/db/schema'
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+import { apiKeys, runPendingAnswers, testRuns, workspaceMembers } from '@/lib/db/schema'
+import { hashApiKey } from '@/lib/utils/api-keys'
+import { resolveTestRunId } from '@/lib/test-run-ids'
 
 type AnswerBody = {
   questionId?: unknown
   answer?: unknown
 }
 
+// G3-pattern: accept either Supabase session cookie OR x-api-key header so the
+// MCP worker / scripts can unblock awaiting_user_question phases without UI.
+async function resolveUserId(request: NextRequest): Promise<string | null> {
+  const user = await getCurrentUser()
+  if (user?.id) return user.id
+  const apiKey = request.headers.get('x-api-key')
+  if (!apiKey) return null
+  const keyHash = hashApiKey(apiKey)
+  const [keyRecord] = await db
+    .select({ userId: apiKeys.userId, revoked: apiKeys.revoked })
+    .from(apiKeys)
+    .where(and(eq(apiKeys.keyHash, keyHash), eq(apiKeys.isActive, true)))
+    .limit(1)
+  if (!keyRecord || keyRecord.revoked) return null
+  return keyRecord.userId
+}
+
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const user = await getCurrentUser()
-  if (!user) {
+  const userId = await resolveUserId(request)
+  if (!userId) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
+  const user = { id: userId }
 
-  const { id: runId } = await params
-  if (!UUID_RE.test(runId)) {
+  const { id: rawId } = await params
+  // G21: shared resolver accepts UUID / mcp_... / live-mcp_... uniformly.
+  const runId = await resolveTestRunId(rawId)
+  if (!runId) {
     return NextResponse.json({ error: 'Invalid run id' }, { status: 400 })
   }
 

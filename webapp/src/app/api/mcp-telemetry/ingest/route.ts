@@ -36,9 +36,11 @@ function clampString(value: unknown, maxLength = MAX_STRING_LENGTH): string | nu
   return text.slice(0, maxLength)
 }
 
-function normalizeStatus(status: unknown, success: unknown): 'success' | 'error' | 'info' {
+type TelemetryStatus = 'success' | 'error' | 'info' | 'warning'
+
+function normalizeStatus(status: unknown, success: unknown): TelemetryStatus {
   const rawStatus = String(status || '').toLowerCase().trim()
-  if (rawStatus === 'success' || rawStatus === 'error' || rawStatus === 'info') {
+  if (rawStatus === 'success' || rawStatus === 'error' || rawStatus === 'info' || rawStatus === 'warning') {
     return rawStatus
   }
   if (success === true) return 'success'

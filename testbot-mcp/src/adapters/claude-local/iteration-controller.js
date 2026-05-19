@@ -12,8 +12,9 @@
  *   1. aborted                       → stop_aborted     (external signal trumps everything)
  *   2. CL3-B qa_cycle_complete       → stop_qa_cycle_complete
  *                                      (only real bugs left + passRate plateaued; iter>=2)
- *   3. selfDone && iter>=1           → stop_self_done   (Claude said DONE)
- *   4. iter >= maxIterations         → stop_coverage_degraded | stop_max_iterations
+ *   3. iter >= maxIterations         → stop_coverage_degraded | stop_max_iterations
+ *                                      (hard cost ceiling before any self-DONE override)
+ *   4. selfDone && iter>=1           → stop_self_done   (Claude said DONE)
  *   5. real coverage win             → stop_success     (only when totalAcTags >= 5)
  *   6. passRate >= target            → stop_success
  *   7. no-progress stall             → stop_no_progress
@@ -24,7 +25,7 @@ const DEFAULT_PASS_TARGET = 0.95;
 const DEFAULT_UNCOVERED_FRACTION = 0.05;
 const DEFAULT_PROGRESS_DELTA = 0.02;
 const DEFAULT_NO_PROGRESS_LIMIT = 3;
-const DEFAULT_MAX_ITERATIONS = 5;
+const DEFAULT_MAX_ITERATIONS = 2;
 // Below this many AC tags the uncoveredFraction metric is unreliable (it
 // trivially evaluates to 0/N for tiny denominators — the exact bug WS-3 is
 // fixing). 5 was picked as the smallest universe where the ratio is at least
@@ -42,7 +43,7 @@ const MIN_TOTAL_ACS_FOR_COVERAGE_STOP = 5;
  * @param {number}  [input.noProgressCounter]      Consecutive iters with delta < progressDelta
  * @param {boolean} [input.aborted]                External abort signal
  * @param {boolean} [input.selfDone]               Claude emitted the "DONE" marker (WS-3)
- * @param {number}  [input.maxIterations]          Cap iterations (default 5; HEALIX_CLAUDE_MAX_ITERATIONS overrides)
+ * @param {number}  [input.maxIterations]          Cap iterations (default DEFAULT_MAX_ITERATIONS; HEALIX_CLAUDE_MAX_ITERATIONS overrides)
  * @param {object}  [input.targets]                Override thresholds
  * @param {object}  [input.failureBreakdown]       CL3-B: { real, bad, env } counts from failure classifier
  * @returns {{ decision: 'continue'|'stop_success'|'stop_self_done'|'stop_qa_cycle_complete'|'stop_max_iterations'|'stop_coverage_degraded'|'stop_no_progress'|'stop_aborted',
@@ -77,6 +78,37 @@ function decide(input) {
   const selfDone = Boolean(input.selfDone);
   const prevNoProgress = Number.isFinite(input.noProgressCounter) ? input.noProgressCounter : 0;
 
+  // G67: surface failing-but-attempted ACs so feedback-builder can route
+  // them to the next iteration with explicit instructions to fix the test
+  // or confirm the app is wrong. `attemptedAcs` and `coveredAcs` are
+  // optional input arrays from acCoverage.{attempted,covered}.
+  const attemptedAcs = Array.isArray(input.attemptedAcs) ? input.attemptedAcs : [];
+  const coveredAcs = Array.isArray(input.coveredAcs) ? input.coveredAcs : [];
+  const coveredSet = new Set(coveredAcs);
+  // Q10: drop known-bug ACs from failingAcs. Without this, the iteration
+  // controller churns Claude on bugs the team has explicitly accepted as
+  // "won't fix this sprint" — the QA known-bugs registry should suppress
+  // them. `knownBugAcs` is the set of AC IDs whose ONLY failing test
+  // matches a known-bug signature.
+  const knownBugAcs = new Set(
+    Array.isArray(input.knownBugAcs) ? input.knownBugAcs : []
+  );
+  const failingAcs = attemptedAcs.filter((id) => !coveredSet.has(id) && !knownBugAcs.has(id));
+
+  // G67: early-stop when every attempted AC passed AND we have at least one
+  // attempted AC. This is the "everything we tried, we covered" win
+  // condition. Distinct from passRate ≥ passTarget — a run with attempted=10
+  // covered=10 should halt even if other unrelated tests bring passRate down.
+  if (attemptedAcs.length > 0 && failingAcs.length === 0) {
+    return {
+      decision: 'stop_qa_cycle_complete',
+      reason: `every attempted AC passed (${coveredSet.size}/${attemptedAcs.length}); QA cycle complete`,
+      noProgressCounter: prevNoProgress,
+      targetsMet: true,
+      failingAcs: [],
+    };
+  }
+
   // 1. External abort — highest priority.
   if (aborted) {
     return {
@@ -107,7 +139,35 @@ function decide(input) {
     }
   }
 
-  // 3. Claude self-DONE — but CL2-C override: refuse premature DONE.
+  // 3. Iteration cap — hard ceiling, cost guard.
+  //    This intentionally runs before the self-DONE block. If Claude says
+  //    DONE prematurely on the cap iteration, we must not return `continue`
+  //    and spend another paid turn trying to improve a run whose caller
+  //    explicitly capped iterations.
+  if (iteration >= maxIterations) {
+    const allowCoverageDegraded = input.allowCoverageDegraded !== false;
+    const usefulTestsRan = (Number.isFinite(input.totalTests) && input.totalTests > 0)
+      || passRate > 0
+      || (Number.isFinite(input.executedTests) && input.executedTests > 0);
+    const breakdown = input.failureBreakdown || {};
+    const envFailures = Number(breakdown.env || 0);
+    if (allowCoverageDegraded && usefulTestsRan && envFailures === 0) {
+      return {
+        decision: 'stop_coverage_degraded',
+        reason: `reached max iterations (${maxIterations}) with useful tests executed; reporting coverage_degraded instead of pipeline error`,
+        noProgressCounter: prevNoProgress,
+        targetsMet: false,
+      };
+    }
+    return {
+      decision: 'stop_max_iterations',
+      reason: `reached max iterations (${maxIterations})`,
+      noProgressCounter: prevNoProgress,
+      targetsMet: false,
+    };
+  }
+
+  // 4. Claude self-DONE — but CL2-C override: refuse premature DONE.
   //    If Claude says DONE while metrics are clearly below the QA-replacement
   //    bar, we treat it as wishful thinking and keep iterating. Specifically:
   //      * passRate must be >= SELF_DONE_PASS_FLOOR (0.90)
@@ -140,30 +200,6 @@ function decide(input) {
       noProgressCounter: prevNoProgress,
       targetsMet: false,
       selfDoneOverridden: true,
-    };
-  }
-
-  // 3. Iteration cap — hard ceiling, cost guard.
-  if (iteration >= maxIterations) {
-    const allowCoverageDegraded = input.allowCoverageDegraded !== false;
-    const usefulTestsRan = (Number.isFinite(input.totalTests) && input.totalTests > 0)
-      || passRate > 0
-      || (Number.isFinite(input.executedTests) && input.executedTests > 0);
-    const breakdown = input.failureBreakdown || {};
-    const envFailures = Number(breakdown.env || 0);
-    if (allowCoverageDegraded && usefulTestsRan && envFailures === 0) {
-      return {
-        decision: 'stop_coverage_degraded',
-        reason: `reached max iterations (${maxIterations}) with useful tests executed; reporting coverage_degraded instead of pipeline error`,
-        noProgressCounter: prevNoProgress,
-        targetsMet: false,
-      };
-    }
-    return {
-      decision: 'stop_max_iterations',
-      reason: `reached max iterations (${maxIterations})`,
-      noProgressCounter: prevNoProgress,
-      targetsMet: false,
     };
   }
 
@@ -206,6 +242,10 @@ function decide(input) {
       reason: `passRate=${passRate.toFixed(3)} below ${passTarget}; iterating`,
       noProgressCounter: nextNoProgress,
       targetsMet: false,
+      // G67: tell feedback-builder which ACs were attempted-but-failing
+      // so the next iter's prompt mentions them by ID (capped at 5 to
+      // keep the prompt small).
+      failingAcs: failingAcs.slice(0, 5),
     };
   }
 
@@ -214,6 +254,7 @@ function decide(input) {
     reason: 'first iteration baseline established; continuing',
     noProgressCounter: 0,
     targetsMet: false,
+    failingAcs: failingAcs.slice(0, 5),
   };
 }
 

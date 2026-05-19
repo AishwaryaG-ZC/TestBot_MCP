@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { projectSourceFingerprints, workspaceMembers } from '@/lib/db/schema'
 import { eq, and } from 'drizzle-orm'
 import { requireWorkspaceAuth } from '@/lib/workspace-auth'
+import { resolveTestRunId } from '@/lib/test-run-ids'
 
 export const runtime = 'nodejs'
 
@@ -81,10 +82,13 @@ export async function POST(
     return NextResponse.json({ error: 'projectKey is required' }, { status: 400 })
   }
 
-  const sourceRunId =
+  // G33: schema column is uuid → testRuns.id; worker passes mcp_... runId.
+  // Resolve before insert/update.
+  const rawSourceRunId =
     typeof body.sourceRunId === 'string' && body.sourceRunId.length > 0
       ? body.sourceRunId
       : null
+  const sourceRunId = rawSourceRunId ? (await resolveTestRunId(rawSourceRunId)) : null
 
   const raw = body.fingerprints
   if (!Array.isArray(raw)) {

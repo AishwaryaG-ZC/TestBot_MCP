@@ -26,6 +26,7 @@ type LiveTest = {
   n: string
   su: string
   f: string
+  p?: string  // G26: Playwright project (tierA-public / tierB-auth-<role> / tierC-backend)
   s: string
   d: number
 }
@@ -350,8 +351,23 @@ export async function getLiveRunSnapshotsForUser(userId: string, options?: {
     if (occurredAt < existing.firstSeenAt) {
       existing.firstSeenAt = occurredAt
     }
-    if (existing.liveTests === null && eventType === 'test_results' && Array.isArray(meta.tests)) {
-      existing.liveTests = meta.tests as LiveTest[]
+    // G25: merge ALL test_results batches by (suite,file,name,project) instead
+    // of keeping only the first one. The SSE path on the client already merges;
+    // the REST/refresh path previously dropped subsequent batches, which caused
+    // the dashboard to show 2 rows visible / 147 missing for runs with many
+    // streamed tests. Latest wins on duplicate keys so retries reflect their
+    // most recent attempt status.
+    if (eventType === 'test_results' && Array.isArray(meta.tests)) {
+      const incoming = meta.tests as LiveTest[]
+      if (existing.liveTests === null) {
+        existing.liveTests = incoming
+      } else {
+        const merged = new Map<string, LiveTest>()
+        const keyOf = (t: LiveTest) => `${t.p || ''}|${t.su || ''}|${t.f || ''}|${t.n || ''}`
+        for (const t of existing.liveTests) merged.set(keyOf(t), t)
+        for (const t of incoming) merged.set(keyOf(t), t)
+        existing.liveTests = [...merged.values()]
+      }
     }
     if (eventType === 'tests_generated' && Array.isArray(meta.files)) {
       const current = Array.isArray(existing.generatedFiles) ? existing.generatedFiles : []

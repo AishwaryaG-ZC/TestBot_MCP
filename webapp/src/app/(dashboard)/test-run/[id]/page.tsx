@@ -1,13 +1,20 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { useParams } from 'next/navigation';
+import { useParams, useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { TestRun, TestFailure, FailureVerdict, QaFinding, FindingSummary } from '@/lib/types/database';
 import QuestionModal from '@/components/run-detail/QuestionModal';
 import LoginPausedBanner from '@/components/run-detail/LoginPausedBanner';
 import TopUpButton from '@/components/run-detail/TopUpButton';
+import { deriveFailureHeadline, derivePassRateTint } from '@/lib/test-run/stats-hero';
+import { matchingTestNames, type ClassifiedFailureLike } from '@/lib/test-run/signal-filter';
+import { groupAcsByFeature } from '@/lib/test-run/ac-coverage';
+import { parseVerdictFilter, applyVerdictFilter, VERDICT_FILTER_VALUES, verdictLabel } from '@/lib/test-run/verdict-filter';
+import { DiffBanner } from '@/components/test-run/DiffBanner';
+import { TargetAppHeader } from '@/components/test-run/TargetAppHeader';
+import { HealixInternalPanel } from '@/components/test-run/HealixInternalPanel';
 import {
   buildIterationLabel,
   fileEditIcon,
@@ -484,8 +491,10 @@ function useCountUp(target: number, duration = 1200, delay = 0) {
 
 // ─── Sub-components ──────────────────────────────────────────────────────────
 
-function KpiCard({ label, value, sub, color, delay, loading }: {
+function KpiCard({ label, value, sub, color, delay, loading, subtitle }: {
   label: string; value: number; sub?: string; color: string; delay: number; loading?: boolean;
+  /** G61: optional subtitle line shown under the big number. */
+  subtitle?: string | null;
 }) {
   const displayed = useCountUp(value, 1000, delay);
   return (
@@ -508,12 +517,24 @@ function KpiCard({ label, value, sub, color, delay, loading }: {
       ) : (
         <span className={`text-3xl font-bold ${color}`}>{displayed}{sub}</span>
       )}
+      {subtitle && !loading && (
+        <span className="text-[#4A6280] text-[10px] font-medium">{subtitle}</span>
+      )}
     </motion.div>
   );
 }
 
+// G61 hero-card derivations live in @/lib/test-run/stats-hero so they can
+// be unit-tested without rendering the entire test-run page.
+
 function StatusBadge({ status }: { status: string }) {
   const s = (status ?? '').toLowerCase();
+  // G62: the row-level run-status field now uses the 5-state derivation
+  // (passed / degraded_noise / degraded_real_bugs / failed / error / aborted).
+  if (s === 'degraded_noise')
+    return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-yellow-500/10 text-yellow-300">degraded · noise</span>;
+  if (s === 'degraded_real_bugs')
+    return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-orange-500/10 text-orange-300">degraded · real bugs</span>;
   if (s === 'passed' || s === 'pass')
     return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400">passed</span>;
   if (s === 'failed' || s === 'fail')
@@ -1735,6 +1756,10 @@ const PHASE_LABELS: Record<string, string> = {
   'stage:aitriage': 'Analyzing Failures',
   'stage:reporting': 'Generating Report',
   'stage:dashboard': 'Opening Dashboard',
+  // G77: per-shard live execution phases
+  live_shard_executing: 'Live Shard Running',
+  live_shard_executed: 'Live Shard Complete',
+  live_shard_skipped: 'Live Shard Skipped',
 };
 
 const TERMINAL_PHASES = new Set(['completed', 'error', 'error_reported']);
@@ -2442,6 +2467,13 @@ function AcCoverageCard({ coverage }: { coverage: AcCoverage }) {
   const attemptedList = coverage.attempted ?? [];
   const ratio = total > 0 ? (coverage.ratio ?? coveredList.length / total) : 0;
   const pct = Math.round(ratio * 100);
+  // G73: per-feature grouping so a "94%" overall doesn't hide a feature at 50%.
+  const featureGroups = groupAcsByFeature({
+    covered: coveredList,
+    attempted: attemptedList,
+    uncovered: uncoveredList,
+    totalAcTags: total,
+  });
   const tone =
     pct >= 80 ? 'text-emerald-400 border-emerald-500/30 bg-emerald-500/5'
     : pct >= 50 ? 'text-amber-400 border-amber-500/30 bg-amber-500/5'
@@ -2491,37 +2523,88 @@ function AcCoverageCard({ coverage }: { coverage: AcCoverage }) {
             style={{ overflow: 'hidden' }}
             className="border-t border-white/8"
           >
-            <div className="px-5 py-4 grid sm:grid-cols-2 gap-4">
-              <div>
-                <div className="text-[10px] uppercase tracking-wider text-emerald-400/80 font-semibold mb-2">
-                  Covered ({coveredList.length})
+            <div className="px-5 py-4 space-y-4">
+              {/* G73: per-feature groups. Each row shows feature key + ratio + tile grid. */}
+              {featureGroups.length > 1 && (
+                <div className="space-y-3">
+                  <div className="text-[10px] uppercase tracking-wider text-[#8DA0BC]/70 font-semibold">
+                    By feature
+                  </div>
+                  {featureGroups.map((g) => {
+                    const featurePct = Math.round(g.ratio * 100);
+                    const featureTone =
+                      featurePct >= 80 ? 'text-emerald-400'
+                        : featurePct >= 50 ? 'text-amber-400'
+                          : 'text-red-400';
+                    return (
+                      <div key={g.feature} className="space-y-1.5">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-[#C4D2E5] font-semibold font-mono">{g.feature}</span>
+                          <span className={`${featureTone} font-mono`}>
+                            {g.covered.length}/{g.total} ({featurePct}%)
+                            {g.attemptedButFailing.length > 0 && (
+                              <span className="text-amber-400/80 ml-2">
+                                · {g.attemptedButFailing.length} attempted-failing
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap gap-1">
+                          {g.covered.map((id) => (
+                            <span key={id} className="px-1.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300/90 text-[10px] font-mono">
+                              {id}
+                            </span>
+                          ))}
+                          {g.attemptedButFailing.map((id) => (
+                            <span key={id} className="px-1.5 py-0.5 rounded bg-amber-500/10 border border-amber-500/30 text-amber-300/90 text-[10px] font-mono" title="Attempted but failing — test exists but does not pass">
+                              {id}
+                            </span>
+                          ))}
+                          {g.uncovered.map((id) => (
+                            <span key={id} className="px-1.5 py-0.5 rounded bg-red-500/10 border border-red-500/30 text-red-300/90 text-[10px] font-mono">
+                              {id}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
-                <div className="flex flex-wrap gap-1">
-                  {coveredList.length === 0 ? (
-                    <span className="text-[#4A6280] text-xs">(none)</span>
-                  ) : (
-                    coveredList.map((id) => (
-                      <span key={id} className="px-1.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300/90 text-[10px] font-mono">
-                        {id}
-                      </span>
-                    ))
-                  )}
+              )}
+
+              {/* Legacy flat view when only one feature OR for users who prefer the global lists. */}
+              <div className="grid sm:grid-cols-2 gap-4">
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-emerald-400/80 font-semibold mb-2">
+                    Covered ({coveredList.length})
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {coveredList.length === 0 ? (
+                      <span className="text-[#4A6280] text-xs">(none)</span>
+                    ) : (
+                      coveredList.map((id) => (
+                        <span key={id} className="px-1.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300/90 text-[10px] font-mono">
+                          {id}
+                        </span>
+                      ))
+                    )}
+                  </div>
                 </div>
-              </div>
-              <div>
-                <div className="text-[10px] uppercase tracking-wider text-red-400/80 font-semibold mb-2">
-                  Uncovered ({uncoveredList.length})
-                </div>
-                <div className="flex flex-wrap gap-1">
-                  {uncoveredList.length === 0 ? (
-                    <span className="text-[#4A6280] text-xs">(none)</span>
-                  ) : (
-                    uncoveredList.map((id) => (
-                      <span key={id} className="px-1.5 py-0.5 rounded bg-red-500/10 border border-red-500/30 text-red-300/90 text-[10px] font-mono">
-                        {id}
-                      </span>
-                    ))
-                  )}
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-red-400/80 font-semibold mb-2">
+                    Uncovered ({uncoveredList.length})
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {uncoveredList.length === 0 ? (
+                      <span className="text-[#4A6280] text-xs">(none)</span>
+                    ) : (
+                      uncoveredList.map((id) => (
+                        <span key={id} className="px-1.5 py-0.5 rounded bg-red-500/10 border border-red-500/30 text-red-300/90 text-[10px] font-mono">
+                          {id}
+                        </span>
+                      ))
+                    )}
+                  </div>
                 </div>
               </div>
             </div>
@@ -2673,10 +2756,23 @@ export function failureBreakdownSummary(b: FailureBreakdown | null | undefined):
 
 function FailureBreakdownCard({ breakdown }: { breakdown: FailureBreakdown }) {
   const [open, setOpen] = useState(false);
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const activeSignal = searchParams?.get('signal') || null;
   const s = failureBreakdownSummary(breakdown);
   if (s.total === 0) return null;
   const byBucket = breakdown.byBucket || {};
   const buckets = Object.entries(byBucket).sort((a, b) => b[1] - a[1]);
+
+  // G72: clicking a signal toggles it as a URL filter; the failures table
+  // reads `?signal=` and narrows itself.
+  const onSignalClick = (signal: string) => {
+    const sp = new URLSearchParams(searchParams?.toString() || '');
+    if (sp.get('signal') === signal) sp.delete('signal');
+    else sp.set('signal', signal);
+    const query = sp.toString();
+    router.push(query ? `?${query}` : '?', { scroll: false });
+  };
 
   return (
     <motion.div
@@ -2745,21 +2841,204 @@ function FailureBreakdownCard({ breakdown }: { breakdown: FailureBreakdown }) {
                 By signal
               </div>
               <ul className="space-y-1.5">
-                {buckets.map(([signal, count]) => (
-                  <li
-                    key={signal}
-                    className="flex items-center justify-between text-xs text-[#C4D2E5] font-mono"
-                  >
-                    <span>{signal}</span>
-                    <span className="text-[#8DA0BC]">{count}</span>
-                  </li>
-                ))}
+                {buckets.map(([signal, count]) => {
+                  const active = activeSignal === signal;
+                  return (
+                    <li key={signal}>
+                      <button
+                        type="button"
+                        onClick={() => onSignalClick(signal)}
+                        className={`group w-full flex items-center justify-between text-xs font-mono px-2 py-1 -mx-2 rounded transition-colors ${
+                          active
+                            ? 'bg-blue-500/10 text-blue-300 hover:bg-blue-500/15'
+                            : 'text-[#C4D2E5] hover:bg-white/[0.03]'
+                        }`}
+                        aria-pressed={active}
+                        aria-label={`${active ? 'Clear' : 'Filter'} failures by signal: ${signal}`}
+                      >
+                        <span className="flex items-center gap-2">
+                          {signal}
+                          {active && (
+                            <span className="text-[10px] text-blue-300/80 font-sans">(filtering)</span>
+                          )}
+                        </span>
+                        <span className={active ? 'text-blue-200' : 'text-[#8DA0BC] group-hover:text-[#C4D2E5]'}>
+                          {count}
+                        </span>
+                      </button>
+                    </li>
+                  );
+                })}
               </ul>
+              {activeSignal && (
+                <button
+                  type="button"
+                  onClick={() => onSignalClick(activeSignal)}
+                  className="mt-2 text-[10px] text-blue-300 hover:text-blue-200 underline"
+                >
+                  Clear signal filter
+                </button>
+              )}
             </div>
           </motion.div>
         )}
       </AnimatePresence>
     </motion.div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// ─── G77: Live shard execution panel ──────────────────────────────────────
+// Aggregates `live_shard_executed` events into a per-shard summary so the
+// operator sees pass/fail counts for each Claude shard as it finishes,
+// BEFORE the canonical full-corpus run. These are "preview" numbers —
+// they predate quarantine gates and aren't the final word.
+// ────────────────────────────────────────────────────────────────────────
+interface LiveShardEvent {
+  phase: string;
+  metadata?: Record<string, unknown> | null;
+  createdAt?: string;
+}
+
+function LiveShardPanel({ events }: { events: LiveShardEvent[] }) {
+  const shardEvents = events.filter((e) => {
+    const p = String(e.phase || '').toLowerCase();
+    return p === 'live_shard_executed' || p === 'live_shard_executing' || p === 'live_shard_skipped';
+  });
+  if (shardEvents.length === 0) return null;
+
+  type ShardRow = { shardKey: string; iteration: number | null; status: 'running' | 'done' | 'skipped'; passed?: number; failed?: number; skipped?: number; files?: number; durationMs?: number; reason?: string };
+  // Collapse to one row per (shardKey, iteration). Later events win.
+  const byKey = new Map<string, ShardRow>();
+  for (const e of shardEvents) {
+    const md = (e.metadata || {}) as Record<string, unknown>;
+    const shardKey = String(md.shardKey || '(unknown)');
+    const iteration = Number.isFinite(md.iteration as number) ? Number(md.iteration) : null;
+    const key = `${shardKey}::${iteration}`;
+    const p = String(e.phase).toLowerCase();
+    const row: ShardRow = byKey.get(key) || { shardKey, iteration, status: 'running' };
+    if (p === 'live_shard_executing') {
+      row.status = 'running';
+      row.files = Number(md.files || 0);
+    } else if (p === 'live_shard_executed') {
+      row.status = 'done';
+      row.passed = Number(md.passed || 0);
+      row.failed = Number(md.failed || 0);
+      row.skipped = Number(md.skipped || 0);
+      row.files = Number(md.files || 0);
+      row.durationMs = Number(md.durationMs || 0);
+    } else if (p === 'live_shard_skipped') {
+      row.status = 'skipped';
+      row.reason = String(md.reason || 'unknown');
+    }
+    byKey.set(key, row);
+  }
+  const rows = Array.from(byKey.values()).sort((a, b) => a.shardKey.localeCompare(b.shardKey));
+
+  const totalPassed = rows.reduce((acc, r) => acc + (r.passed || 0), 0);
+  const totalFailed = rows.reduce((acc, r) => acc + (r.failed || 0), 0);
+  const totalTests = totalPassed + totalFailed + rows.reduce((acc, r) => acc + (r.skipped || 0), 0);
+  const previewPassRate = totalTests > 0 ? Math.round((totalPassed / totalTests) * 100) : 0;
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl border border-blue-500/20 bg-blue-500/[0.02] overflow-hidden"
+    >
+      <div className="px-5 py-3 border-b border-blue-500/10 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className="text-blue-300 text-[10px] uppercase tracking-wider font-semibold">G77 · Live preview (per shard)</span>
+          <span className="px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider font-bold bg-white/8 border border-white/10 text-[#8DA0BC]">
+            Internal
+          </span>
+          <span className="text-[#8DA0BC] text-[10px]">— pre-quarantine; canonical run still pending</span>
+        </div>
+        {totalTests > 0 && (
+          <div className="flex items-center gap-3 text-xs font-mono">
+            <span className="text-emerald-400">{totalPassed}P</span>
+            <span className="text-red-400">{totalFailed}F</span>
+            <span className={previewPassRate >= 70 ? 'text-emerald-400' : previewPassRate >= 40 ? 'text-amber-400' : 'text-red-400'}>
+              {previewPassRate}%
+            </span>
+          </div>
+        )}
+      </div>
+      <ul className="divide-y divide-blue-500/10">
+        {rows.map((r) => (
+          <li key={`${r.shardKey}::${r.iteration}`} className="px-5 py-2 flex items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                r.status === 'done' ? 'bg-emerald-400' : r.status === 'skipped' ? 'bg-slate-400' : 'bg-blue-400 animate-pulse'
+              }`} />
+              <span className="text-[#F0F6FF] font-mono truncate">{r.shardKey}</span>
+              {r.iteration && <span className="text-[#4A6280] text-[10px]">iter {r.iteration}</span>}
+            </div>
+            <div className="flex items-center gap-3 font-mono text-[11px] flex-shrink-0">
+              {r.status === 'done' && (
+                <>
+                  <span className="text-emerald-400">{r.passed ?? 0}P</span>
+                  <span className="text-red-400">{r.failed ?? 0}F</span>
+                  {(r.skipped ?? 0) > 0 && <span className="text-amber-400">{r.skipped}S</span>}
+                  <span className="text-[#4A6280]">{Math.round((r.durationMs || 0) / 1000)}s</span>
+                </>
+              )}
+              {r.status === 'running' && <span className="text-blue-300">running…</span>}
+              {r.status === 'skipped' && <span className="text-slate-400">skipped · {r.reason}</span>}
+            </div>
+          </li>
+        ))}
+      </ul>
+    </motion.div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// ─── G74: Verdict filter chip row ─────────────────────────────────────────
+// Sits above the failures list. Each chip pushes a `?verdict=` query so the
+// filter survives reloads and can be shared via URL.
+// ────────────────────────────────────────────────────────────────────────
+function VerdictFilterChips({ totalFailures, filteredCount }: { totalFailures: number; filteredCount: number }) {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const current = parseVerdictFilter(searchParams?.get('verdict'));
+  const onClick = (v: typeof VERDICT_FILTER_VALUES[number]) => {
+    const sp = new URLSearchParams(searchParams?.toString() || '');
+    if (v === 'all') sp.delete('verdict');
+    else sp.set('verdict', v);
+    const q = sp.toString();
+    router.push(q ? `?${q}` : '?', { scroll: false });
+  };
+  return (
+    <div className="flex items-center gap-2 flex-wrap" data-testid="verdict-filter-chips">
+      <span className="text-[10px] uppercase tracking-wider text-[#8DA0BC]/70 font-semibold">
+        Verdict
+      </span>
+      {VERDICT_FILTER_VALUES.map((v) => {
+        const active = current === v;
+        const label = v === 'all' ? `all (${totalFailures})` : verdictLabel(v);
+        return (
+          <button
+            key={v}
+            type="button"
+            onClick={() => onClick(v)}
+            className={`px-3 py-1 rounded-full text-[11px] font-semibold border transition-colors ${
+              active
+                ? 'bg-blue-500/15 border-blue-500/40 text-blue-200'
+                : 'bg-white/[0.02] border-white/10 text-[#8DA0BC] hover:border-white/20 hover:text-[#C4D2E5]'
+            }`}
+            aria-pressed={active}
+          >
+            {label}
+          </button>
+        );
+      })}
+      {current !== 'all' && (
+        <span className="text-[10px] text-[#8DA0BC]/70 ml-1">
+          showing {filteredCount} of {totalFailures}
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -4050,6 +4329,13 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
 
 export default function TestRunDetailPage() {
   const params = useParams();
+  // G72/G74: hoist URL-state hooks to the top of the component so they're
+  // ALWAYS called on every render. Pre-fix these lived after early returns
+  // (loading / notFound) which violated React's rules of hooks. The values
+  // are passed down to FailureBreakdownCard and VerdictFilterChips which
+  // also use the hooks; that's fine because the early-return paths above
+  // also don't render those components.
+  const _searchParamsForSignal = useSearchParams();
   const id = params?.id as string;
   const isLiveDetailId = String(id || '').startsWith('live-');
 
@@ -4542,9 +4828,31 @@ export default function TestRunDetailPage() {
   const passRate = totalTests > 0 ? Math.round((passedTests / totalTests) * 100) : 0;
   // True while Playwright is executing but no individual results have streamed in yet
   const isRunningPhase = !effectivePipelineEnded && liveEvents.some(e => (e.phase || '').toLowerCase() === 'running');
+  // G72: signal filter — when ?signal= is set we narrow the table to tests
+  // whose classified failure-bucket matches. The signal is recovered from
+  // the failure's `reason` text (since `test_failures` doesn't carry a
+  // `signal` column directly). `_searchParamsForSignal` is hoisted to the
+  // top of the component to satisfy React's rules-of-hooks.
+  const _activeSignal = _searchParamsForSignal?.get('signal') || null;
+  const _classifiedFailures: ClassifiedFailureLike[] = Array.isArray(testRun.test_failures)
+    ? testRun.test_failures.map((f) => ({
+        testName: f.test_name,
+        file: f.test_file,
+        errorMessage: f.reason,
+        // verdict carries app/test/env split but not the fine-grained signal;
+        // signal-filter.ts will fall back to reason-text regex.
+      }))
+    : [];
+  const _signalMatchSet = _activeSignal
+    ? matchingTestNames(_classifiedFailures, _activeSignal)
+    : null;
+  const _signalFilteredTests = _signalMatchSet
+    ? displayTests.filter(t => _signalMatchSet.has(t.name))
+    : displayTests;
+
   const filteredTests = filterStatus === 'all'
-    ? displayTests
-    : displayTests.filter(t => {
+    ? _signalFilteredTests
+    : _signalFilteredTests.filter(t => {
         const s = t.status.toLowerCase();
         if (filterStatus === 'passed') return s === 'passed' || s === 'pass';
         if (filterStatus === 'failed') return s === 'failed' || s === 'fail';
@@ -4594,8 +4902,16 @@ export default function TestRunDetailPage() {
   const testFailures: TestFailure[] = rawFailures.map((f) => (
     overrides[f.id] ? { ...f, user_override: overrides[f.id] } : f
   ));
+  // G74: verdict filter — drives the chip row + narrows `failuresByName`
+  // so the table only shows tests whose failure verdict matches.
+  const _verdictParam = _searchParamsForSignal?.get('verdict') || null;
+  const _verdictFilter = parseVerdictFilter(_verdictParam);
+  const _filteredFailures = applyVerdictFilter(
+    testFailures.map((f) => ({ ...f, verdict: f.user_override ?? f.verdict })),
+    _verdictFilter,
+  );
   const failuresByName = new Map<string, TestFailure>();
-  for (const f of testFailures) failuresByName.set(f.test_name, f);
+  for (const f of _filteredFailures as TestFailure[]) failuresByName.set(f.test_name, f);
 
   const failureClusters = (() => {
     const byCluster = new Map<string, TestFailure[]>();
@@ -4685,10 +5001,23 @@ export default function TestRunDetailPage() {
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="15 18 9 12 15 6" /></svg>
           Back to All Tests
         </Link>
+        {/* Q1: replace the generic "MCP Run 0_xyz" header with a target-app-
+            centric one. The mcp_ identifier moves to a secondary line. */}
+        <TargetAppHeader
+          projectName={testRun.creation_name || 'Test Run'}
+          mcpRunId={(report?.metadata as { runId?: string })?.runId || testRun.id}
+          gitRemote={(() => {
+            const meta = report?.metadata as { gitRemote?: string; projectPath?: string } | undefined
+            return meta?.gitRemote || null
+          })()}
+          gitBranch={(report as { specQuarantineHistory?: unknown; gitBranch?: string })?.gitBranch || null}
+          gitCommit={(report as { gitCommit?: string })?.gitCommit || null}
+          baseUrl={(report?.metadata as { baseURL?: string })?.baseURL || null}
+          startedAt={testRun.created_at || null}
+        />
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
-            <h1 className="text-[#F0F6FF] font-bold text-2xl">{testRun.creation_name || 'Test Run'}</h1>
-            <p className="text-[#4A6280] text-sm mt-0.5">{formattedDate}</p>
+            <p className="text-[#4A6280] text-sm">{formattedDate}</p>
           </div>
           <div className="flex items-center gap-3 flex-wrap">
             <GenerationJobProgressChip job={generationJob} />
@@ -4822,7 +5151,14 @@ export default function TestRunDetailPage() {
                 )}
               </div>
               <div>
-                <div className="text-[#D8E8FF] font-semibold text-sm">Healix Activity</div>
+                <div className="text-[#D8E8FF] font-semibold text-sm flex items-center gap-2">
+                  Healix Activity
+                  {/* Q1: clearly label this card as Healix-internal so QA
+                      managers know it's pipeline plumbing, not target-app bugs. */}
+                  <span className="px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider font-bold bg-white/8 border border-white/10 text-[#8DA0BC]">
+                    Internal
+                  </span>
+                </div>
                 <div className="text-[#4A6280] text-[11px] font-mono">
                   {effectivePipelineEnded ? 'completed' : (testRun.current_phase || liveMeta?.phase || testRun.status)}
                   {testRun.error_code || liveMeta?.errorCode ? ` · error: ${testRun.error_code || liveMeta?.errorCode}` : ''}
@@ -4935,12 +5271,45 @@ export default function TestRunDetailPage() {
           <span className="text-blue-300/70 text-xs font-medium">Tests executing — results will stream in as they complete</span>
         </motion.div>
       )}
+      {/* Q7: regression diff banner sits ABOVE the hero strip — the
+          highest-priority question a QA manager asks on a new run is
+          "what changed since last time?" */}
+      <DiffBanner testRunId={testRun.id} />
+
       <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
+        {/* G61: when the failure breakdown is available, the FAILED card
+            becomes a REAL BUGS card with the noise+env split moved to a
+            subtitle. Headline now reflects the actual defect count, not the
+            raw failure count which mixes in generator noise. */}
         <KpiCard label="Total Tests" value={totalTests} color="text-[#F0F6FF]" delay={0} />
         <KpiCard label="Passed" value={passedTests} color="text-emerald-400" delay={80} loading={isRunningPhase && !hasLiveStats} />
-        <KpiCard label="Failed" value={failedTests} color="text-red-400" delay={160} loading={isRunningPhase && !hasLiveStats} />
+        {(() => {
+          // F5: mid-run state — Playwright has finished (failedTests > 0)
+          // but triage/classifier hasn't completed. Hero card shows amber
+          // "Classifying…" instead of scary red to communicate provisional.
+          const _midRun = !effectivePipelineEnded && failedTests > 0
+            && (!failureBreakdown || (failureBreakdown.total ?? 0) === 0);
+          const headline = deriveFailureHeadline(failureBreakdown, failedTests, _midRun);
+          return (
+            <KpiCard
+              label={headline.label}
+              value={headline.value}
+              color={headline.color}
+              subtitle={headline.subtitle}
+              delay={160}
+              loading={isRunningPhase && !hasLiveStats}
+            />
+          );
+        })()}
         <KpiCard label="Skipped" value={skippedTests} color="text-amber-400" delay={240} loading={isRunningPhase && !hasLiveStats} />
-        <KpiCard label="Pass Rate" value={passRate} sub="%" color={passRate >= 70 ? 'text-emerald-400' : passRate >= 40 ? 'text-amber-400' : 'text-red-400'} delay={320} loading={isRunningPhase && !hasLiveStats} />
+        <KpiCard
+          label="Pass Rate"
+          value={passRate}
+          sub="%"
+          color={derivePassRateTint(passRate, failureBreakdown)}
+          delay={320}
+          loading={isRunningPhase && !hasLiveStats}
+        />
       </div>
 
       {/* WS-5: AC Coverage card. Renders the ratio of acceptance criteria that
@@ -4957,11 +5326,22 @@ export default function TestRunDetailPage() {
         <BugScorecardCard scorecard={bugScorecard} />
       )}
 
+      {/* G77: per-shard live execution preview. Renders when any
+          live_shard_executed event has been emitted. */}
+      <LiveShardPanel events={liveEvents as unknown as LiveShardEvent[]} />
+
       {/* CL3-A: Failure breakdown card — three pills (Real / Bad tests / Env)
           + an expandable per-signal breakdown. Only renders when the worker
           actually classified at least one failure. */}
       {failureBreakdown && (failureBreakdown.total ?? 0) > 0 && (
         <FailureBreakdownCard breakdown={failureBreakdown} />
+      )}
+
+      {/* G74: verdict-filter chip row. Lets the operator narrow the failures
+          table by classifier verdict. URL-backed via ?verdict= so reloads
+          preserve the choice. */}
+      {testFailures.length > 0 && (
+        <VerdictFilterChips totalFailures={testFailures.length} filteredCount={_filteredFailures.length} />
       )}
 
       {/* Tier pills (Phase D) — Tier A/B/C segmentation from MCP. Only shown
@@ -5134,7 +5514,18 @@ export default function TestRunDetailPage() {
               </svg>
               <div>
                 <h2 className="text-[#F0F6FF] font-semibold text-base">Test Results</h2>
-                <p className="text-[#4A6280] text-xs mt-0.5">{totalTests} individual tests — click a row to expand details</p>
+                <p className="text-[#4A6280] text-xs mt-0.5">
+                  {totalTests} individual tests — click a row to expand details
+                  {/* G19: stats and the test-row data come from different sources
+                      (testRun.total_tests vs report.tests array). Surface the
+                      discrepancy explicitly instead of letting the user assume
+                      the tree has all rows. */}
+                  {totalTests > 0 && displayTests.length > 0 && displayTests.length < totalTests && (
+                    <span className="ml-2 text-amber-400">
+                      ⚠ {displayTests.length} row{displayTests.length === 1 ? '' : 's'} visible · {totalTests - displayTests.length} not in report.tests
+                    </span>
+                  )}
+                </p>
               </div>
             </button>
             {/* Filter + Group buttons */}

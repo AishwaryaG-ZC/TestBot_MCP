@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
+const ModelLadder = require('../src/model-ladder');
 
 const repoRoot = path.join(__dirname, '..', '..');
 
@@ -80,4 +81,27 @@ test('per-agent generation quality uses agent-scoped category expectations', () 
   assert.match(openaiGenerator, /agent === 'smoke'[\s\S]*ui_flow/);
   assert.match(dashboardRunPage, /AGENT_CATEGORY_SCOPE/);
   assert.match(dashboardRunPage, /inferAgentRequiredCategories/);
+});
+
+test('model ladder does not advance on shared parse-prd capacity errors', () => {
+  const concurrencyError = new Error('Healix webapp /api/parse-prd failed (429): CONCURRENT_LIMIT_EXCEEDED');
+  concurrencyError.status = 429;
+
+  assert.equal(ModelLadder.isSharedCapacityError(concurrencyError), true);
+  assert.equal(ModelLadder.isLadderAdvanceableError(concurrencyError), false);
+});
+
+test('model ladder still advances on model compatibility errors', () => {
+  const modelError = new Error('The model gpt-5.5-mini does not exist');
+  modelError.status = 404;
+
+  assert.equal(ModelLadder.isSharedCapacityError(modelError), false);
+  assert.equal(ModelLadder.isLadderAdvanceableError(modelError), true);
+});
+
+test('mcp telemetry ingest preserves warning status instead of normalizing it to success', () => {
+  const ingestRoute = read('webapp/src/app/api/mcp-telemetry/ingest/route.ts');
+
+  assert.match(ingestRoute, /type TelemetryStatus = 'success' \| 'error' \| 'info' \| 'warning'/);
+  assert.match(ingestRoute, /rawStatus === 'warning'/);
 });

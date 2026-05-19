@@ -88,7 +88,7 @@ async function main() {
         return {
           content: [{
             type: 'text',
-            text: `Could not get an answer (${err?.code || 'ERROR'}: ${err?.message || 'unknown'}). Proceeding without one — please use a sensible default.`,
+            text: `Could not get an answer (${err?.code || 'ERROR'}: ${err?.message || 'unknown'}). The Healix run is paused for user input; do not guess or reduce coverage.`,
           }],
           isError: true,
         };

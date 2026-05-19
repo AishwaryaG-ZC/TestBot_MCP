@@ -151,32 +151,55 @@ export async function POST(
     updatedAt: now,
   }
 
-  const [saved] = await db
-    .insert(projectClaudeSessions)
-    .values(row)
-    .onConflictDoUpdate({
-      target: [
-        projectClaudeSessions.workspaceId,
-        projectClaudeSessions.projectKey,
-        projectClaudeSessions.projectPathHash,
-        projectClaudeSessions.surfaceKey,
-      ],
-      set: {
-        claudeSessionId: row.claudeSessionId,
-        model: row.model,
-        effort: row.effort,
-        sourceSignature: row.sourceSignature,
-        prdSignature: row.prdSignature,
-        corpusVersion: row.corpusVersion,
-        lastRunId: row.lastRunId,
-        lastIteration: row.lastIteration,
-        status: row.status,
-        expiresAt: row.expiresAt,
-        invalidationReason: row.invalidationReason,
-        updatedAt: now,
-      },
-    })
-    .returning()
-
-  return NextResponse.json({ success: true, session: rowToApi(saved) })
+  // F3: the insert was previously uncaught; any postgres error (FK, type,
+  // unique-violation) bubbled to Next.js as a bare 500 with no body.
+  // We now log the error AND return a structured error so the caller's
+  // log line carries useful diagnostic context.
+  try {
+    const [saved] = await db
+      .insert(projectClaudeSessions)
+      .values(row)
+      .onConflictDoUpdate({
+        target: [
+          projectClaudeSessions.workspaceId,
+          projectClaudeSessions.projectKey,
+          projectClaudeSessions.projectPathHash,
+          projectClaudeSessions.surfaceKey,
+        ],
+        set: {
+          claudeSessionId: row.claudeSessionId,
+          model: row.model,
+          effort: row.effort,
+          sourceSignature: row.sourceSignature,
+          prdSignature: row.prdSignature,
+          corpusVersion: row.corpusVersion,
+          lastRunId: row.lastRunId,
+          lastIteration: row.lastIteration,
+          status: row.status,
+          expiresAt: row.expiresAt,
+          invalidationReason: row.invalidationReason,
+          updatedAt: now,
+        },
+      })
+      .returning()
+    return NextResponse.json({ success: true, session: rowToApi(saved) })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to upsert claude session'
+    // Common cause #1: workspaceId is a UUID that exists in the row but
+    // doesn't reference a real projectWorkspaces row (FK violation when the
+    // workspace was deleted mid-run). Reject as 404 so the caller can
+    // gracefully skip session-resume tracking.
+    if (/violates foreign key constraint/i.test(message) || /not present in table/i.test(message)) {
+      console.warn('[claude-sessions] FK violation — workspace not found:', { workspaceId, message })
+      return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
+    }
+    // Common cause #2: lastIteration / expiresAt type errors, status enum
+    // values not in {active, invalidated, expired}.
+    if (/invalid input syntax/i.test(message) || /check constraint/i.test(message)) {
+      console.warn('[claude-sessions] Input validation failed:', { workspaceId, surfaceKey, message })
+      return NextResponse.json({ error: `Invalid payload: ${message.slice(0, 200)}` }, { status: 422 })
+    }
+    console.error('[claude-sessions] Unexpected error:', err)
+    return NextResponse.json({ error: 'Internal server error', detail: message.slice(0, 200) }, { status: 500 })
+  }
 }

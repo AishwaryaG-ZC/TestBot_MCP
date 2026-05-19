@@ -71,7 +71,10 @@ const CASES = [
 
 for (const tc of CASES) {
   test(`iteration-controller: ${tc.name}`, () => {
-    const result = IC.decide(tc.input);
+    // Default maxIterations to 10 in tests so cases that exercise iterations 2-5
+    // are not affected by the production default (which is tuned for cost).
+    const input = { maxIterations: 10, ...tc.input };
+    const result = IC.decide(input);
     assert.equal(result.decision, tc.expected, `expected=${tc.expected} actual=${result.decision} reason=${result.reason}`);
   });
 }
@@ -81,6 +84,7 @@ test('progress counter increments on consecutive stalls', () => {
   const stalledInput = {
     passRate: 0.5, previousPassRate: 0.5, iteration: 2,
     totalAcTags: 20, uncoveredAcTagsCount: 10, previousUncoveredCount: 10,
+    maxIterations: 10,
   };
   state = IC.decide({ ...stalledInput, noProgressCounter: state.noProgressCounter });
   assert.equal(state.noProgressCounter, 1);

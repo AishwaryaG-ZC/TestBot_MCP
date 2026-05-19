@@ -66,6 +66,7 @@ test('prompt builder renders all required sections in the load-bearing order', (
     'Roles + auth',
     'Context manifest',
     'Surface focus',
+    'Coverage guard',
     'Acceptance criteria preview',
     'PRD (fallback compact)',
     'Routes + UI (fallback compact)',
@@ -206,4 +207,26 @@ test('prompt builder omits loaded context bodies on resumed iterations 2-3', () 
   assert.ok(md.includes('bulk context were already loaded earlier in the session'));
   assert.ok(md.includes('prd.md'));
   assert.equal(md.includes('This full PRD body should not be repeated on resume.'), false);
+});
+
+test('prompt builder includes validated Claude plan without changing stable prefix expectations', () => {
+  const md = PromptBuilder.buildPrompt(baseArgs({
+    claudePlan: {
+      status: 'ok',
+      planPath: '/tmp/example-app/.healix/claude-plans/run/root/plan.json',
+      parsedPlan: {
+        plannedFiles: ['login-flow.spec.ts'],
+        coveredAcIds: ['F1.S1.AC1'],
+      },
+      validation: { warnings: [], errors: [] },
+    },
+    coverageGuard: {
+      coverageRisk: false,
+      expectedAcIds: ['F1.S1.AC1'],
+      selectedSurfaces: { routes: ['/login'], apiEndpoints: [], forms: [], roles: [] },
+    },
+  }));
+  assert.ok(md.includes('## Claude plan'));
+  assert.ok(md.includes('login-flow.spec.ts'));
+  assert.ok(md.includes('## Coverage guard'));
 });

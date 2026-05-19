@@ -1,10 +1,29 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth/session'
 import { db } from '@/lib/db'
-import { testRuns, testFailures, generationJobs, projectWorkspaces } from '@/lib/db/schema'
+import { testRuns, testFailures, generationJobs, projectWorkspaces, apiKeys } from '@/lib/db/schema'
 import { eq, and, desc, sql } from 'drizzle-orm'
 import { extractRunIdFromReport, getLiveRunsForUser } from '@/lib/mcp-live-runs'
 import { loadQaFindingsForRun } from '@/lib/qa-corpus'
+import { hashApiKey } from '@/lib/utils/api-keys'
+
+// Resolve the caller's userId from either (a) Supabase session cookie or
+// (b) x-api-key header (matches the auth shape used by /api/test-runs/phase).
+// Returns null if neither is valid.
+async function resolveUserId(request: NextRequest): Promise<string | null> {
+  const user = await getCurrentUser()
+  if (user?.id) return user.id
+  const apiKey = request.headers.get('x-api-key')
+  if (!apiKey) return null
+  const keyHash = hashApiKey(apiKey)
+  const [keyRecord] = await db
+    .select({ userId: apiKeys.userId, revoked: apiKeys.revoked })
+    .from(apiKeys)
+    .where(and(eq(apiKeys.keyHash, keyHash), eq(apiKeys.isActive, true)))
+    .limit(1)
+  if (!keyRecord || keyRecord.revoked) return null
+  return keyRecord.userId
+}
 
 // ── Generation-job progress projection (P2-i) ────────────────────────────────
 // Normalizes a linked generation_jobs row into the wire shape consumed by the
@@ -108,11 +127,12 @@ async function loadFailuresForRun(runId: string, userId: string) {
 }
 
 export async function GET(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const user = await getCurrentUser()
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  const userId = await resolveUserId(request)
+  if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  const user = { id: userId }
 
   const { id } = await params
 

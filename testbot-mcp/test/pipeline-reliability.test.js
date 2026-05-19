@@ -145,6 +145,7 @@ test('pipeline decision logger appends sanitized JSONL and emits telemetry', () 
 
     assert.equal(emitted.length, 1);
     assert.equal(emitted[0].eventType, 'pipeline_decision');
+    assert.equal(emitted[0].status, 'warning');
     assert.equal(emitted[0].metadata.password, '[REDACTED]');
   });
 });
@@ -3475,7 +3476,11 @@ test('failure triage reports skipped status without creating AI analysis', async
     runId: 'triage-disabled',
   });
   assert.equal(disabled.analysis, null);
-  assert.equal(disabled.triage.aiTriageStatus, 'skipped_disabled');
+  // G40: status now reflects that only the AI layer is disabled; the
+  // deterministic classifier still runs (returns empty verdicts because
+  // there are no failures to bundle).
+  assert.equal(disabled.triage.aiTriageStatus, 'skipped_disabled_ai_only');
+  assert.equal(disabled.triage.deterministicVerdicts, 0);
 
   const noFailures = await maybeRunFailureTriage({
     config: { aiFailureAnalysis: true },

@@ -367,11 +367,17 @@ test('W5-T4: writeEmergencyStatus writes error_reported when no terminal phase w
   assert.ok(Array.isArray([...require('../src/pipeline-worker').TERMINAL_PHASES]));
 });
 
-test('W5-T4: TERMINAL_PHASES includes tests_complete + error_reported', () => {
+test('W5-T4: TERMINAL_PHASES includes the post-ingest phases (G27)', () => {
+  // G27: `tests_complete` was previously in this set, which let the worker
+  // exit before the final report/ingest. The terminal set now covers only
+  // phases that fire AFTER ingest finishes.
   const { TERMINAL_PHASES } = require('../src/pipeline-worker');
-  assert.ok(TERMINAL_PHASES.has('tests_complete'));
+  assert.equal(TERMINAL_PHASES.has('tests_complete'), false, 'tests_complete must NOT be terminal — ingest still pending');
   assert.ok(TERMINAL_PHASES.has('error_reported'));
   assert.ok(TERMINAL_PHASES.has('completed'));
+  assert.ok(TERMINAL_PHASES.has('completed-partial'));
+  assert.ok(TERMINAL_PHASES.has('pipeline_complete'));
+  assert.ok(TERMINAL_PHASES.has('aborted'));
 });
 
 // ------------------------------------------------------------------

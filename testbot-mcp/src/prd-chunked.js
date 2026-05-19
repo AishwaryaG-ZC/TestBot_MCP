@@ -181,7 +181,14 @@ async function parsePRDChunked(prdText, { parseChunkLLM = null, onChunkParsed = 
   const chunks = splitByFeatureHeadings(prdText);
   const parsedChunks = [];
   const perChunk = [];
-  for (const chunk of chunks) {
+  // G41: pace LLM calls between chunks so the webapp's per-user concurrency
+  // counter has time to release. The webapp counter doesn't decrement until
+  // OpenAI returns; 250ms wasn't enough headroom. Bumped to 1.5s — adds
+  // ~30s for a 22-chunk PRD but eliminates the 429 churn and the noisy
+  // "AI unavailable" warning on the dashboard.
+  const INTER_CHUNK_DELAY_MS = 1500;
+  for (let i = 0; i < chunks.length; i += 1) {
+    const chunk = chunks[i];
     let parsed = null;
     let source = 'regex';
     if (parseChunkLLM) {
@@ -194,6 +201,9 @@ async function parsePRDChunked(prdText, { parseChunkLLM = null, onChunkParsed = 
         }
       } catch {
         parsed = null;
+      }
+      if (i < chunks.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, INTER_CHUNK_DELAY_MS));
       }
     }
     if (!parsed) {

@@ -803,7 +803,12 @@ export const runPendingAnswers = pgTable(
     consumedAt: timestamp('consumed_at', { withTimezone: true }),
   },
   (table) => [
-    index('run_pending_answers_run_question_idx').on(table.runId, table.questionId),
+    // G24: (run_id, question_id) is the logical key — duplicate inserts have
+    // caused duplicate awaiting_user_question rows under concurrent submits.
+    // Uniqueness is now enforced at the DB level so any future answer-route
+    // insert that races can be safely turned into an upsert. Requires a
+    // db:generate + db:migrate to materialise on the DB.
+    uniqueIndex('run_pending_answers_run_question_uniq').on(table.runId, table.questionId),
   ]
 )
 
@@ -1008,5 +1013,35 @@ export const qaGenerationIterations = pgTable(
   (table) => [
     index('qa_generation_iterations_lookup').on(table.workspaceId, table.projectKey, table.surfaceKey),
     index('qa_generation_iterations_run_idx').on(table.workspaceId, table.runId),
+  ]
+)
+
+/**
+ * Q4: known-bugs registry.
+ *
+ * Lets a QA manager mark a bug as "won't fix this sprint" so it stops
+ * cluttering the dashboard's REAL BUGS hero count. Keyed by
+ * `(workspaceId, projectKey, bugSignature)` so the same signature in two
+ * different projects doesn't collide.
+ *
+ * `bugSignature` is the Q2 normalized signature — stable across runs.
+ */
+export const knownBugs = pgTable(
+  'known_bugs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => projectWorkspaces.id, { onDelete: 'cascade' }),
+    projectKey: text('project_key').notNull(),
+    bugSignature: text('bug_signature').notNull(),
+    reason: text('reason'),
+    ticketUrl: text('ticket_url'),
+    markedBy: uuid('marked_by').references(() => profiles.id),
+    markedAt: timestamp('marked_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('known_bugs_unique').on(table.workspaceId, table.projectKey, table.bugSignature),
+    index('known_bugs_lookup').on(table.workspaceId, table.projectKey),
   ]
 )

@@ -88,6 +88,20 @@ function build(input = {}) {
   }
   lines.push('');
 
+  // G67: surface attempted-but-failing ACs. These are ACs the suite already
+  // has tests for, but those tests are failing. Distinct from `uncoveredAcTags`
+  // which lists ACs never tested. Forces Claude to re-examine and either fix
+  // the test or confirm app-is-wrong.
+  const failingAcs = Array.isArray(input.failingAcs) ? input.failingAcs : [];
+  if (failingAcs.length > 0) {
+    lines.push(`### Attempted but FAILING ACs (${failingAcs.length}): ${failingAcs.slice(0, 10).join(', ')}${failingAcs.length > 10 ? ' (+more)' : ''}.`);
+    lines.push("Each of these ACs has a test that ran but did NOT pass. For each: read the test, read the cited source, then either");
+    lines.push("  (a) fix the assertion so the test matches the app's actual contract, OR");
+    lines.push("  (b) leave the test as-is and flag it as a real product bug in your DONE summary.");
+    lines.push("Do NOT delete these tests — that would silently drop coverage.");
+    lines.push('');
+  }
+
   if (hasSplit) {
     // ── CL3-A path: split BAD vs REAL vs ENV ──────────────────────────────────
     lines.push(`### Tests to REWRITE (likely ungrounded — ${badFailures.length} test${badFailures.length === 1 ? '' : 's'})`);

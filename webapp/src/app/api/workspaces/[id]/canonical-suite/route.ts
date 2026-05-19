@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { projectCanonicalSuites, workspaceMembers } from '@/lib/db/schema'
 import { eq, and, desc, sql } from 'drizzle-orm'
 import { requireWorkspaceAuth } from '@/lib/workspace-auth'
+import { resolveTestRunId } from '@/lib/test-run-ids'
 
 export const runtime = 'nodejs'
 
@@ -84,10 +85,14 @@ export async function POST(
     return NextResponse.json({ error: 'projectKey is required' }, { status: 400 })
   }
 
-  const sourceRunId =
+  // G33: caller may pass an MCP runId (mcp_...) here; the projectCanonicalSuites
+  // schema column is uuid FK → testRuns.id, which used to 500 on type mismatch.
+  // Resolve via the shared helper before insert.
+  const rawSourceRunId =
     typeof body.sourceRunId === 'string' && body.sourceRunId.length > 0
       ? body.sourceRunId
       : null
+  const sourceRunId = rawSourceRunId ? (await resolveTestRunId(rawSourceRunId)) : null
 
   const manifest = body.suite_manifest
   if (!Array.isArray(manifest) || !manifest.every(isManifestEntry)) {

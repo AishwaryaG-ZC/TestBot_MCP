@@ -3480,6 +3480,16 @@ function setDurablePhaseReporter(fn) {
   __durablePhaseReporter = typeof fn === 'function' ? fn : null;
 }
 
+// G15: awaitable terminal-phase reporter used by SIGTERM/SIGINT handlers to
+// notify the webapp that the run aborted, so the dashboard's test_runs row
+// flips to a terminal status immediately instead of waiting 30 min for the
+// lazy orphan detector. Must be bounded (≤2s) — the exit signal handler has
+// no guarantee of more time before the process is reaped.
+let __terminalEmergencyReporter = null;
+function setTerminalEmergencyReporter(fn) {
+  __terminalEmergencyReporter = typeof fn === 'function' ? fn : null;
+}
+
 /**
  * Circular-reference-safe JSON serialiser for status payloads.
  * Handles Buffers, Errors, BigInts, and circular refs — all of which can appear
@@ -3506,8 +3516,12 @@ function safeStatusStringify(obj) {
 // process-exit hook below reads these to decide whether the worker died
 // without ever writing a terminal phase — if so, it writes one itself so
 // status.json never freezes at "generating" forever (Run mkgs4f failure).
+// G27: `tests_complete` was previously listed here, which let the worker exit
+// cleanly AFTER Playwright finished but BEFORE the final report/ingest step
+// completed. That meant the dashboard never saw the final test list / stats
+// for some runs. Real terminal phases are the post-ingest ones below; the
+// `tests_complete` event is now treated as a progress marker only.
 const TERMINAL_PHASES = new Set([
-  'tests_complete',
   'error_reported',
   'completed',
   'completed-partial',
@@ -3576,14 +3590,23 @@ function installWorkerExitHooks() {
     // Let Node continue its default behavior (exit non-zero); the `exit`
     // handler above will not double-write because the flag is set.
   });
-  process.on('SIGTERM', () => {
-    writeEmergencyStatus('worker_received_sigterm');
-    process.exit(143);
-  });
-  process.on('SIGINT', () => {
-    writeEmergencyStatus('worker_received_sigint');
-    process.exit(130);
-  });
+  // SIGTERM/SIGINT: best-effort webapp notification before exit so the
+  // dashboard's "running" row flips to "aborted" immediately instead of
+  // dangling for 30 min. Bounded to ~2s — we are inside a signal handler.
+  const gracefulExit = async (signal, code) => {
+    writeEmergencyStatus(`worker_received_${signal.toLowerCase()}`);
+    if (typeof __terminalEmergencyReporter === 'function') {
+      try {
+        await Promise.race([
+          __terminalEmergencyReporter('aborted', `worker_received_${signal.toLowerCase()}`),
+          new Promise((resolve) => setTimeout(resolve, 2000)),
+        ]);
+      } catch { /* swallow — we're exiting anyway */ }
+    }
+    process.exit(code);
+  };
+  process.on('SIGTERM', () => { gracefulExit('SIGTERM', 143); });
+  process.on('SIGINT', () => { gracefulExit('SIGINT', 130); });
 }
 
 function classifyErrorCode(error) {
@@ -4433,6 +4456,13 @@ function removeHealixOwnedSupplementalAuthConfig(projectPath, reason = 'stale') 
 
 function writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles) {
   if (!verifiedRoles || verifiedRoles.length === 0) return null;
+  // G48: same Playwright worker bump as the main runtime config — auth pass
+  // was running with workers: 2 by default, serializing all Tier-B tests to
+  // a multi-minute crawl.
+  const healixWorkersEnv = parseInt(process.env.HEALIX_PLAYWRIGHT_WORKERS || '', 10);
+  const cpuCount = (() => { try { return Math.max(1, require('os').cpus().length); } catch { return 4; } })();
+  const autoWorkers = Math.max(2, Math.min(8, Math.floor(cpuCount / 2)));
+  const targetWorkers = Number.isFinite(healixWorkersEnv) && healixWorkersEnv > 0 ? healixWorkersEnv : autoWorkers;
   const tierBProjects = verifiedRoles.map((r) => `    {
       name: 'tierB-auth-${normalizeRoleLabel(r.role || r.name || 'user')}',
       grep: /@auth|@tierB/,
@@ -4459,7 +4489,7 @@ export default defineConfig({
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
-  workers: process.env.CI ? 1 : 2,
+  workers: process.env.CI ? 1 : ${targetWorkers},
   reporter: [
     ['list'],
     ['json', { outputFile: 'healix-reports/results/auth-results.json' }],
@@ -4840,6 +4870,119 @@ function normalizeValidationTarget(testTarget) {
   }
   const filename = path.basename(raw);
   return GENERATED_SPEC_FILE_PATTERN.test(filename) ? filename : null;
+}
+
+/**
+ * G52: TypeScript compile precheck for generated specs.
+ *
+ * Runs `tsc --noEmit` against `tests/generated/*.spec.ts` with permissive
+ * settings. Specs that fail compilation are quarantined into
+ * `.healix/quarantined/<runId>/typescript/` along with a structured
+ * error record. Skipped entirely when `HEALIX_TS_PRECHECK=off` or when no
+ * tsc binary is found.
+ *
+ * Catches: unawaited Promises (`newPage()` without await), wrong argument
+ * types, missing imports, undefined identifiers — all pre-Playwright.
+ */
+async function precheckTypescriptOnGeneratedSpecs({ projectPath, runId }) {
+  if (String(process.env.HEALIX_TS_PRECHECK || '').toLowerCase() === 'off') {
+    return { ran: false, reason: 'disabled_env', quarantined: [] };
+  }
+  const generatedDir = path.join(projectPath, 'tests', 'generated');
+  if (!fs.existsSync(generatedDir)) return { ran: false, reason: 'no_generated_dir', quarantined: [] };
+
+  const specFiles = fs.readdirSync(generatedDir).filter((n) => /\.spec\.(ts|tsx)$/.test(n));
+  if (specFiles.length === 0) return { ran: false, reason: 'no_specs', quarantined: [] };
+
+  // Write a permissive tsconfig that points only at the generated specs.
+  const healixDir = path.join(projectPath, '.healix');
+  fs.mkdirSync(healixDir, { recursive: true });
+  const tsconfigPath = path.join(healixDir, 'tsconfig.healix-precheck.json');
+  const tsconfig = {
+    compilerOptions: {
+      noEmit: true,
+      target: 'ES2022',
+      module: 'ESNext',
+      moduleResolution: 'node',
+      lib: ['DOM', 'ES2022'],
+      jsx: 'preserve',
+      esModuleInterop: true,
+      allowSyntheticDefaultImports: true,
+      skipLibCheck: true,
+      isolatedModules: false,
+      types: ['node'],
+    },
+    include: ['../tests/generated/**/*'],
+  };
+  fs.writeFileSync(tsconfigPath, JSON.stringify(tsconfig, null, 2));
+
+  // Resolve tsc — first try local node_modules of the target, then global npx.
+  const localTsc = path.join(projectPath, 'node_modules', '.bin', 'tsc');
+  const candidates = [
+    fs.existsSync(localTsc) ? localTsc : null,
+    'npx',
+  ].filter(Boolean);
+
+  let stdout = '';
+  let stderr = '';
+  let lastErr = null;
+  for (const cmd of candidates) {
+    try {
+      const args = cmd === 'npx'
+        ? ['-y', '--package=typescript@5', '--', 'tsc', '-p', tsconfigPath]
+        : ['-p', tsconfigPath];
+      const result = spawnSync(cmd, args, {
+        cwd: projectPath,
+        encoding: 'utf8',
+        timeout: 60_000,
+        env: { ...process.env, NODE_OPTIONS: '' },
+      });
+      stdout = String(result.stdout || '');
+      stderr = String(result.stderr || '');
+      if (result.error) { lastErr = result.error; continue; }
+      break;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  if (lastErr && !stdout && !stderr) {
+    Logger.warn('PipelineWorker', '[G52] could not run tsc — skipping precheck', { reason: lastErr?.message });
+    return { ran: false, reason: 'tsc_unavailable', quarantined: [] };
+  }
+
+  // tsc emits errors as `path/file.ts(LINE,COL): error TSXXXX: msg`. Group by file.
+  const errorRe = /^(.*?\.tsx?)\((\d+),(\d+)\):\s+(error\s+TS\d+):\s+(.*)$/gmi;
+  const errorsByFile = new Map();
+  const combined = `${stdout}\n${stderr}`;
+  for (const m of combined.matchAll(errorRe)) {
+    const filePath = m[1].trim();
+    if (!errorsByFile.has(filePath)) errorsByFile.set(filePath, []);
+    errorsByFile.get(filePath).push({ line: Number(m[2]), col: Number(m[3]), code: m[4], message: m[5] });
+  }
+
+  // Move failed specs into the quarantine bucket. Reuse the existing dir layout.
+  const quarantineDir = path.join(projectPath, '.healix', 'quarantined', String(runId || 'unknown'), 'typescript');
+  const quarantined = [];
+  for (const [absOrRel, errs] of errorsByFile.entries()) {
+    // Resolve to absolute. tsc paths may be project-relative.
+    const abs = path.isAbsolute(absOrRel) ? absOrRel : path.resolve(projectPath, absOrRel);
+    // Only quarantine generated specs — never touch user-authored files.
+    if (!abs.startsWith(generatedDir)) continue;
+    try {
+      fs.mkdirSync(quarantineDir, { recursive: true });
+      const dest = path.join(quarantineDir, path.basename(abs));
+      fs.renameSync(abs, dest);
+      const reasonFile = dest + '.tsc-errors.json';
+      fs.writeFileSync(reasonFile, JSON.stringify({ file: abs, errors: errs.slice(0, 20) }, null, 2));
+      quarantined.push({ file: abs, errors: errs.length });
+    } catch (err) {
+      Logger.warn('PipelineWorker', '[G52] quarantine move failed', { file: abs, reason: err?.message });
+    }
+  }
+  if (quarantined.length > 0) {
+    Logger.info('PipelineWorker', '[G52] tsc precheck quarantined specs', { quarantined });
+  }
+  return { ran: true, quarantined, totalErrors: combined.match(errorRe)?.length || 0 };
 }
 
 async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTests = true, timeoutMs = 90000, testTarget = 'tests/generated' }) {
@@ -7921,6 +8064,193 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         : [salvage];
     };
     const validateSuiteOrSalvage = async ({ stage = 'validation', qualityAudit = null, qualityRecovery = null } = {}) => {
+      // G66 ORDER (post-fix):
+      //   1. G51 workflow synth     — write new specs first so subsequent gates evaluate them too
+      //   2. G55 negative-path gen  — augment state-changing specs BEFORE quarantine
+      //   3. G52 TS precheck        — quarantine type-broken specs
+      //   4. G53 DOM-locator probe  — quarantine dead-selector specs
+      //   5. G54 self-review        — quarantine AI-drift specs
+      //   6. validateGeneratedTestsWithList
+      //
+      // Pre-G66 the order was 1→3→2→5→4 which meant happy-paths quarantined by
+      // G52 (TS errors) were never augmented with negative variants. The new
+      // order lets G55 see the full happy-path set first.
+      //
+      // Each stage records its file-touches into stageOrder[] so the
+      // pipeline-stage-order test can assert the sequence remains correct
+      // (and so G75's quarantine-history can attribute touches to gates).
+      const stageOrder = [];
+
+      // G75: accumulate per-file gate events for the dashboard's "Gates
+      // touched" column. Each gate records into this array via recordEvent.
+      // `generationMeta` here is the `const` declared at the top of
+      // generateWithFallbackChain — we mutate its fields, never reassign.
+      const { recordEvent: _g75RecordEvent } = require('./quarantine-history');
+      if (!Array.isArray(generationMeta.specQuarantineHistory)) {
+        generationMeta.specQuarantineHistory = [];
+      }
+      const _g75History = generationMeta.specQuarantineHistory;
+      const _g75CurrentIter = (Array.isArray(generationMeta.iterations) && generationMeta.iterations.length) || 1;
+
+      // 1. G51 workflow synthesizer
+      try {
+        const { synthesizeWorkflows } = require('./workflow-synthesizer');
+        const adminAuth = path.join(config.projectPath, '.healix', 'auth-state-admin.json');
+        const wf = synthesizeWorkflows({
+          projectPath: config.projectPath,
+          runId,
+          authStatePath: fs.existsSync(adminAuth) ? adminAuth : null,
+        });
+        stageOrder.push({ stage: 'G51', ran: !!wf.ran, files: wf.synthesized?.length || 0 });
+        for (const s of (wf.synthesized || [])) {
+          _g75RecordEvent(_g75History, { file: s.file, gate: 'G51', action: 'augment', reason: `Workflow spec synthesized (${s.steps || 0} steps)`, iter: _g75CurrentIter });
+        }
+        if (wf.ran && Array.isArray(wf.synthesized) && wf.synthesized.length > 0) {
+          updateStatus(statusDir, 'workflows_synthesized', {
+            runId,
+            message: `Synthesized ${wf.synthesized.length} workflow spec(s) from exploration keyFlows.`,
+            metadata: { synthesized: wf.synthesized },
+          }, telemetryReporter);
+        }
+      } catch (err) {
+        Logger.warn('PipelineWorker', '[G51] workflow synthesis failed (non-blocking)', { reason: err?.message });
+      }
+
+      // 1b. G65 API-surface synthesizer (Tier-C contracts + negative)
+      try {
+        const { synthesizeApiSurfaceSpecs } = require('./api-surface-synthesizer');
+        // F4-H1: pass an admin storageState so contract tests authenticate.
+        const _g65AdminAuth = path.join(config.projectPath, '.healix', 'auth-state-admin.json');
+        const apiRes = synthesizeApiSurfaceSpecs({
+          projectPath: config.projectPath,
+          runId,
+          authStatePath: fs.existsSync(_g65AdminAuth) ? _g65AdminAuth : null,
+        });
+        stageOrder.push({ stage: 'G65', ran: !!apiRes.ran, files: apiRes.synthesized?.length || 0 });
+        if (apiRes.ran && Array.isArray(apiRes.synthesized) && apiRes.synthesized.length > 0) {
+          updateStatus(statusDir, 'api_surface_synthesized', {
+            runId,
+            message: `Synthesized ${apiRes.synthesized.length} API spec(s) from G50 endpoints.`,
+            metadata: { synthesized: apiRes.synthesized },
+          }, telemetryReporter);
+        }
+      } catch (err) {
+        Logger.warn('PipelineWorker', '[G65] API surface synthesis failed (non-blocking)', { reason: err?.message });
+      }
+
+      // 2. G55 negative-path generator
+      try {
+        const { generateNegativePaths } = require('./negative-path-generator');
+        const ng = generateNegativePaths({ projectPath: config.projectPath });
+        stageOrder.push({ stage: 'G55', ran: !!ng.ran, files: ng.augmented?.length || 0 });
+        for (const a of (ng.augmented || [])) {
+          const fileBase = require('node:path').basename(a.file || '');
+          _g75RecordEvent(_g75History, { file: fileBase, gate: 'G55', action: 'augment', reason: `Added ${a.addedVariants || 0} negative variants`, iter: _g75CurrentIter });
+        }
+        if (ng.ran && Array.isArray(ng.augmented) && ng.augmented.length > 0) {
+          updateStatus(statusDir, 'negative_paths_generated', {
+            runId,
+            message: `Added negative-path variants to ${ng.augmented.length} spec(s).`,
+            metadata: { augmented: ng.augmented.slice(0, 20) },
+          }, telemetryReporter);
+        }
+      } catch (err) {
+        Logger.warn('PipelineWorker', '[G55] negative-path generation failed (non-blocking)', { reason: err?.message });
+      }
+
+      // 3. G52 TS precheck
+      try {
+        const tscResult = await precheckTypescriptOnGeneratedSpecs({ projectPath: config.projectPath, runId });
+        stageOrder.push({ stage: 'G52', ran: !!tscResult.ran, files: tscResult.quarantined?.length || 0 });
+        for (const q of (tscResult.quarantined || [])) {
+          _g75RecordEvent(_g75History, { file: typeof q === 'string' ? q : (q.file || q.fileName || 'unknown'), gate: 'G52', action: 'quarantine', reason: 'TypeScript precheck failed', iter: _g75CurrentIter });
+        }
+        if (tscResult.ran && Array.isArray(tscResult.quarantined) && tscResult.quarantined.length > 0) {
+          updateStatus(statusDir, 'typescript_precheck_quarantine', {
+            runId,
+            message: `Quarantined ${tscResult.quarantined.length} spec(s) failing tsc --noEmit.`,
+            metadata: { quarantined: tscResult.quarantined, totalErrors: tscResult.totalErrors },
+          }, telemetryReporter);
+        }
+      } catch (err) {
+        Logger.warn('PipelineWorker', '[G52] tsc precheck threw (non-blocking)', { reason: err?.message });
+      }
+
+      // 4. G53 DOM-locator probe
+      try {
+        const { probeGeneratedSpecLocators } = require('./dom-locator-probe');
+        const adminAuthState = path.join(config.projectPath, '.healix', 'auth-state-admin.json');
+        const probeBaseURL = config.baseURL || projectInfo?.baseURL || `http://localhost:${configuredPort || 3000}`;
+        const probeRes = await probeGeneratedSpecLocators({
+          projectPath: config.projectPath,
+          baseURL: probeBaseURL,
+          authStatePath: fs.existsSync(adminAuthState) ? adminAuthState : null,
+          runId,
+        });
+        stageOrder.push({ stage: 'G53', ran: !!probeRes.ran, files: probeRes.quarantined?.length || 0 });
+        for (const q of (probeRes.quarantined || [])) {
+          _g75RecordEvent(_g75History, { file: q.file || 'unknown', gate: 'G53', action: 'quarantine', reason: `Dead locators (${q.deadCount || 0})`, iter: _g75CurrentIter });
+        }
+        if (probeRes.ran) {
+          const deadCount = probeRes.probed.reduce((acc, p) => acc + p.deadLocators.length, 0);
+          const strictCount = probeRes.probed.reduce((acc, p) => acc + p.strictRiskLocators.length, 0);
+          if (probeRes.quarantined.length > 0 || deadCount > 0 || strictCount > 0) {
+            updateStatus(statusDir, 'dom_locator_probe', {
+              runId,
+              message: `Probed ${probeRes.probed.length} spec(s) — quarantined=${probeRes.quarantined.length} deadLocators=${deadCount} strictRisks=${strictCount}`,
+              metadata: {
+                quarantined: probeRes.quarantined,
+                probedSummary: probeRes.probed.slice(0, 30).map((p) => ({
+                  file: p.file,
+                  routes: p.routes.length,
+                  locators: p.locators,
+                  dead: p.deadLocators.length,
+                  strictRisk: p.strictRiskLocators.length,
+                })),
+              },
+            }, telemetryReporter);
+          }
+        }
+      } catch (err) {
+        Logger.warn('PipelineWorker', '[G53] DOM-locator probe failed (non-blocking)', { reason: err?.message });
+      }
+
+      // 5. G54 self-review (G60 default-on; opt-out via HEALIX_CLAUDE_SELF_REVIEW=off)
+      try {
+        const { runSelfReviewPass } = require('./adapters/claude-local/review-pass');
+        const reviewRes = await runSelfReviewPass({
+          projectPath: config.projectPath,
+          runId,
+          // F1: read fallback state from generationMeta (which IS in this
+          // closure scope as a const). The pre-F1 code referenced a bare
+          // `fallbackUsed` symbol that doesn't exist here, throwing a
+          // ReferenceError that the outer catch silently swallowed — G54
+          // never ran, so the dominant `ungrounded_text` noise stayed
+          // unchecked.
+          fallbackUsed: Boolean(generationMeta?.fallbackUsed),
+        });
+        stageOrder.push({ stage: 'G54', ran: !!reviewRes.ran, files: reviewRes.quarantined?.length || 0 });
+        for (const q of (reviewRes.quarantined || [])) {
+          _g75RecordEvent(_g75History, { file: q.file || 'unknown', gate: 'G54', action: 'quarantine', reason: q.issue || 'self-review high severity', iter: _g75CurrentIter });
+        }
+        if (reviewRes.ran && (reviewRes.flagged.length > 0 || reviewRes.quarantined.length > 0)) {
+          updateStatus(statusDir, 'claude_self_review_complete', {
+            runId,
+            message: `Self-review flagged ${reviewRes.flagged.length} spec(s); quarantined ${reviewRes.quarantined.length} high-severity.`,
+            metadata: {
+              flagged: reviewRes.flagged.slice(0, 20),
+              quarantined: reviewRes.quarantined,
+            },
+          }, telemetryReporter);
+        }
+      } catch (err) {
+        Logger.warn('PipelineWorker', '[G54] self-review pass failed (non-blocking)', { reason: err?.message });
+      }
+
+      // Expose stage order for downstream observability (G75 quarantine
+      // history). `generationMeta` is const at this scope — mutate fields.
+      generationMeta.gateStageOrder = stageOrder;
+
       let validation = await validateGeneratedTestsWithList({
         projectPath: config.projectPath,
         validateGeneratedTests,
@@ -8214,28 +8544,95 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       const isClaudeLocalGen = String(generator || '').startsWith('claude-local')
         || String(generator || '').includes('claude-local');
       if (isClaudeLocalGen) {
-        Logger.info('PipelineWorker', '[CL2-A] Quality audit advisory for claude-local — no quarantine', {
+        // G37: targeted quarantine for the clearest failure mode — files with
+        // NO [SRC:*] provenance markers (added per G30 grounding rule). Other
+        // audit categories (riskyFiles, ungroundedUiFiles) stay advisory to
+        // avoid regressing the V1 #2 over-quarantine collapse, but a spec with
+        // zero source citations is by definition ungrounded and not worth
+        // running — it will only produce noisy failures.
+        const filesToQuarantine = Array.isArray(qualityAudit.missingSourceReferenceFiles)
+          ? qualityAudit.missingSourceReferenceFiles.slice()
+          : [];
+        // G47: code-level enforcement of the prompt-side anti-patterns. Scans
+        // every generated spec for known-bad patterns (logo-vs-product first(),
+        // inverted toContain shape, waitForTimeout, absolute auth-state paths,
+        // etc.) and adds them to the quarantine list. Pure regex; works the
+        // same on any target app. Mirrors the same `path.basename` quarantine
+        // dance below so the merged list is processed in one pass.
+        try {
+          const { detectBlockingAntiPatterns } = require('./static-anti-patterns');
+          const antiPatternHits = [];
+          const candidateRoots = [
+            path.join(config.projectPath, 'tests', 'generated'),
+            path.join(config.projectPath, 'tests', 'healix-ephemeral', 'tier-1'),
+          ];
+          for (const root of candidateRoots) {
+            if (!fs.existsSync(root)) continue;
+            for (const name of fs.readdirSync(root)) {
+              if (!/\.spec\.(ts|tsx|js|jsx|mjs|cjs)$/i.test(name)) continue;
+              const abs = path.join(root, name);
+              let content;
+              try { content = fs.readFileSync(abs, 'utf8'); } catch { continue; }
+              const hits = detectBlockingAntiPatterns(content);
+              if (hits.length > 0) {
+                antiPatternHits.push({ file: abs, rel: path.relative(config.projectPath, abs), hits });
+                if (!filesToQuarantine.includes(abs) && !filesToQuarantine.includes(path.relative(config.projectPath, abs))) {
+                  filesToQuarantine.push(abs);
+                }
+              }
+            }
+          }
+          if (antiPatternHits.length > 0) {
+            Logger.info('PipelineWorker', '[G47] static anti-pattern hits — quarantining', {
+              fileCount: antiPatternHits.length,
+              sample: antiPatternHits.slice(0, 3).map((h) => ({ file: h.rel, rules: h.hits.map((x) => x.id) })),
+            });
+            qualityAudit.staticAntiPatternHits = antiPatternHits;
+          }
+        } catch (err) {
+          Logger.warn('PipelineWorker', '[G47] static anti-pattern scan failed (non-blocking)', { reason: err?.message });
+        }
+        const quarantinedFiles = [];
+        if (filesToQuarantine.length > 0) {
+          const quarantineDir = path.join(config.projectPath, '.healix', 'quarantined', String(runId || 'unknown'));
+          try { fs.mkdirSync(quarantineDir, { recursive: true }); } catch { /* ignore */ }
+          for (const relOrAbs of filesToQuarantine) {
+            const abs = path.isAbsolute(relOrAbs) ? relOrAbs : path.join(config.projectPath, relOrAbs);
+            try {
+              if (!fs.existsSync(abs)) continue;
+              const dest = path.join(quarantineDir, path.basename(abs));
+              fs.renameSync(abs, dest);
+              quarantinedFiles.push({ from: relOrAbs, to: dest });
+            } catch (err) {
+              Logger.warn('PipelineWorker', '[G37] quarantine move failed', { file: relOrAbs, reason: err?.message });
+            }
+          }
+        }
+        Logger.info('PipelineWorker', '[CL2-A/G37] Quality audit for claude-local', {
           generator,
           totalFiles: qualityAudit.totalFiles,
-          riskyFiles: qualityAudit.riskyFiles?.length || 0,
-          ungroundedUiFiles: qualityAudit.ungroundedUiFiles?.length || 0,
-          missingSourceReferenceFiles: qualityAudit.missingSourceReferenceFiles?.length || 0,
+          riskyFilesAdvisory: qualityAudit.riskyFiles?.length || 0,
+          ungroundedUiAdvisory: qualityAudit.ungroundedUiFiles?.length || 0,
+          quarantinedMissingSrc: quarantinedFiles.length,
         });
-        if (statusDir && (qualityAudit.riskyFiles?.length || qualityAudit.ungroundedUiFiles?.length)) {
+        if (statusDir) {
           recordRunDecision(statusDir, telemetryReporter, {
             runId,
-            decisionType: 'quality_audit_advisory',
-            phase: 'generation_quality_advisory',
-            status: 'info',
-            message: 'Quality audit found issues — advisory only for claude-local (no quarantine).',
+            decisionType: quarantinedFiles.length > 0 ? 'quality_audit_quarantine' : 'quality_audit_advisory',
+            phase: quarantinedFiles.length > 0 ? 'quality_audit_quarantine' : 'generation_quality_advisory',
+            status: quarantinedFiles.length > 0 ? 'warn' : 'info',
+            message: quarantinedFiles.length > 0
+              ? `Quality audit quarantined ${quarantinedFiles.length} file(s) missing [SRC:*] provenance.`
+              : 'Quality audit found issues — advisory only for claude-local (no quarantine).',
             metadata: {
-              riskyFiles: qualityAudit.riskyFiles,
-              ungroundedUiFiles: qualityAudit.ungroundedUiFiles,
+              quarantinedFiles,
+              riskyFilesAdvisory: qualityAudit.riskyFiles,
+              ungroundedUiAdvisory: qualityAudit.ungroundedUiFiles,
               missingSourceReferenceFiles: qualityAudit.missingSourceReferenceFiles,
             },
           });
         }
-        return { ...validation, qualityAudit };
+        return { ...validation, qualityAudit, quarantinedFiles };
       }
       const pruning = pruneGeneratedTestsByQuality({
         projectPath: config.projectPath,
@@ -9056,6 +9453,17 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
   const requestedGenerator = (config.generationMode === 'saas' || process.env.HEALIX_GENERATOR === 'saas')
     ? 'saas'
     : 'claude-local';
+  // Surface a warning when the caller passes a generationMode the pipeline
+  // doesn't recognize — silent fallthrough to claude-local has bitten users
+  // who set legacy values like 'openai-first' expecting OpenAI fan-out.
+  const recognizedModes = new Set(['saas', 'claude-local', undefined, null, '']);
+  if (config.generationMode != null && !recognizedModes.has(config.generationMode)) {
+    Logger.warn('PipelineWorker', 'Unrecognized generationMode — falling back to claude-local', {
+      requested: config.generationMode,
+      hint: "Set generationMode: 'saas' (webapp OpenAI fan-out) or omit to use claude-local. Legacy values like 'openai-first' are ignored.",
+      actualGenerator: requestedGenerator,
+    });
+  }
 
   const claudeLocalGenerator = async () => {
     const testsDir = resetGeneratedTestsDir(config.projectPath);
@@ -9167,41 +9575,42 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     for (let shardIndex = 0; shardIndex < fanoutPlan.surfaces.length; shardIndex += 1) {
       const shardSurface = fanoutPlan.surfaces[shardIndex];
       const shardPacked = shardSurface.surfaceKey === primarySurface.surfaceKey ? packed : packSurface(shardSurface);
+      const shardGenerationArgs = {
+        context: shardPacked.context,
+        projectPath: config.projectPath,
+        testsDir: tier1Dir,
+        prdContent: prdContent || '',
+        parsedPRD: shardPacked.parsedPRD || parsedPRD || null,
+        explorationArtifact: shardPacked.explorationArtifact || explorationArtifact || null,
+        roles: roles || [],
+        projectInfo,
+        runId,
+        statusDir,
+        client: adapterClient,
+        workspaceContext: corpusBootstrap?.workspaceContext || null,
+        corpusSeed: shardPacked.corpusSeed || corpusBootstrap?.corpusSeed || null,
+        corpusGuidance: shardPacked.corpusGuidance || corpusGuidance || null,
+        iterationNumber: 1,
+        feedback: null,
+        sessionId: null,
+        surfaceKey: shardSurface.surfaceKey,
+        contextArtifacts: shardPacked.contextArtifacts || null,
+        compactSummary: shardPacked.compactSummary || null,
+        promptBudget: shardPacked.promptBudget || null,
+        sessionMetadata: {
+          surface: shardSurface,
+          specialistRole: shardSurface.specialistRole || null,
+          shardIndex,
+          shardCount: fanoutPlan.surfaces.length,
+          sourceSignature: shardSurface.fingerprintHash || null,
+          prdSignature: null,
+          corpusVersion: corpusBootstrap?.corpusSeed?.version || corpusBootstrap?.corpusSeed?.canonicalVersion || null,
+        },
+        telemetryReporter,
+      };
       let shardResult;
       try {
-        shardResult = await ClaudeLocal.runClaudeGeneration({
-          context: shardPacked.context,
-          projectPath: config.projectPath,
-          testsDir: tier1Dir,
-          prdContent: prdContent || '',
-          parsedPRD: shardPacked.parsedPRD || parsedPRD || null,
-          explorationArtifact: shardPacked.explorationArtifact || explorationArtifact || null,
-          roles: roles || [],
-          projectInfo,
-          runId,
-          statusDir,
-          client: adapterClient,
-          workspaceContext: corpusBootstrap?.workspaceContext || null,
-          corpusSeed: shardPacked.corpusSeed || corpusBootstrap?.corpusSeed || null,
-          corpusGuidance: shardPacked.corpusGuidance || corpusGuidance || null,
-          iterationNumber: 1,
-          feedback: null,
-          sessionId: null,
-          surfaceKey: shardSurface.surfaceKey,
-          contextArtifacts: shardPacked.contextArtifacts || null,
-          compactSummary: shardPacked.compactSummary || null,
-          promptBudget: shardPacked.promptBudget || null,
-          sessionMetadata: {
-            surface: shardSurface,
-            specialistRole: shardSurface.specialistRole || null,
-            shardIndex,
-            shardCount: fanoutPlan.surfaces.length,
-            sourceSignature: shardSurface.fingerprintHash || null,
-            prdSignature: null,
-            corpusVersion: corpusBootstrap?.corpusSeed?.version || corpusBootstrap?.corpusSeed?.canonicalVersion || null,
-          },
-          telemetryReporter,
-        });
+        shardResult = await ClaudeLocal.runClaudeGeneration(shardGenerationArgs);
       } catch (err) {
         if (err?.code === 'CLAUDE_LOGIN_REQUIRED' || err?.code === 'CLAUDE_AWAITING_USER_QUESTION') throw err;
         const failure = {
@@ -9232,14 +9641,36 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         throw err;
       }
       if (shardResult.status === 'awaiting_user_question') {
-        // Surface upward — the worker's post-execute iteration loop will block
-        // on the answer poll, NOT generateWithFallbackChain. For now we treat
-        // it as a soft pause that produced zero files; the outer iteration
-        // loop reinvokes once the answer comes in.
-        const err = new Error('Claude pipeline paused on awaiting_user_question');
-        err.code = 'CLAUDE_AWAITING_USER_QUESTION';
-        err.adapterResult = shardResult;
-        throw err;
+        updateStatus(statusDir, 'awaiting_user_question', {
+          runId,
+          message: shardResult.question || 'Claude needs your input before continuing.',
+          questionId: shardResult.questionId,
+          question: shardResult.question,
+          options: shardResult.options || [],
+          surfaceKey: shardSurface.surfaceKey,
+          sessionId: shardResult.sessionId || null,
+        }, telemetryReporter);
+        const answer = await adapterClient.pollPendingAnswer({
+          runId,
+          questionId: shardResult.questionId,
+        });
+        shardResult = await ClaudeLocal.runClaudeGeneration({
+          ...shardGenerationArgs,
+          feedback: [
+            'Human answer to prior blocking question:',
+            `Question: ${shardResult.question || ''}`,
+            `Answer: ${answer || ''}`,
+          ].join('\n'),
+          sessionId: shardResult.sessionId || null,
+          iterationNumber: 1,
+          _skipPreflight: true,
+        });
+        if (shardResult.status !== 'ok') {
+          const err = new Error(`Claude did not resume after user answer (${shardResult.status || 'unknown'})`);
+          err.code = 'CLAUDE_AWAITING_USER_QUESTION';
+          err.adapterResult = shardResult;
+          throw err;
+        }
       }
       shardResults.push(shardResult);
     }
@@ -9477,24 +9908,52 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     throw error;
   }
 
-  return {
+  const mergedResult = {
     ...result,
     generationMeta: { ...(result?.generationMeta || {}), ...generationMeta },
   };
+  Object.defineProperty(mergedResult, 'corpusBootstrap', {
+    value: corpusBootstrap,
+    enumerable: false,
+    configurable: false,
+  });
+  return mergedResult;
 }
 
 async function maybeRunFailureTriage({ config, testResults, runBudget, runId }) {
+  // G40: deterministic classifier always runs (cheap, no model calls). Only
+  // the AI agent layer is gated by `aiFailureAnalysis`. Even when AI is off,
+  // we still produce classifier verdicts so the dashboard has SOMETHING to
+  // show per failure instead of a blank explanation column.
   if (config.aiFailureAnalysis === false) {
+    let detVerdicts = [];
+    let detBundles = [];
+    try {
+      const { bundleFailures } = require('./failure-triage/evidence-bundler');
+      const { classifyFailures } = require('./failure-triage/classifier');
+      const bundled = await bundleFailures({
+        failures: testResults?.failures || [],
+        tests: testResults?.tests || [],
+        projectPath: config.projectPath,
+        runId,
+      });
+      detBundles = bundled?.bundles || [];
+      detVerdicts = detBundles.length
+        ? (classifyFailures(detBundles) || []).map((v) => ({ ...v, source: 'deterministic' }))
+        : [];
+    } catch (err) {
+      Logger.warn('PipelineWorker', '[G40] deterministic classifier failed (non-blocking)', { reason: err?.message });
+    }
     return {
       analysis: null,
-      evidenceBundles: [],
-      verdicts: [],
+      evidenceBundles: detBundles,
+      verdicts: detVerdicts,
       clusters: [],
       triage: {
-        aiTriageStatus: 'skipped_disabled',
-        aiTriageReason: 'AI failure analysis disabled by run config',
+        aiTriageStatus: 'skipped_disabled_ai_only',
+        aiTriageReason: 'AI agent disabled by run config; deterministic classifier still ran',
         aiEligibleFailures: 0,
-        deterministicVerdicts: 0,
+        deterministicVerdicts: detVerdicts.length,
       },
     };
   }
@@ -9537,6 +9996,33 @@ async function maybeRunFailureTriage({ config, testResults, runBudget, runId }) 
   try {
     const { classifyFailures } = require('./failure-triage/classifier');
     classifierResult = classifyFailures(bundleResult.bundles);
+    // G56: source-grounded calibration of ambiguous / low-confidence verdicts.
+    // Reads the [SRC:*] citations from the failing spec, greps for tokens
+    // from the error message, and either bumps confidence on app_is_wrong
+    // (source confirms the asserted contract holds) or flips to test_is_wrong
+    // (source refutes the assertion). Pure deterministic — no LLM cost.
+    try {
+      const { calibrateVerdictsWithSourceProbing } = require('./failure-triage/source-probe');
+      const cal = calibrateVerdictsWithSourceProbing(
+        classifierResult.verdicts || [],
+        bundleResult.bundles,
+        { projectPath: config.projectPath }
+      );
+      classifierResult.verdicts = cal.verdicts;
+      if (cal.calibrated > 0) {
+        Logger.info('PipelineWorker', '[G56] verdict calibration applied', {
+          calibrated: cal.calibrated, total: classifierResult.verdicts.length,
+        });
+      }
+      // Recompute aiEligibleIndexes after calibration — verdicts that just
+      // crossed the 0.8 confidence threshold no longer need AI triage.
+      const AI_SKIP_THRESHOLD = 0.80;
+      classifierResult.aiEligibleIndexes = (classifierResult.verdicts || [])
+        .map((v, i) => ((Number(v?.confidence || 0) >= AI_SKIP_THRESHOLD) ? -1 : i))
+        .filter((i) => i >= 0);
+    } catch (err) {
+      Logger.warn('PipelineWorker', '[G56] source-probe calibration failed (non-blocking)', { reason: err?.message });
+    }
     Logger.info('PipelineWorker', 'Classifier completed', {
       totalFailures: bundleResult.bundles.length,
       aiEligible: classifierResult.aiEligibleIndexes.length,
@@ -10648,11 +11134,16 @@ async function runPipeline(config, runId) {
       Logger.warn('PipelineWorker', 'WS-LIVE start failed (non-blocking)', { reason: err?.message });
     }
     setDurablePhaseReporter((payload) => {
+      // G7: forward the FULL payload as metadata so the dashboard can render
+      // surface/iteration progress AND the awaiting_user_question modal
+      // (which needs questionId/question/options/confidence). Previously only
+      // message+errorCode were forwarded, which silently broke the question UI.
+      const { phase, ...metadata } = payload || {};
       durableClient.reportPhase({
         runId,
         testRunId: liveTestRunId,
-        phase: payload.phase,
-        metadata: { message: payload.message, errorCode: payload.errorCode || null },
+        phase,
+        metadata: { ...metadata, errorCode: payload?.errorCode || null },
       }).catch(() => undefined);
     });
     setStageBudgetReporter(({ stage, consumedMs, capMs, success }) => {
@@ -10664,9 +11155,19 @@ async function runPipeline(config, runId) {
         metadata: { success },
       }).catch(() => undefined);
     });
+    // G15: register a bounded emergency reporter for SIGTERM/SIGINT paths so
+    // the dashboard learns about the abort immediately. Returns the awaitable
+    // promise so the signal handler can race it against a 2s timeout.
+    setTerminalEmergencyReporter((phase, reason) => durableClient.reportPhase({
+      runId,
+      testRunId: liveTestRunId,
+      phase,
+      metadata: { reason, source: 'sigterm_or_sigint' },
+    }));
   } else {
     setDurablePhaseReporter(null);
     setStageBudgetReporter(null);
+    setTerminalEmergencyReporter(null);
   }
 
   // Kill any leftover Healix-started dev server from a previous run.
@@ -10686,6 +11187,7 @@ async function runPipeline(config, runId) {
   let routeAccessSummary = null;
   const aiOnlyEnforced = strictAIEnabled(config);
   let workspaceState = null; // populated by pre-flight if shared workspace found
+  let corpusBootstrap = null; // internal W2 state returned by generation helper
   // CL-C — hoisted bridge between the `if (config.generateTests) { ... }`
   // block (where generationResult and its context vars live) and the
   // iteration loop further down. Captured at the end of the generation
@@ -11048,16 +11550,43 @@ async function runPipeline(config, runId) {
         // deterministic regex per chunk so AC traceability is preserved
         // even if every LLM call fails (run vz2nys repro).
         const chunks = PrdChunked.splitByFeatureHeadings(combinedPrdContent);
+        const parsePrdFallbackKeys = new Set();
+        let parsePrdAiDisabledReason = null;
+        let parsePrdAiDisabledLogged = false;
+        const disableParsePrdAiForRun = (reason, heading, errorCode = null) => {
+          parsePrdAiDisabledReason = parsePrdAiDisabledReason || String(reason || 'PRD AI parse unavailable').slice(0, 240);
+          if (parsePrdAiDisabledLogged || !statusDir) return;
+          parsePrdAiDisabledLogged = true;
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'parse_prd_ai_unavailable',
+            phase: 'parsing_prd',
+            status: 'warning',
+            message: 'PRD AI parse unavailable; using deterministic regex fallback for remaining chunks.',
+            metadata: {
+              heading,
+              reason: parsePrdAiDisabledReason,
+              errorCode,
+              chunkCount: chunks.length,
+              remainingChunksUseRegex: true,
+            },
+          });
+        };
         const chunkResult = await withStageBudget(runBudget, 'prdParse', () =>
           PrdChunked.parsePRDChunked(combinedPrdContent, {
             parseChunkLLM: async (chunkBody, { heading }) => {
+              if (parsePrdAiDisabledReason) {
+                return null;
+              }
               try {
                 const sub = await ModelLadder.runWithLadder('parse_prd', async (model) => {
                   return await client.parsePRD({ prdContent: chunkBody, model });
                 }, {
                   onFallback: (decision) => {
                     Logger.warn('PipelineWorker', '[parse-prd] model ladder fallback', decision);
-                    if (statusDir) {
+                    const fallbackKey = `${decision.task || 'parse_prd'}|${decision.model}|${decision.nextModel || ''}|${decision.reason || ''}`;
+                    if (statusDir && !parsePrdFallbackKeys.has(fallbackKey)) {
+                      parsePrdFallbackKeys.add(fallbackKey);
                       recordRunDecision(statusDir, telemetryReporter, {
                         runId,
                         decisionType: 'model_ladder_decision',
@@ -11072,6 +11601,27 @@ async function runPipeline(config, runId) {
                 return sub?.value?.parsedPRD || null;
               } catch (err) {
                 Logger.warn('PipelineWorker', '[parse-prd] chunk LLM failed — using regex', { reason: err?.message, heading });
+                if (ModelLadder.isSharedCapacityError?.(err)) {
+                  disableParsePrdAiForRun(
+                    err?.message || err?.reason || 'parse-prd concurrency/rate limit',
+                    heading,
+                    Number(err?.status || err?.statusCode || 0) === 429 ? 'CONCURRENT_LIMIT_EXCEEDED' : null
+                  );
+                } else if (err?.code === 'MODEL_LADDER_EXHAUSTED') {
+                  disableParsePrdAiForRun(err.message, heading, 'MODEL_LADDER_EXHAUSTED');
+                } else if (statusDir) {
+                  recordRunDecision(statusDir, telemetryReporter, {
+                    runId,
+                    decisionType: 'parse_prd_chunk_regex_fallback',
+                    phase: 'parsing_prd',
+                    status: 'warning',
+                    message: `PRD chunk "${heading || 'Untitled'}" fell back to deterministic regex parsing.`,
+                    metadata: {
+                      heading,
+                      reason: String(err?.message || err?.reason || err || 'unknown').slice(0, 240),
+                    },
+                  });
+                }
                 return null;
               }
             },
@@ -11473,6 +12023,7 @@ async function runPipeline(config, runId) {
           });
 
           generationMeta = generationResult.generationMeta;
+          corpusBootstrap = generationResult.corpusBootstrap || null;
           fallbackUsed = !!generationMeta?.fallbackUsed;
           if (generationMeta && routeAccessSummary) {
             generationMeta.routeAccessSummary = routeAccessSummary;
@@ -11847,10 +12398,14 @@ async function runPipeline(config, runId) {
       progressFlushTimer = null;
       const batch = pendingProgress.splice(0);
       if (!batch.length || !telemetryReporter || !telemetryReporter.isEnabled()) return;
+      // G26: forward file/suite/project so the dashboard groups tests by main
+      // type + category instead of bucketing them as "Other". Parser fills
+      // these from the Playwright list-reporter line; empty string is fallback.
       const tests = batch.map((t) => ({
         n: String(t.name || ''),
-        su: '',
-        f: '',
+        su: String(t.suite || ''),
+        f: String(t.file || ''),
+        p: String(t.project || ''),
         s: String(t.status || 'unknown'),
         d: Number(t.durationMs || 0),
       }));
@@ -12128,6 +12683,15 @@ async function runPipeline(config, runId) {
       }
     }
 
+    updateStatus(statusDir, 'running', {
+      runId,
+      message: 'Running Playwright tests...',
+      generatedSpecCount: listGeneratedTestFiles(config.projectPath).length,
+      tierBAuthConfigPath: config.tierBAuthConfigPath || null,
+      tierBRoles: config.tierBRoles || [],
+      executionTimeout,
+    }, telemetryReporter);
+
     // -------------------------------------------------------
     // Workspace post-gen sync: push newly written test files
     // -------------------------------------------------------
@@ -12247,7 +12811,7 @@ async function runPipeline(config, runId) {
         };
         claudeLocalCtx.surfaceKey = topupSurface.surfaceKey;
         claudeLocalCtx.surfaceInventory = generationMeta.claudeSurfaceInventory;
-        const topupRegen = await ClaudeLocal.runClaudeGeneration({
+        const topupRegenArgs = {
           context: topupPacked.context,
           projectPath: config.projectPath,
           testsDir: TierIsolation.ensureTierDirs(config.projectPath).tier1,
@@ -12278,7 +12842,34 @@ async function runPipeline(config, runId) {
           // CL3-D — focus areas shipped by /api/test-runs/[id]/topup
           topupFocus: config.topupFocus || null,
           _skipPreflight: true,
-        });
+        };
+        let topupRegen = await ClaudeLocal.runClaudeGeneration(topupRegenArgs);
+        if (topupRegen?.status === 'awaiting_user_question') {
+          updateStatus(statusDir, 'awaiting_user_question', {
+            runId,
+            message: topupRegen.question || 'Claude needs your input before continuing top-up.',
+            questionId: topupRegen.questionId,
+            question: topupRegen.question,
+            options: topupRegen.options || [],
+            surfaceKey: topupSurface.surfaceKey,
+            sessionId: topupRegen.sessionId || config.parentSessionId || null,
+          }, telemetryReporter);
+          const answer = await topupAdapterClient.pollPendingAnswer({
+            runId,
+            questionId: topupRegen.questionId,
+          });
+          topupRegen = await ClaudeLocal.runClaudeGeneration({
+            ...topupRegenArgs,
+            feedback: [
+              String(topupRegenArgs.feedback || ''),
+              '',
+              'Human answer to prior blocking question:',
+              `Question: ${topupRegen.question || ''}`,
+              `Answer: ${answer || ''}`,
+            ].join('\n'),
+            sessionId: topupRegen.sessionId || config.parentSessionId,
+          });
+        }
         if (topupRegen?.status === 'ok') {
           claudeLocalCtx.claudeSessionId = topupRegen.sessionId || claudeLocalCtx.claudeSessionId;
           try { TierIsolation.syncLegacyView(config.projectPath, { clear: false }); } catch { /* best-effort */ }
@@ -12318,7 +12909,8 @@ async function runPipeline(config, runId) {
       || Boolean(generationMeta?.iterations?.[0]?.selfDone);
     const claudeMaxIterations = Math.max(
       1,
-      Number.parseInt(process.env.HEALIX_CLAUDE_MAX_ITERATIONS || '', 10) || 5
+      Number.parseInt(process.env.HEALIX_CLAUDE_MAX_ITERATIONS || '', 10)
+        || ClaudeLocal.IterationController.DEFAULT_MAX_ITERATIONS
     );
     // WS-5: AC coverage scoring state — recomputed every loop after Playwright
     // finishes. The final value is stamped onto the report payload so the
@@ -12544,45 +13136,74 @@ async function runPipeline(config, runId) {
         runId,
       });
       let reGen;
+      const regenArgs = {
+        context: packedRegen.context || claudeLocalCtx?.context || {},
+        projectPath: config.projectPath,
+        testsDir: TierIsolation.ensureTierDirs(config.projectPath).tier1,
+        prdContent: claudeLocalCtx?.prdContent || '',
+        parsedPRD: packedRegen.parsedPRD || claudeLocalCtx?.parsedPRD || null,
+        explorationArtifact: packedRegen.explorationArtifact || claudeLocalCtx?.explorationArtifact || null,
+        roles: claudeLocalCtx?.roles || [],
+        projectInfo,
+        runId,
+        statusDir,
+        client: adapterClient,
+        workspaceContext: workspaceState?.workspaceId ? { workspaceId: workspaceState.workspaceId } : null,
+        corpusSeed: packedRegen.corpusSeed || null,
+        corpusGuidance: packedRegen.corpusGuidance || null,
+        iterationNumber: claudeIteration + 1,
+        feedback: packedRegen.feedback || feedback,
+        sessionId: claudeSessionId,
+        surfaceKey: activeSurface.surfaceKey || 'root',
+        contextArtifacts: packedRegen.contextArtifacts || null,
+        compactSummary: packedRegen.compactSummary || null,
+        promptBudget: packedRegen.promptBudget || null,
+        sessionMetadata: {
+          surface: activeSurface,
+          sourceSignature: activeSurface.fingerprintHash || null,
+          corpusVersion: corpusBootstrap?.corpusSeed?.version || corpusBootstrap?.corpusSeed?.canonicalVersion || null,
+        },
+        telemetryReporter,
+        // CL3-D — propagate top-up focus across iterations of a top-up run.
+        topupFocus: config.topupFocus || null,
+        _skipPreflight: true, // session is warm — no need to re-probe
+      };
       try {
-        reGen = await ClaudeLocal.runClaudeGeneration({
-          context: packedRegen.context || claudeLocalCtx?.context || {},
-          projectPath: config.projectPath,
-          testsDir: TierIsolation.ensureTierDirs(config.projectPath).tier1,
-          prdContent: claudeLocalCtx?.prdContent || '',
-          parsedPRD: packedRegen.parsedPRD || claudeLocalCtx?.parsedPRD || null,
-          explorationArtifact: packedRegen.explorationArtifact || claudeLocalCtx?.explorationArtifact || null,
-          roles: claudeLocalCtx?.roles || [],
-          projectInfo,
-          runId,
-          statusDir,
-          client: adapterClient,
-          workspaceContext: workspaceState?.workspaceId ? { workspaceId: workspaceState.workspaceId } : null,
-          corpusSeed: packedRegen.corpusSeed || null,
-          corpusGuidance: packedRegen.corpusGuidance || null,
-          iterationNumber: claudeIteration + 1,
-          feedback: packedRegen.feedback || feedback,
-          sessionId: claudeSessionId,
-          surfaceKey: activeSurface.surfaceKey || 'root',
-          contextArtifacts: packedRegen.contextArtifacts || null,
-          compactSummary: packedRegen.compactSummary || null,
-          promptBudget: packedRegen.promptBudget || null,
-          sessionMetadata: {
-            surface: activeSurface,
-            sourceSignature: activeSurface.fingerprintHash || null,
-            corpusVersion: corpusBootstrap?.corpusSeed?.version || corpusBootstrap?.corpusSeed?.canonicalVersion || null,
-          },
-          telemetryReporter,
-          // CL3-D — propagate top-up focus across iterations of a top-up run.
-          topupFocus: config.topupFocus || null,
-          _skipPreflight: true, // session is warm — no need to re-probe
-        });
+        reGen = await ClaudeLocal.runClaudeGeneration(regenArgs);
       } catch (reGenErr) {
         Logger.warn('PipelineWorker', 'Claude-local re-invocation threw — stopping iteration', {
           iteration: claudeIteration + 1,
           message: reGenErr?.message,
         });
         break;
+      }
+
+      if (reGen?.status === 'awaiting_user_question') {
+        updateStatus(statusDir, 'awaiting_user_question', {
+          runId,
+          message: reGen.question || 'Claude needs your input before continuing.',
+          questionId: reGen.questionId,
+          question: reGen.question,
+          options: reGen.options || [],
+          surfaceKey: activeSurface.surfaceKey || 'root',
+          sessionId: reGen.sessionId || claudeSessionId || null,
+        }, telemetryReporter);
+        const answer = await adapterClient.pollPendingAnswer({
+          runId,
+          questionId: reGen.questionId,
+        });
+        reGen = await ClaudeLocal.runClaudeGeneration({
+          ...regenArgs,
+          feedback: [
+            String(regenArgs.feedback || ''),
+            '',
+            'Human answer to prior blocking question:',
+            `Question: ${reGen.question || ''}`,
+            `Answer: ${answer || ''}`,
+          ].join('\n'),
+          sessionId: reGen.sessionId || claudeSessionId,
+          _skipPreflight: true,
+        });
       }
 
       if (reGen?.status !== 'ok') {
@@ -12876,6 +13497,21 @@ async function runPipeline(config, runId) {
     });
     generationMeta = attachPipelineDecisionSummary(generationMeta || {}, statusDir);
     patchReportWithPipelineDecisionSummary(report.path, statusDir);
+
+    // G59: surface ingest success/failure. If the ingest call exhausted
+    // retries, emit a `dashboard_ingest_failed` phase event so any
+    // reconciliation tooling (and the operator watching the live UI) can
+    // see the run's counts are stale on the dashboard even though the
+    // local report is correct.
+    if (report.dashboardIngest && !report.dashboardIngest.succeeded) {
+      updateStatus(statusDir, 'dashboard_ingest_failed', {
+        runId,
+        message: `Dashboard sync failed after retries (status=${report.dashboardIngest.lastStatus || 'n/a'}). Local report is authoritative; dashboard row may show 0 counts until reconciled.`,
+        reportPath: report.path,
+        lastStatus: report.dashboardIngest.lastStatus,
+        lastError: report.dashboardIngest.lastError,
+      }, telemetryReporter);
+    }
 
     // Use the actual run ID returned from the server (if available)
     const actualRunId = report.actualRunId || runId;

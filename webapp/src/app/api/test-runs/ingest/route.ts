@@ -11,6 +11,7 @@ import { runAbuseDetection } from '@/lib/abuse-detector'
 import { trackProjectUsage } from '@/lib/project-hash'
 import { logBlockedRequest } from '@/lib/security-logger'
 import { computeCoverageMetrics } from '@/lib/coverage'
+import { deriveRunStatus } from '@/lib/test-run/derive-status'
 import {
   hasRealFindings,
   persistPreparedQaCorpus,
@@ -438,12 +439,30 @@ export async function POST(request: NextRequest) {
     const skipped_tests = stats.skipped || 0
     const duration_ms = stats.duration || 0
 
-    // Determine status
+    // G62: derive the 5-state status from counts + classifier breakdown.
+    // Pre-G62 this was a flat "any-failure → failed". The new derivation
+    // honors `failureBreakdown.bad` (generator noise) vs `failureBreakdown.real`
+    // (genuine defects), so a 80%-pass run dominated by noise lands as
+    // `degraded_noise` rather than `failed`.
+    const _bodyFb =
+      (failure_breakdown && typeof failure_breakdown === 'object' ? failure_breakdown : null)
+      || (bodyFailureBreakdown && typeof bodyFailureBreakdown === 'object' ? bodyFailureBreakdown : null)
+      || ((report as unknown as { failureBreakdown?: unknown })?.failureBreakdown
+        && typeof (report as unknown as { failureBreakdown?: unknown }).failureBreakdown === 'object'
+          ? (report as unknown as { failureBreakdown?: unknown }).failureBreakdown
+          : null)
+      || null
+    const _bodyFbTyped = _bodyFb as { real?: number; bad?: number; env?: number; total?: number } | null
     let status: string
     if (failed_tests === 0 && total_tests > 0) {
       status = 'passed'
     } else if (failed_tests > 0) {
-      status = 'failed'
+      status = deriveRunStatus({
+        totalTests: total_tests,
+        failedTests: failed_tests,
+        passedTests: passed_tests,
+        failureBreakdown: _bodyFbTyped,
+      })
     } else {
       status = 'error'
     }

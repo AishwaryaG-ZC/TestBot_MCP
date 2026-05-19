@@ -843,18 +843,37 @@ class WebappClient {
 
   async parsePRD({ prdContent, prdHash, model }) {
     this._assertKey('/api/parse-prd');
-    return this._post(
-      '/api/parse-prd',
-      {
-        api_key: this.apiKey,
-        prd: prdContent,
-        prdHash: prdHash || null,
-        // Optional model override — used by the worker's per-task model
-        // ladder so a 4xx on one model can be retried with the next rung.
-        model: model || undefined,
-      },
-      { timeoutMs: ENDPOINT_TIMEOUTS_MS.parsePRD }
-    );
+    // G41: webapp enforces a per-user concurrency limit on /api/parse-prd
+    // (429 CONCURRENT_LIMIT_EXCEEDED). The counter releases only after the
+    // upstream OpenAI call returns, which can take 5–15s; short backoffs
+    // (800/1600ms) consistently miss the release window. Bumped to
+    // exponential 3s / 6s / 12s / 24s with 5 total attempts — still bounded
+    // (~45s total worst case), and high enough to ride out one full OpenAI
+    // round trip per backoff step.
+    const body = {
+      api_key: this.apiKey,
+      prd: prdContent,
+      prdHash: prdHash || null,
+      model: model || undefined,
+    };
+    const url = '/api/parse-prd';
+    const opts = { timeoutMs: ENDPOINT_TIMEOUTS_MS.parsePRD };
+    let attempt = 0;
+    while (true) {
+      attempt += 1;
+      try {
+        return await this._post(url, body, opts);
+      } catch (err) {
+        const status = Number(err?.status);
+        const isRateLimited = status === 429 || /CONCURRENT_LIMIT_EXCEEDED|RATE_LIMIT_EXCEEDED/i.test(String(err?.message || ''));
+        if (!isRateLimited || attempt >= 5) throw err;
+        const backoffMs = Math.min(24000, 3000 * Math.pow(2, attempt - 1)); // 3s, 6s, 12s, 24s
+        Logger.warn('WebappClient', '[G41] parsePRD rate-limited, backing off', {
+          attempt, backoffMs, status,
+        });
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      }
+    }
   }
 
   async planExploration({ explorationArtifact, parsedPRD }) {
@@ -1318,6 +1337,13 @@ class WebappClient {
     if (!this.apiKey || !workspaceId || !projectKey || !projectPathHash || !surfaceKey || !claudeSessionId) {
       return null;
     }
+    // G34: webapp `/api/workspaces/{id}/claude-sessions` requires non-empty
+    // `model` and `effort`. When the caller didn't pass them (some surfaces
+    // skip plumbing), fall back to the write-model defaults so the DB upsert
+    // doesn't get rejected with HTTP 400 and break resume continuity.
+    const Exec = require('./adapters/claude-local/exec');
+    const safeModel = model || Exec.DEFAULT_WRITE_MODEL || 'claude-haiku-4-5';
+    const safeEffort = effort || Exec.DEFAULT_EFFORT || 'medium';
     try {
       return await this._post(
         `/api/workspaces/${encodeURIComponent(workspaceId)}/claude-sessions`,
@@ -1326,8 +1352,8 @@ class WebappClient {
           projectPathHash,
           surfaceKey,
           claudeSessionId,
-          model,
-          effort,
+          model: safeModel,
+          effort: safeEffort,
           sourceSignature,
           prdSignature,
           corpusVersion,
@@ -1496,10 +1522,20 @@ class WebappClient {
         if (result && typeof result.answer === 'string') return result.answer;
         // 204 from server → no answer yet, fall through to sleep + retry.
       } catch (err) {
-        // 204 surfaces as a non-error empty result from _get in most stacks;
-        // any other error we treat as transient and back off.
+        // G22: 4xx responses are server-side rejections (invalid runId, missing
+        // questionId, auth failure). Retrying won't change the outcome. Throw a
+        // terminal error so the ask-user wrapper can unblock the run rather
+        // than spinning forever like the old behavior.
+        const status = Number(err?.status);
+        if (status >= 400 && status < 500) {
+          const fatal = new Error(`pollPendingAnswer rejected (HTTP ${status}): ${err?.message || 'unknown'}`);
+          fatal.code = 'ASK_USER_POLL_FAILED';
+          fatal.status = status;
+          throw fatal;
+        }
+        // 5xx + network blips are still treated as transient and retried.
         Logger.warn('WebappClient', 'pollPendingAnswer transient error', {
-          runId, questionId, code: err?.code, message: err?.message,
+          runId, questionId, code: err?.code, status, message: err?.message,
         });
       }
       attempt += 1;

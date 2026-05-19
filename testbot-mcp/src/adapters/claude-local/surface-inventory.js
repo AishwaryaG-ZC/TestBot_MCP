@@ -3,7 +3,7 @@
 const crypto = require('node:crypto');
 const path = require('node:path');
 
-const DEFAULT_MAX_SHARDS = 8;
+const DEFAULT_MAX_SHARDS = 4;
 const DEFAULT_FANOUT_TOKEN_THRESHOLD = 60_000;
 
 function sha(value) {
@@ -322,7 +322,17 @@ function buildSurfaceInventory({
     return obj;
   });
 
-  list.sort((a, b) => Number(b.changed) - Number(a.changed) || priority(a.type) - priority(b.type) || a.surfaceKey.localeCompare(b.surfaceKey));
+  // G29: sort `changed > unchanged`, then `high-confidence > low-confidence`,
+  // then by type priority, then by key. Previously low-confidence shards (no
+  // source files matched) could outrank real UI/API surfaces and got Claude
+  // attention they didn't deserve — e.g., `api:DELETE /:id` (a wildcard
+  // ghost) winning over `api:POST /api/issues` (a real, source-tied endpoint).
+  list.sort((a, b) =>
+    Number(b.changed) - Number(a.changed)
+    || Number(Boolean(a.lowConfidence)) - Number(Boolean(b.lowConfidence))
+    || priority(a.type) - priority(b.type)
+    || a.surfaceKey.localeCompare(b.surfaceKey)
+  );
   if (list.length > max) {
     const keep = list.slice(0, max - 1);
     const rest = list.slice(max - 1);
