@@ -200,6 +200,33 @@ export async function POST(
       return NextResponse.json({ error: `Invalid payload: ${message.slice(0, 200)}` }, { status: 422 })
     }
     console.error('[claude-sessions] Unexpected error:', err)
-    return NextResponse.json({ error: 'Internal server error', detail: message.slice(0, 200) }, { status: 500 })
+    // R1: drizzle wraps the postgres error — the human-friendly message
+    // lives on `cause.message` (postgres-js) and the SQLSTATE on
+    // `cause.code`. Surface BOTH so a 23xxx (integrity violation) or
+    // 22xxx (data exception) doesn't hide behind a generic SQL dump.
+    const cause = (err as { cause?: { message?: string; code?: string; detail?: string; constraint?: string; table?: string; column?: string } })?.cause
+    const pgMessage = cause?.message
+    const pgCode = cause?.code
+    const pgConstraint = cause?.constraint
+    const pgColumn = cause?.column
+    // Classify by postgres SQLSTATE class:
+    //   23* — integrity violation (FK / unique / NOT NULL)
+    //   22* — data exception (invalid syntax, out-of-range)
+    //   42* — syntax / undefined column / table
+    if (pgCode && /^23/.test(pgCode)) {
+      console.warn('[claude-sessions] integrity violation', { code: pgCode, constraint: pgConstraint, column: pgColumn, message: pgMessage })
+      return NextResponse.json({
+        error: 'Integrity violation',
+        detail: pgMessage || message.slice(0, 600),
+        code: pgCode,
+        constraint: pgConstraint || null,
+        column: pgColumn || null,
+      }, { status: 422 })
+    }
+    return NextResponse.json({
+      error: 'Internal server error',
+      detail: pgMessage || message.slice(0, 1200),
+      code: pgCode || null,
+    }, { status: 500 })
   }
 }

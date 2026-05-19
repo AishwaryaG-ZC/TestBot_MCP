@@ -239,6 +239,11 @@ async function _discoverClickRoutes(page, { resetUrl, maxClicks }) {
       await locator.click({ timeout: CLICK_PROBE_TIMEOUT_MS });
       await page.waitForLoadState('domcontentloaded', { timeout: CLICK_PROBE_TIMEOUT_MS }).catch(() => {});
       await page.waitForTimeout(250);
+      // R2: clicks frequently kick off XHR (load detail panel, fetch
+      // subresource). Give those fetches up to 1.5s so they register with
+      // the response.on() listener — without this, G65 sees an empty
+      // apiEndpoints[] even when the click DID trigger an API call.
+      await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(() => undefined);
 
       const afterUrl = page.url();
       if (afterUrl && afterUrl !== beforeUrl) discoveredUrls.push(afterUrl);
@@ -446,6 +451,13 @@ async function _walkRoutes({ browser, contextOptions, baseURL, origin, credentia
       const resolvedPathname = routeKeyFromUrl(page.url(), baseURL) || pathKey;
 
       await page.waitForTimeout(SETTLE_WAIT_MS);
+
+      // R2: wait for networkidle to give SPA mount-fetches time to fire so
+      // they register with the response.on() listener (which feeds G50's
+      // apiEndpoints and G65's API contract synthesis). Cap at 3s — most
+      // SPA mounts complete in <1s; the cap prevents stalling on
+      // hung connections.
+      await page.waitForLoadState('networkidle', { timeout: 3000 }).catch(() => undefined);
 
       // Scroll to reveal lazy-loaded / below-fold content before collecting.
       await _scrollToReveal(page);

@@ -15,6 +15,10 @@ import { parseVerdictFilter, applyVerdictFilter, VERDICT_FILTER_VALUES, verdictL
 import { DiffBanner } from '@/components/test-run/DiffBanner';
 import { TargetAppHeader } from '@/components/test-run/TargetAppHeader';
 import { HealixInternalPanel } from '@/components/test-run/HealixInternalPanel';
+import { BugClusterTable } from '@/components/test-run/BugClusterTable';
+import { groupFailuresByBug } from '@/lib/test-run/bug-groups';
+import { annotateFailuresWithKnown, type KnownBugRecord } from '@/lib/test-run/known-bug-match';
+import { categorizeFailure } from '@/lib/test-run/bug-categorize';
 import {
   buildIterationLabel,
   fileEditIcon,
@@ -4336,6 +4340,26 @@ export default function TestRunDetailPage() {
   // also use the hooks; that's fine because the early-return paths above
   // also don't render those components.
   const _searchParamsForSignal = useSearchParams();
+  // R4: known-bugs state. Fetched per (workspaceId, projectKey) and
+  // re-fetched when the user marks/unmarks a bug. `_kbRunCtx` carries the
+  // (workspaceId, projectKey) tuple the effect derives from testRun once
+  // the data loads.
+  const [_knownBugsForRun, _setKnownBugsForRun] = useState<KnownBugRecord[]>([]);
+  const [knownBugsRefreshTick, setKnownBugsRefreshTick] = useState(0);
+  const [_kbRunCtx, _setKbRunCtx] = useState<{ workspaceId: string; projectKey: string } | null>(null);
+  useEffect(() => {
+    if (!_kbRunCtx) return;
+    let aborted = false;
+    fetch(`/api/known-bugs?workspaceId=${encodeURIComponent(_kbRunCtx.workspaceId)}&projectKey=${encodeURIComponent(_kbRunCtx.projectKey)}`, {
+      credentials: 'include',
+    })
+      .then((r) => (r.ok ? r.json() : Promise.resolve({ knownBugs: [] })))
+      .then((body: { knownBugs?: KnownBugRecord[] }) => {
+        if (!aborted) _setKnownBugsForRun(Array.isArray(body.knownBugs) ? body.knownBugs : []);
+      })
+      .catch(() => { if (!aborted) _setKnownBugsForRun([]); });
+    return () => { aborted = true; };
+  }, [_kbRunCtx, knownBugsRefreshTick]);
   const id = params?.id as string;
   const isLiveDetailId = String(id || '').startsWith('live-');
 
@@ -4410,6 +4434,15 @@ export default function TestRunDetailPage() {
     setGenerationJob(
       (json.data as { generationJob?: GenerationJobSnapshot | null }).generationJob ?? null
     );
+    // R4: derive (workspaceId, projectKey) once the run loads so the
+    // known-bugs registry can be fetched. projectKey lives in report_json
+    // (set by the worker at ingest time via QA corpus payload).
+    const wsId = nextRun?.workspace_id;
+    const reportObj = (nextRun?.report_json ?? null) as { projectKey?: string; metadata?: { projectKey?: string } } | null;
+    const projKey = reportObj?.projectKey || reportObj?.metadata?.projectKey || null;
+    if (wsId && projKey) {
+      _setKbRunCtx((prev) => (prev?.workspaceId === wsId && prev?.projectKey === projKey ? prev : { workspaceId: wsId, projectKey: projKey }));
+    }
   }, [id]);
 
   useEffect(() => {
@@ -5336,6 +5369,40 @@ export default function TestRunDetailPage() {
       {failureBreakdown && (failureBreakdown.total ?? 0) > 0 && (
         <FailureBreakdownCard breakdown={failureBreakdown} />
       )}
+
+      {/* R4: Bug cluster table — deduplicated bug list with severity, category,
+          affected-tests count, and "Mark as known" button per bug.
+          Renders ABOVE the raw failures table so QA managers triage at the
+          BUG level (8 bugs) instead of the TEST level (43 rows). */}
+      {(() => {
+        const annotated = annotateFailuresWithKnown(
+          testFailures.map((f) => ({
+            id: f.id,
+            test_name: f.test_name,
+            test_file: f.test_file,
+            tier: f.tier,
+            verdict: f.user_override ?? f.verdict ?? null,
+            verdict_confidence: f.verdict_confidence,
+            reason: f.reason,
+            category: categorizeFailure({ testFile: f.test_file, testName: f.test_name, tier: f.tier, reason: f.reason }),
+          })),
+          _knownBugsForRun
+        );
+        const groups = groupFailuresByBug(annotated);
+        if (groups.length === 0) return null;
+        return (
+          <BugClusterTable
+            groups={groups}
+            workspaceId={(testRun.workspace_id as string | null) || null}
+            projectKey={
+              ((report?.metadata as { projectKey?: string } | null)?.projectKey)
+              || ((report as { projectKey?: string } | null)?.projectKey)
+              || null
+            }
+            onKnownBugsChanged={() => setKnownBugsRefreshTick((t) => t + 1)}
+          />
+        );
+      })()}
 
       {/* G74: verdict-filter chip row. Lets the operator narrow the failures
           table by classifier verdict. URL-backed via ?verdict= so reloads
