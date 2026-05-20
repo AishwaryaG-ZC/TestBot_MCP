@@ -1361,11 +1361,19 @@ function ensureQaContractSpec({ projectPath, context = {}, roles = [], testType 
   const generatedDir = path.join(projectPath, 'tests', 'generated');
   fs.mkdirSync(generatedDir, { recursive: true });
   const targetPath = path.join(generatedDir, spec.filename);
+  const testCount = (spec.content.match(/\btest\s*\(/g) || []).length;
+  if (fs.existsSync(targetPath) && fs.readFileSync(targetPath, 'utf-8') === spec.content) {
+    result.written = true;
+    result.filename = spec.filename;
+    result.path = targetPath;
+    result.generatedTests = testCount;
+    return result;
+  }
   fs.writeFileSync(targetPath, spec.content, 'utf-8');
   result.written = true;
   result.filename = spec.filename;
   result.path = targetPath;
-  result.generatedTests = (spec.content.match(/\btest\s*\(/g) || []).length;
+  result.generatedTests = testCount;
   return result;
 }
 

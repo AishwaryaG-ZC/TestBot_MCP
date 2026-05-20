@@ -43,3 +43,16 @@ notebooks/
 
 # Local target apps cloned for Healix evaluation
 targets/
+
+# Supabase CLI runtime state (config.toml is committed; these are not)
+supabase/.temp/
+supabase/.branches/
+
+# Local Python version / virtualenv name (pyenv)
+.python-version
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

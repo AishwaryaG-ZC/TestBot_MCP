@@ -92,6 +92,7 @@ const STRICT_AI_REQUIRED_CATEGORIES = [
 ];
 
 const GENERATED_SPEC_FILE_PATTERN = /\.(?:spec|test)\.(?:ts|js|mts|mjs|cts|cjs)$/i;
+const TIER0_SPEC_FILENAME = 'healix-qa-contracts.spec.ts';
 const GENERATED_SPEC_FILENAME_PATTERN = /[A-Za-z0-9_.-]+\.(?:spec|test)\.(?:ts|js|mts|mjs|cts|cjs)\b/g;
 
 const CURSOR_FIXTURE_BASENAME = '__healix-fixture';
@@ -3647,7 +3648,13 @@ function resolveFailureAnalysisProvider() {
 
 function resetGeneratedTestsDir(projectPath) {
   const testsDir = path.join(projectPath, 'tests', 'generated');
-  fs.rmSync(testsDir, { recursive: true, force: true });
+  if (fs.existsSync(testsDir)) {
+    for (const entry of fs.readdirSync(testsDir, { withFileTypes: true })) {
+      if (entry.name !== TIER0_SPEC_FILENAME) {
+        fs.rmSync(path.join(testsDir, entry.name), { recursive: true, force: true });
+      }
+    }
+  }
   ensureDir(testsDir);
   return testsDir;
 }
@@ -8251,6 +8258,17 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           generationMeta.qaContractWarnings = recoveredPack.qaContractWarnings;
           if (!recoveredPack.written || recoveredPack.generatedTests <= 0) {
             throw new Error('No runnable deterministic QA contract tests were available for rescue.');
+          }
+          // Remove any broken AI-generated partials so validation only sees Tier-0.
+          // AI partials may have been written before the failure and would cause
+          // compile errors that mask a perfectly valid Tier-0 spec.
+          const tier0Dir = path.join(config.projectPath, 'tests', 'generated');
+          if (fs.existsSync(tier0Dir)) {
+            for (const entry of fs.readdirSync(tier0Dir, { withFileTypes: true })) {
+              if (entry.name !== TIER0_SPEC_FILENAME) {
+                fs.rmSync(path.join(tier0Dir, entry.name), { recursive: true, force: true });
+              }
+            }
           }
           generationMeta.fixtureWiring = applyFixtureWiring(`${generatorName}-qa-contracts`);
           const validation = await runValidation(`${generatorName}-qa-contracts`);
