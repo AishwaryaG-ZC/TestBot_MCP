@@ -74,11 +74,13 @@ function statusBadgeClass(status: string | null | undefined) {
   if (status === 'failed') return 'bg-red-500/10 text-red-400'
   if (status === 'running') return 'bg-blue-500/10 text-blue-400'
   if (status === 'completed_with_findings') return 'bg-amber-500/10 text-amber-300'
+  if (status === 'completed-partial') return 'bg-orange-500/10 text-orange-300'
   return 'bg-amber-500/10 text-amber-400'
 }
 
 function statusLabel(status: string | null | undefined) {
   if (status === 'completed_with_findings') return 'findings'
+  if (status === 'completed-partial') return 'partial'
   return status || 'unknown'
 }
 

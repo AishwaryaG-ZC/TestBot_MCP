@@ -456,11 +456,16 @@ export async function POST(request: NextRequest) {
       qa_contracts,
     })
 
+    const isPartialRescue = Boolean(
+      (report as any)?.metadata?.generationMeta?.partialGenerationWarning
+    )
     const runStatus = pipelineErrorPayload
       ? 'error'
-      : hasRealFindings(qaCorpusPayload.findingSummary)
-        ? 'completed_with_findings'
-        : status
+      : isPartialRescue
+        ? 'completed-partial'
+        : hasRealFindings(qaCorpusPayload.findingSummary)
+          ? 'completed_with_findings'
+          : status
 
     // Insert test run
     const [testRun] = await db

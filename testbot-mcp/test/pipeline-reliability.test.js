@@ -654,7 +654,7 @@ test('quality audit requires runnable QA filter form and a11y contracts to be co
       testType: 'both',
       contents: [
         fs.readFileSync(path.join(projectPath, 'tests', 'generated', 'generated.spec.ts'), 'utf-8'),
-        fs.readFileSync(pack.path, 'utf-8'),
+        ...pack.paths.map((p) => fs.readFileSync(p, 'utf-8')),
       ],
     });
     assert.equal(coveredAudit.valid, true);

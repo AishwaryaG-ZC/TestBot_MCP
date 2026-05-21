@@ -268,9 +268,11 @@ export default function HomePage() {
                               ? 'bg-blue-500/10 text-blue-400'
                               : test.status === 'completed_with_findings'
                               ? 'bg-amber-500/10 text-amber-300'
+                              : test.status === 'completed-partial'
+                              ? 'bg-orange-500/10 text-orange-300'
                               : 'bg-amber-500/10 text-amber-400'
                           }`}>
-                            {test.status === 'completed_with_findings' ? 'findings' : test.status}
+                            {test.status === 'completed_with_findings' ? 'findings' : test.status === 'completed-partial' ? 'partial' : test.status}
                           </span>
                         </td>
                         <td className="px-4 py-4">

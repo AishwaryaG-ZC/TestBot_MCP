@@ -109,7 +109,7 @@ export interface TestRun {
   id: string
   user_id: string
   creation_name: string
-  status: 'running' | 'passed' | 'failed' | 'error' | 'completed_with_findings'
+  status: 'running' | 'passed' | 'failed' | 'error' | 'completed_with_findings' | 'completed-partial'
   total_tests: number
   passed_tests: number
   failed_tests: number
