@@ -5,6 +5,7 @@ import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { TestRun, TestFailure, FailureVerdict, QaFinding, FindingSummary } from '@/lib/types/database';
+import { createSupabaseBrowserClient } from '@/lib/supabase/client';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -467,6 +468,7 @@ function StatusBadge({ status }: { status: string }) {
 function runStatusLabel(status: string | null | undefined): string {
   if (status === 'completed_with_findings') return 'completed with findings';
   if (status === 'completed-partial') return 'partial (Tier-0 only)';
+  if (status === 'stalled') return 'stalled';
   return status || 'unknown';
 }
 
@@ -476,7 +478,86 @@ function runStatusClass(status: string | null | undefined): string {
   if (status === 'running') return 'bg-blue-500/10 border border-blue-500/20 text-blue-400';
   if (status === 'completed_with_findings') return 'bg-amber-500/10 border border-amber-500/25 text-amber-300';
   if (status === 'completed-partial') return 'bg-orange-500/10 border border-orange-500/25 text-orange-300';
+  if (status === 'stalled') return 'bg-yellow-500/10 border border-yellow-500/25 text-yellow-300';
   return 'bg-amber-500/10 border border-amber-500/20 text-amber-400';
+}
+
+// ── TierPillBanner ─────────────────────────────────────────────────────────────
+// Shows P0/P1/P2/P3 finding counts streaming in from partial_findings (mid-run)
+// or finding_summary (final). Visible when run is live/running or partials exist.
+function TierPillBanner({ partialFindings, findingSummary, status }: {
+  partialFindings?: unknown[] | null;
+  findingSummary?: FindingSummary | null;
+  status?: string | null;
+}) {
+  const isActive = status === 'running' || (Array.isArray(partialFindings) && partialFindings.length > 0);
+  if (!isActive) return null;
+
+  // Count by severity from partial_findings if available, else fall back to finding_summary
+  const counts: Record<string, number> = { P0: 0, P1: 0, P2: 0, P3: 0 };
+  if (Array.isArray(partialFindings) && partialFindings.length > 0) {
+    for (const f of partialFindings) {
+      if (f && typeof f === 'object' && 'severity' in f) {
+        const sev = String((f as { severity: unknown }).severity).toUpperCase();
+        if (sev in counts) counts[sev]++;
+      }
+    }
+  } else if (findingSummary?.bySeverity) {
+    for (const [sev, n] of Object.entries(findingSummary.bySeverity)) {
+      const key = sev.toUpperCase();
+      if (key in counts) counts[key] = (counts[key] || 0) + Number(n);
+    }
+  }
+
+  const total = counts.P0 + counts.P1 + counts.P2 + counts.P3;
+  if (total === 0 && status !== 'running') return null;
+
+  return (
+    <div className="flex items-center gap-2 px-4 py-2 rounded-xl bg-white/[0.03] border border-white/10 text-sm">
+      <span className="text-[#4A6280] text-xs font-medium mr-1">
+        {status === 'running' ? 'Live findings' : 'Findings'}
+      </span>
+      {(['P0', 'P1', 'P2', 'P3'] as const).map((sev) => {
+        const n = counts[sev] || 0;
+        const colors: Record<string, string> = {
+          P0: 'bg-red-500/15 border-red-500/30 text-red-300',
+          P1: 'bg-orange-500/15 border-orange-500/30 text-orange-300',
+          P2: 'bg-amber-500/15 border-amber-500/30 text-amber-300',
+          P3: 'bg-white/5 border-white/10 text-[#8BA4C8]',
+        };
+        return (
+          <span
+            key={sev}
+            className={`px-2 py-0.5 rounded-full border text-xs font-semibold ${colors[sev]} ${n === 0 ? 'opacity-40' : ''}`}
+          >
+            {sev} {n}
+          </span>
+        );
+      })}
+      {status === 'running' && (
+        <span className="ml-1 h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse" />
+      )}
+    </div>
+  );
+}
+
+// ── StalledBanner ──────────────────────────────────────────────────────────────
+function StalledBanner({ lastHeartbeatAt }: { lastHeartbeatAt?: string | null }) {
+  const sinceMin = lastHeartbeatAt
+    ? Math.floor((Date.now() - new Date(lastHeartbeatAt).getTime()) / 60_000)
+    : null;
+  return (
+    <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-yellow-500/10 border border-yellow-500/25 text-yellow-300 text-sm">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="shrink-0">
+        <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
+      </svg>
+      <span>
+        Run stalled — worker stopped responding
+        {sinceMin !== null && sinceMin > 0 ? ` ${sinceMin} min ago` : ''}.
+        {' '}Restart Healix to resume.
+      </span>
+    </div>
+  );
 }
 
 function severityClass(severity: string | null | undefined): string {
@@ -3666,6 +3747,41 @@ export default function TestRunDetailPage() {
     return () => clearInterval(timer);
   }, [id, activePolling, isLiveDetailId, isLiveOrRunning]);
 
+  // ── Supabase realtime subscription ──────────────────────────────────────────
+  // Fires whenever test_runs row changes (partial_findings, status, etc.) so
+  // the dashboard updates without a full poll cycle. Only active for non-live
+  // ingested runs (live runs get updates via SSE).
+  useEffect(() => {
+    if (!testRun?.id || isLiveDetailId || testRun.is_live) return;
+
+    const supabase = createSupabaseBrowserClient();
+    const channel = supabase
+      .channel(`test-run-${testRun.id}`)
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'test_runs', filter: `id=eq.${testRun.id}` },
+        (payload) => {
+          const updated = payload.new as Partial<TestRun> & { partial_findings?: unknown[]; last_heartbeat_at?: string };
+          if (!updated) return;
+          setTestRun((prev) => prev ? {
+            ...prev,
+            status: (updated.status as TestRun['status']) ?? prev.status,
+            current_phase: updated.current_phase ?? prev.current_phase,
+            partial_findings: updated.partial_findings ?? prev.partial_findings,
+            last_heartbeat_at: updated.last_heartbeat_at ?? prev.last_heartbeat_at,
+            updated_at: (updated.updated_at as string) ?? prev.updated_at,
+          } : prev);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  // Re-subscribe only when the run ID or live-mode changes, not on every partial_findings update.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [testRun?.id, isLiveDetailId, testRun?.is_live]);
+
   // ── Loading ──
   if (loading) {
     return (
@@ -3925,6 +4041,14 @@ export default function TestRunDetailPage() {
             </span>
           </div>
         </div>
+        {testRun.status === 'stalled' && (
+          <StalledBanner lastHeartbeatAt={testRun.last_heartbeat_at} />
+        )}
+        <TierPillBanner
+          partialFindings={testRun.partial_findings}
+          findingSummary={findingSummary}
+          status={testRun.status}
+        />
       </motion.div>
 
       {pipelineError && (

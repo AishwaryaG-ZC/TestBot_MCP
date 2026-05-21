@@ -55,7 +55,7 @@ export async function POST(request: NextRequest) {
     if (testRunId) {
       await db
         .update(testRuns)
-        .set({ currentPhase: phase, currentPhaseAt: now, updatedAt: now })
+        .set({ currentPhase: phase, currentPhaseAt: now, lastHeartbeatAt: now, updatedAt: now })
         .where(and(eq(testRuns.id, testRunId), eq(testRuns.userId, userId)))
     }
 

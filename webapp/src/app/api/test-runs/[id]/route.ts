@@ -189,7 +189,7 @@ export async function GET(
       return NextResponse.json({ data: { ...liveRun, generationJob: null } })
     }
 
-    const [row] = await db
+    let [row] = await db
       .select()
       .from(testRuns)
       .where(and(eq(testRuns.id, id), eq(testRuns.userId, user.id)))
@@ -197,6 +197,21 @@ export async function GET(
 
     if (!row) {
       return NextResponse.json({ error: 'Test run not found' }, { status: 404 })
+    }
+
+    // Lazy stalled-flip: if the run is still "running" but the worker hasn't
+    // sent a heartbeat in 5+ minutes, mark it stalled so the dashboard banner fires.
+    if (row.status === 'running' && row.lastHeartbeatAt) {
+      const stalledThresholdMs = 5 * 60 * 1000
+      const msSinceHeartbeat = Date.now() - new Date(row.lastHeartbeatAt).getTime()
+      if (msSinceHeartbeat > stalledThresholdMs) {
+        const now = new Date()
+        await db
+          .update(testRuns)
+          .set({ status: 'stalled', updatedAt: now })
+          .where(and(eq(testRuns.id, id), eq(testRuns.userId, user.id)))
+        row = { ...row, status: 'stalled', updatedAt: now }
+      }
     }
 
     const [test_failures, qa_findings, generationJob] = await Promise.all([
@@ -229,9 +244,11 @@ export async function GET(
       created_at: row.createdAt?.toISOString() ?? null,
       updated_at: row.updatedAt?.toISOString() ?? null,
       run_id: extractRunIdFromReport(row.reportJson),
-      current_phase: null,
+      current_phase: row.currentPhase ?? null,
       error_code: null,
       is_live: false,
+      partial_findings: (row.partialFindings as unknown[] | null) ?? null,
+      last_heartbeat_at: row.lastHeartbeatAt?.toISOString() ?? null,
       generationJob,
     }
 
