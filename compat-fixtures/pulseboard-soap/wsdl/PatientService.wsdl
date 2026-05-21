@@ -1,0 +1,270 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions
+  xmlns="http://schemas.xmlsoap.org/wsdl/"
+  xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
+  xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+  xmlns:tns="http://pulseboard.soap/patient"
+  targetNamespace="http://pulseboard.soap/patient"
+  name="PatientService">
+
+  <!-- ===== Types ===== -->
+  <types>
+    <xsd:schema targetNamespace="http://pulseboard.soap/patient">
+
+      <xsd:element name="GetPatientRequest">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element name="id" type="xsd:string"/>
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+
+      <xsd:element name="GetPatientResponse">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element name="PatientId"   type="xsd:string"/>
+            <xsd:element name="Name"        type="xsd:string"/>
+            <xsd:element name="DateOfBirth" type="xsd:string"/>
+            <xsd:element name="MRN"         type="xsd:string"/>
+            <xsd:element name="Status"      type="xsd:string"/>
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+
+      <xsd:element name="CreatePatientRequest">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element name="Name"        type="xsd:string"/>
+            <xsd:element name="DateOfBirth" type="xsd:string"/>
+            <xsd:element name="MRN"         type="xsd:string"/>
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+
+      <xsd:element name="CreatePatientResponse">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element name="PatientId" type="xsd:string"/>
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+
+      <xsd:element name="UpdatePatientRequest">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element name="id"          type="xsd:string"/>
+            <xsd:element name="Name"        type="xsd:string" minOccurs="0"/>
+            <xsd:element name="DateOfBirth" type="xsd:string" minOccurs="0"/>
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+
+      <xsd:element name="UpdatePatientResponse">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element name="PatientId" type="xsd:string"/>
+            <xsd:element name="Updated"   type="xsd:boolean"/>
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+
+      <xsd:element name="ListPatientsRequest">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element name="Status" type="xsd:string" minOccurs="0"/>
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+
+      <xsd:element name="ListPatientsResponse">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element name="Patients" maxOccurs="unbounded" minOccurs="0">
+              <xsd:complexType>
+                <xsd:sequence>
+                  <xsd:element name="PatientId" type="xsd:string"/>
+                  <xsd:element name="Name"      type="xsd:string"/>
+                  <xsd:element name="Status"    type="xsd:string"/>
+                </xsd:sequence>
+              </xsd:complexType>
+            </xsd:element>
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+
+      <xsd:element name="DeletePatientRequest">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element name="id" type="xsd:string"/>
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+
+      <xsd:element name="DeletePatientResponse">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element name="Deleted" type="xsd:boolean"/>
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+
+      <!-- Fault detail types -->
+      <xsd:element name="PatientNotFoundFault">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element name="message"   type="xsd:string"/>
+            <xsd:element name="patientId" type="xsd:string"/>
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+
+      <xsd:element name="DuplicateMRNFault">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element name="message" type="xsd:string"/>
+            <xsd:element name="mrn"     type="xsd:string"/>
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+
+      <xsd:element name="ValidationErrorFault">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element name="message" type="xsd:string"/>
+            <xsd:element name="field"   type="xsd:string"/>
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+
+    </xsd:schema>
+  </types>
+
+  <!-- ===== Messages ===== -->
+  <message name="GetPatientInput">
+    <part name="parameters" element="tns:GetPatientRequest"/>
+  </message>
+  <message name="GetPatientOutput">
+    <part name="parameters" element="tns:GetPatientResponse"/>
+  </message>
+  <message name="PatientNotFoundFault">
+    <part name="fault" element="tns:PatientNotFoundFault"/>
+  </message>
+
+  <message name="CreatePatientInput">
+    <part name="parameters" element="tns:CreatePatientRequest"/>
+  </message>
+  <message name="CreatePatientOutput">
+    <part name="parameters" element="tns:CreatePatientResponse"/>
+  </message>
+  <message name="DuplicateMRNFault">
+    <part name="fault" element="tns:DuplicateMRNFault"/>
+  </message>
+  <message name="ValidationErrorFault">
+    <part name="fault" element="tns:ValidationErrorFault"/>
+  </message>
+
+  <message name="UpdatePatientInput">
+    <part name="parameters" element="tns:UpdatePatientRequest"/>
+  </message>
+  <message name="UpdatePatientOutput">
+    <part name="parameters" element="tns:UpdatePatientResponse"/>
+  </message>
+
+  <message name="ListPatientsInput">
+    <part name="parameters" element="tns:ListPatientsRequest"/>
+  </message>
+  <message name="ListPatientsOutput">
+    <part name="parameters" element="tns:ListPatientsResponse"/>
+  </message>
+
+  <message name="DeletePatientInput">
+    <part name="parameters" element="tns:DeletePatientRequest"/>
+  </message>
+  <message name="DeletePatientOutput">
+    <part name="parameters" element="tns:DeletePatientResponse"/>
+  </message>
+
+  <!-- ===== PortType ===== -->
+  <portType name="PatientServicePortType">
+
+    <operation name="GetPatient">
+      <input  message="tns:GetPatientInput"/>
+      <output message="tns:GetPatientOutput"/>
+      <fault  name="PatientNotFound" message="tns:PatientNotFoundFault"/>
+    </operation>
+
+    <operation name="CreatePatient">
+      <input  message="tns:CreatePatientInput"/>
+      <output message="tns:CreatePatientOutput"/>
+      <fault  name="DuplicateMRN"    message="tns:DuplicateMRNFault"/>
+      <fault  name="ValidationError" message="tns:ValidationErrorFault"/>
+    </operation>
+
+    <operation name="UpdatePatient">
+      <input  message="tns:UpdatePatientInput"/>
+      <output message="tns:UpdatePatientOutput"/>
+      <fault  name="PatientNotFound" message="tns:PatientNotFoundFault"/>
+    </operation>
+
+    <operation name="ListPatients">
+      <input  message="tns:ListPatientsInput"/>
+      <output message="tns:ListPatientsOutput"/>
+    </operation>
+
+    <operation name="DeletePatient">
+      <input  message="tns:DeletePatientInput"/>
+      <output message="tns:DeletePatientOutput"/>
+      <fault  name="PatientNotFound" message="tns:PatientNotFoundFault"/>
+    </operation>
+
+  </portType>
+
+  <!-- ===== Binding ===== -->
+  <binding name="PatientServiceBinding" type="tns:PatientServicePortType">
+    <soap:binding style="document" transport="http://schemas.xmlsoap.org/soap/http"/>
+
+    <operation name="GetPatient">
+      <soap:operation soapAction="http://pulseboard.soap/patient/GetPatient"/>
+      <input>  <soap:body use="literal"/> </input>
+      <output> <soap:body use="literal"/> </output>
+      <fault name="PatientNotFound"> <soap:fault name="PatientNotFound" use="literal"/> </fault>
+    </operation>
+
+    <operation name="CreatePatient">
+      <soap:operation soapAction="http://pulseboard.soap/patient/CreatePatient"/>
+      <input>  <soap:body use="literal"/> </input>
+      <output> <soap:body use="literal"/> </output>
+      <fault name="DuplicateMRN">    <soap:fault name="DuplicateMRN"    use="literal"/> </fault>
+      <fault name="ValidationError"> <soap:fault name="ValidationError" use="literal"/> </fault>
+    </operation>
+
+    <operation name="UpdatePatient">
+      <soap:operation soapAction="http://pulseboard.soap/patient/UpdatePatient"/>
+      <input>  <soap:body use="literal"/> </input>
+      <output> <soap:body use="literal"/> </output>
+      <fault name="PatientNotFound"> <soap:fault name="PatientNotFound" use="literal"/> </fault>
+    </operation>
+
+    <operation name="ListPatients">
+      <soap:operation soapAction="http://pulseboard.soap/patient/ListPatients"/>
+      <input>  <soap:body use="literal"/> </input>
+      <output> <soap:body use="literal"/> </output>
+    </operation>
+
+    <operation name="DeletePatient">
+      <soap:operation soapAction="http://pulseboard.soap/patient/DeletePatient"/>
+      <input>  <soap:body use="literal"/> </input>
+      <output> <soap:body use="literal"/> </output>
+      <fault name="PatientNotFound"> <soap:fault name="PatientNotFound" use="literal"/> </fault>
+    </operation>
+
+  </binding>
+
+  <!-- ===== Service ===== -->
+  <service name="PatientService">
+    <port name="PatientServicePort" binding="tns:PatientServiceBinding">
+      <soap:address location="http://localhost:4802/patient"/>
+    </port>
+  </service>
+
+</definitions>

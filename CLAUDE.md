@@ -17,6 +17,9 @@ npm run db:migrate          # Apply pending migrations to the database
 # MCP server
 npm run start:testbot       # Start the MCP server (stdin/stdout transport)
 
+# SOAP fixture (Prompt 03)
+npm run start:pulseboard-soap  # SOAP service on :4802 — WSDL at http://localhost:4802/?wsdl
+
 # Tests (MCP only — webapp has no tests yet)
 npm run test:testbot        # Run all MCP unit tests (node --test)
 # Run a single test file:
@@ -26,6 +29,10 @@ cd testbot-mcp && node --test test/dispatch.test.js           # Dispatch router 
 cd testbot-mcp && node --test test/git-corpus.test.js         # Tier-0 commit-back
 cd testbot-mcp && node --test test/qa-contracts-isolation.test.js  # Per-finding isolation
 cd testbot-mcp && node --test test/partial-ingest.test.js     # Live partial ingest (Prompt 02)
+cd testbot-mcp && node --test test/soap-wsdl-parser.test.js   # WSDL parser (Prompt 03)
+cd testbot-mcp && node --test test/soap-codegen.test.js       # SoapUI XML + Groovy codegen (Prompt 03)
+cd testbot-mcp && node --test test/soap-groovy.test.js        # Groovy + fault template builders (Prompt 03)
+cd testbot-mcp && node --test test/soap-tier0.test.js         # SOAP Tier-0 entry point (Prompt 03)
 ```
 
 ## Environment Setup
@@ -61,6 +68,7 @@ Registers two MCP tools: `healix_test_my_app` and `healix_configure`.
 4. Parse PRD/AC from URLs via webapp `/api/parse-prd`
 5. Generate Playwright tests via webapp `/api/generate-tests` (sync or Inngest async)
 6. Write **Tier-0 QA contract specs** (`qa-contracts.js`) — one `healix-qac-<id>.spec.ts` per obligation. Skips files whose content hasn't changed. Preserved across resets so AI-tier failures don't wipe deterministic specs. `writtenCount` tracks new vs reused files to gate commit-back. After writing, emits stub partial findings (`buildTier0PartialFindings`) via `__partialFindingsReporter` → `PATCH /api/test-runs/:id/findings` so the dashboard shows P0/P1/P2 counts at ~90 s without waiting for test execution.
+   - **SOAP Tier-0** (`soap/soap-tier0.js`) — non-blocking companion step fired right after QA contracts: scans `projectPath` for `*.wsdl` files and, if found, emits a SoapUI 5.x XML project + Groovy scaffolds into `tests/soap/`. No-op when no WSDLs exist, so REST-only projects are unaffected.
 7. Inject credentials per role → `storageState` files in `.healix/` — `credentials-injector.js`
 8. Execute tests in **three tiers**:
    - Tier A: Public flows (no auth)
@@ -71,6 +79,14 @@ Registers two MCP tools: `healix_test_my_app` and `healix_configure`.
 11. **Dispatch findings** (`dispatch/router.js`) — non-fatal step; reads `.healix/dispatch.json`; routes P0/P1/P2/P3 findings to Slack, GitHub Issues, or Jira via exact-match severity; idempotency tracked in `.healix/dispatched_findings.json`
 12. Open dashboard deep-link
 13. **Commit-back** (optional) — if `commitTier0: true` + `githubToken` are passed as tool args, pushes newly-written Tier-0 specs to a `healix/tier0-<runId>` branch and opens a PR via `@octokit/rest` (`git-corpus.js`). Skipped when `writtenCount === 0`.
+
+**SOAP Tier-0 module** (`soap/`): activated when a project contains `.wsdl` files.
+
+- `wsdl-parser.js` — parses WSDL XML (via `fast-xml-parser`) into `{ serviceName, targetNamespace, endpoint, operations[], types }`. Operations carry `inputParts`, `outputParts`, and `faults[]`.
+- `soap-codegen.js` — consumes parsed WSDL and produces: (a) a SoapUI 5.x XML project with one happy-path + one fault testCase per fault type, plus boundary/filter/schema/malformed cases (target 14 active testCases); (b) `{ [filename]: content }` Groovy scaffold map.
+- `groovy-templates.js` — `buildPreambleGroovy` (XmlSlurper import, WSDL health check, `assertNoFault` closure), `buildTeardownGroovy` (summary log), `buildOperationGroovy` (per-op request + response assertion).
+- `soap-fault-templates.js` — XML builders for SoapUI assertion blocks: `buildFaultAssertionXml`, `buildNotFaultAssertionXml`, `buildXPathAssertion`, `buildHttpStatusAssertion`, `buildSoapEnvelopeForFault`.
+- `soap-tier0.js` — entry point (`runSoapTier0({ projectPath, outputDir })`). Recursively scans for `*.wsdl`, skips `node_modules`/`.git`, calls `writeSoapTestFiles` per service. Returns `{ written, writtenCount, filenames, paths, operations, services }` — same shape as `buildQaContractSpecFiles` for dashboard compat.
 
 **Failure triage** (`failure-triage/`): three-tier pipeline — deterministic `classifier.js` rules first, then AI via `agent-response.js`, with `error-remediations.js` producing patch suggestions. Playwright traces parsed by `trace-parser.js`.
 
@@ -138,7 +154,7 @@ Key tables: `profiles` (users), `testRuns` (execution results with JSONB fields 
 
 ## Testing Conventions
 
-MCP tests use Node.js built-in `node:test` runner — no Jest or Vitest. Test files in `testbot-mcp/test/`. Tests cover: pipeline phases, async job polling, failure triage classifier, AI response parsing, trace parsing, port pre-flight, credentials injection, artifact upload, defect taxonomy, dispatch router + adapters + idempotency, Tier-0 per-finding isolation, and git corpus commit-back.
+MCP tests use Node.js built-in `node:test` runner — no Jest or Vitest. Test files in `testbot-mcp/test/`. Tests cover: pipeline phases, async job polling, failure triage classifier, AI response parsing, trace parsing, port pre-flight, credentials injection, artifact upload, defect taxonomy, dispatch router + adapters + idempotency, Tier-0 per-finding isolation, git corpus commit-back, and SOAP/WSDL codegen (Prompt 03: `soap-wsdl-parser`, `soap-codegen`, `soap-groovy`, `soap-tier0`).
 
 Webapp has no tests yet. `webapp/tests/generated/` directory exists but is empty.
 
