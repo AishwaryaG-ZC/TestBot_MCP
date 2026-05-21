@@ -880,11 +880,152 @@ class WebappClient {
     );
   }
 
+  /**
+   * Create a test-run row at pipeline start so partial findings and heartbeats
+   * have a DB target throughout the run. Returns { id } on success or null on
+   * any failure — the pipeline proceeds without a testRunId if this call fails.
+   */
+  async initTestRun({ creationName, projectPath } = {}) {
+    if (!this.apiKey) return null;
+    try {
+      const result = await this._post(
+        '/api/test-runs/init',
+        { api_key: this.apiKey, creation_name: creationName || 'Untitled Run', project_path: projectPath || null },
+        { timeoutMs: 8_000 }
+      );
+      return result?.id ? { id: result.id } : null;
+    } catch (err) {
+      Logger.warn('WebappClient', 'initTestRun failed (non-blocking)', {
+        code: err?.code,
+        message: err?.message,
+      });
+      return null;
+    }
+  }
+
   async ingestTestRun(runPayload) {
     this._assertKey('/api/test-runs/ingest');
     return this._post('/api/test-runs/ingest', runPayload, {
       timeoutMs: ENDPOINT_TIMEOUTS_MS.ingest,
     });
+  }
+
+  async _patch(path, body, { timeoutMs } = {}) {
+    const url = `${this.dashboardUrl}${path}`;
+    const fetchFn = getFetch();
+    const limit = Number.isFinite(timeoutMs) ? timeoutMs : this.timeoutMs;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), limit);
+    let response;
+    try {
+      response = await fetchFn(url, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': this.apiKey || '',
+        },
+        body: JSON.stringify(body || {}),
+        signal: controller.signal,
+      });
+    } catch (networkErr) {
+      clearTimeout(timer);
+      if (networkErr.name === 'AbortError') {
+        const err = new Error(`Healix webapp call timed out after ${limit}ms: ${path}`);
+        err.code = 'WEBAPP_TIMEOUT';
+        throw err;
+      }
+      const err = new Error(`Cannot reach Healix webapp at ${url}: ${networkErr.message}`);
+      err.code = 'WEBAPP_UNREACHABLE';
+      throw err;
+    }
+    clearTimeout(timer);
+
+    let payload = null;
+    const rawText = await response.text().catch(() => '');
+    try { payload = rawText ? JSON.parse(rawText) : null; } catch { payload = null; }
+
+    if (!response.ok) {
+      const detail = payload?.error || rawText.slice(0, 400) || `HTTP ${response.status}`;
+      const err = new Error(`Healix webapp ${path} failed (${response.status}): ${detail}`);
+      err.code =
+        response.status === 401 ? 'INVALID_API_KEY' :
+        response.status === 404 ? 'RUN_NOT_FOUND' :
+        response.status >= 500 ? 'WEBAPP_SERVER_ERROR' : 'WEBAPP_ERROR';
+      err.status = response.status;
+      throw err;
+    }
+
+    return payload;
+  }
+
+  /**
+   * Emit partial (Tier-0) findings mid-run. Fire-and-forget — a failure here
+   * must not block the rest of the pipeline.
+   */
+  async patchFindings({ testRunId, findings } = {}) {
+    if (!this.apiKey || !testRunId || !Array.isArray(findings) || findings.length === 0) return null;
+    try {
+      return await this._patch(
+        `/api/test-runs/${encodeURIComponent(testRunId)}/findings`,
+        { findings },
+        { timeoutMs: 10_000 }
+      );
+    } catch (err) {
+      Logger.warn('WebappClient', 'patchFindings failed (non-blocking)', {
+        testRunId,
+        count: findings.length,
+        code: err?.code,
+        message: err?.message,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Send a heartbeat to prevent the run from being marked stalled. Fire-and-forget.
+   */
+  async patchHeartbeat({ testRunId, phase } = {}) {
+    if (!this.apiKey || !testRunId) return null;
+    try {
+      return await this._patch(
+        `/api/test-runs/${encodeURIComponent(testRunId)}/heartbeat`,
+        { phase: phase || undefined },
+        { timeoutMs: this._timeout('phase') }
+      );
+    } catch (err) {
+      Logger.warn('WebappClient', 'patchHeartbeat failed (non-blocking)', {
+        testRunId,
+        code: err?.code,
+        message: err?.message,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Signal run completion, merging any partial findings with the final set.
+   */
+  async patchComplete({ testRunId, status, finalFindings, report } = {}) {
+    if (!this.apiKey || !testRunId) return null;
+    try {
+      return await this._patch(
+        `/api/test-runs/${encodeURIComponent(testRunId)}/complete`,
+        {
+          status: status || 'failed',
+          final_findings: Array.isArray(finalFindings) ? finalFindings : [],
+          report: report || undefined,
+        },
+        { timeoutMs: 15_000 }
+      );
+    } catch (err) {
+      Logger.warn('WebappClient', 'patchComplete failed (non-blocking)', {
+        testRunId,
+        code: err?.code,
+        message: err?.message,
+      });
+      return null;
+    }
   }
 
   /**

@@ -22,9 +22,10 @@ npm run test:testbot        # Run all MCP unit tests (node --test)
 # Run a single test file:
 cd testbot-mcp && node --test test/classifier.test.js
 # Run specific test suites:
-cd testbot-mcp && node --test test/dispatch.test.js        # Dispatch router + taxonomy
-cd testbot-mcp && node --test test/git-corpus.test.js      # Tier-0 commit-back
+cd testbot-mcp && node --test test/dispatch.test.js           # Dispatch router + taxonomy
+cd testbot-mcp && node --test test/git-corpus.test.js         # Tier-0 commit-back
 cd testbot-mcp && node --test test/qa-contracts-isolation.test.js  # Per-finding isolation
+cd testbot-mcp && node --test test/partial-ingest.test.js     # Live partial ingest (Prompt 02)
 ```
 
 ## Environment Setup
@@ -59,14 +60,14 @@ Registers two MCP tools: `healix_test_my_app` and `healix_configure`.
 3. Browser exploration via `browser-use-driver.js` (Python subprocess) or Playwright heuristic fallback
 4. Parse PRD/AC from URLs via webapp `/api/parse-prd`
 5. Generate Playwright tests via webapp `/api/generate-tests` (sync or Inngest async)
-6. Write **Tier-0 QA contract specs** (`qa-contracts.js`) — one `healix-qac-<id>.spec.ts` per obligation. Skips files whose content hasn't changed. Preserved across resets so AI-tier failures don't wipe deterministic specs. `writtenCount` tracks new vs reused files to gate commit-back.
+6. Write **Tier-0 QA contract specs** (`qa-contracts.js`) — one `healix-qac-<id>.spec.ts` per obligation. Skips files whose content hasn't changed. Preserved across resets so AI-tier failures don't wipe deterministic specs. `writtenCount` tracks new vs reused files to gate commit-back. After writing, emits stub partial findings (`buildTier0PartialFindings`) via `__partialFindingsReporter` → `PATCH /api/test-runs/:id/findings` so the dashboard shows P0/P1/P2 counts at ~90 s without waiting for test execution.
 7. Inject credentials per role → `storageState` files in `.healix/` — `credentials-injector.js`
 8. Execute tests in **three tiers**:
    - Tier A: Public flows (no auth)
    - Tier B: Per-role authenticated flows
    - Tier C: API/backend tests
 9. Upload screenshots/videos/traces to Supabase Storage — `artifact-uploader.js`
-10. POST results to webapp `/api/test-runs/ingest`
+10. POST results to webapp `/api/test-runs/ingest` (kept for backward compat). The partial-ingest path also calls `PATCH /api/test-runs/:id/complete` to merge any previously-emitted partial findings with the final set.
 11. **Dispatch findings** (`dispatch/router.js`) — non-fatal step; reads `.healix/dispatch.json`; routes P0/P1/P2/P3 findings to Slack, GitHub Issues, or Jira via exact-match severity; idempotency tracked in `.healix/dispatched_findings.json`
 12. Open dashboard deep-link
 13. **Commit-back** (optional) — if `commitTier0: true` + `githubToken` are passed as tool args, pushes newly-written Tier-0 specs to a `healix/tier0-<runId>` branch and opens a PR via `@octokit/rest` (`git-corpus.js`). Skipped when `writtenCount === 0`.
@@ -94,6 +95,12 @@ Each adapter entry routes findings whose `severity` exactly matches its configur
 All AI calls, auth, and persistence live here. Key areas:
 
 - `src/app/api/` — API route groups. Most relevant: `generate-tests/`, `parse-prd/`, `analyze-failures/`, `test-runs/ingest/`, `exploration/plan/`, `mcp-auth/validate/`, `test-lists/`
+  - **Partial-ingest endpoints** (all authenticated via `x-api-key`):
+    - `POST  /api/test-runs/init` — creates a `running` row at pipeline start; returns `{ id }` used by all subsequent PATCH calls
+    - `PATCH /api/test-runs/[id]/phase` — updates `currentPhase` + `lastHeartbeatAt`
+    - `PATCH /api/test-runs/[id]/findings` — appends partial findings (deduped by `signature`) to `partial_findings` JSONB
+    - `PATCH /api/test-runs/[id]/heartbeat` — refreshes `last_heartbeat_at`; revives `stalled` runs back to `running`
+    - `PATCH /api/test-runs/[id]/complete` — merges `partial_findings` + `final_findings`, sets terminal status, clears `partial_findings`
 - `src/lib/db/` — Drizzle ORM schema + migrations. Schema changes require `db:generate` then `db:migrate`
 - `src/lib/test-generation/` — GPT orchestration: planner, per-agent generators, plan schema
 - `src/lib/inngest/functions/` — Async generation: orchestrator fans out to 5 parallel agents (smoke, frontend, api, workflow, error, expansion), writes partials as they complete
@@ -109,6 +116,15 @@ All AI calls, auth, and persistence live here. Key areas:
 Drizzle ORM over PostgreSQL (Supabase). Schema lives in `webapp/src/lib/db/schema.ts`. Migrations in `webapp/drizzle/`. Always run `db:generate` after schema changes before `db:migrate`.
 
 Key tables: `profiles` (users), `testRuns` (execution results with JSONB fields for report/analysis/triage), `testLists` (named collections), `testListItems` (items in a collection, soft FK to testRuns). The `testLists`/`testListItems` tables own a manually-tracked `testCount` that is incremented/decremented on item add/delete — it is not computed from a JOIN.
+
+`testRuns` has two partial-ingest columns added in migration `0014_partial_ingest.sql`:
+
+- `partial_findings jsonb` — accumulates stub findings before final ingest; cleared on complete
+- `last_heartbeat_at timestamptz` — updated on every heartbeat/phase call; used for `stalled` detection
+
+`status` can be `running | passed | failed | error | completed_with_findings | completed-partial | stalled`. The `stalled` flip is **lazy**: `GET /api/test-runs/[id]` checks `last_heartbeat_at` and flips inline if >5 minutes have elapsed (no cron needed).
+
+**Migration note:** `db:migrate` is broken for this repo (missing `0000_gray_agent_brand.sql` journal entry). Apply schema changes directly via the Supabase Dashboard SQL Editor using the `.sql` file in `webapp/drizzle/`.
 
 **API route conventions:**
 

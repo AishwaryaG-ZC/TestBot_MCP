@@ -91,6 +91,8 @@ export const testRuns = pgTable(
     tierResults: jsonb('tier_results'),
     pipelineError: jsonb('pipeline_error'),
     findingSummary: jsonb('finding_summary').$type<FindingSummary>(),
+    partialFindings: jsonb('partial_findings'),
+    lastHeartbeatAt: timestamp('last_heartbeat_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
   },

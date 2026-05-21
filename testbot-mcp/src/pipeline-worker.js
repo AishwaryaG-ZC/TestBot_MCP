@@ -3070,6 +3070,20 @@ function setDurablePhaseReporter(fn) {
   __durablePhaseReporter = typeof fn === 'function' ? fn : null;
 }
 
+// Optional heartbeat reporter — called on every updateStatus tick to keep
+// `test_runs.last_heartbeat_at` fresh for stalled-run detection.
+let __heartbeatReporter = null;
+function setHeartbeatReporter(fn) {
+  __heartbeatReporter = typeof fn === 'function' ? fn : null;
+}
+
+// Optional partial-findings reporter — called after Tier-0 contracts are written
+// so the dashboard can show stub findings before test execution completes.
+let __partialFindingsReporter = null;
+function setPartialFindingsReporter(fn) {
+  __partialFindingsReporter = typeof fn === 'function' ? fn : null;
+}
+
 /**
  * Circular-reference-safe JSON serialiser for status payloads.
  * Handles Buffers, Errors, BigInts, and circular refs — all of which can appear
@@ -3110,9 +3124,46 @@ function updateStatus(statusDir, phase, data, telemetryReporter = null) {
     if (__durablePhaseReporter) {
       try { __durablePhaseReporter(payload); } catch { /* non-blocking */ }
     }
+    if (__heartbeatReporter) {
+      try { __heartbeatReporter(phase); } catch { /* non-blocking */ }
+    }
   } catch (e) {
     Logger.error('PipelineWorker', 'Failed to write status', e);
   }
+}
+
+/**
+ * Build stub partial findings from the tier-0 generatedContracts map so the
+ * dashboard can show P0/P1/P2 counts before test execution completes.
+ * Each contract is represented as a "pending" finding — it becomes a real
+ * finding (pass or fail) only after the test run ingests.
+ */
+function buildTier0PartialFindings(generatedContracts) {
+  if (!generatedContracts || typeof generatedContracts !== 'object') return [];
+  const SEVERITY_MAP = {
+    rbacContracts: 'P0',
+    filterContracts: 'P1',
+    formValidationContracts: 'P1',
+    statusCodeContracts: 'P1',
+    boundaryValidationContracts: 'P1',
+    a11yContracts: 'P2',
+  };
+  const findings = [];
+  for (const [key, ids] of Object.entries(generatedContracts)) {
+    if (!Array.isArray(ids)) continue;
+    const severity = SEVERITY_MAP[key] || 'P3';
+    for (const id of ids) {
+      findings.push({
+        signature: `tier0-${key}-${id}`,
+        severity,
+        title: `[Tier-0] ${id}`,
+        status: 'pending',
+        findingType: 'tier0_contract_ready',
+        category: key.replace('Contracts', ''),
+      });
+    }
+  }
+  return findings;
 }
 
 function classifyErrorCode(error) {
@@ -8423,6 +8474,17 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
             qaContractQuestions: deterministicTier0Pack.qaContractQuestions,
           },
         });
+
+        // Emit stub partial findings for each tier-0 contract so the dashboard
+        // can show a P0/P1/P2 count before test execution completes.
+        if (__partialFindingsReporter) {
+          try {
+            const partialFindings = buildTier0PartialFindings(deterministicTier0Pack.generatedContracts);
+            if (partialFindings.length > 0) {
+              __partialFindingsReporter(partialFindings);
+            }
+          } catch { /* non-blocking */ }
+        }
       }
     }
     const saasResult = await maybeGenerateViaSaaS({
@@ -8654,6 +8716,10 @@ async function runPipeline(config, runId) {
   const durableClient = process.env.HEALIX_API_KEY
     ? new WebappClient({ apiKey: process.env.HEALIX_API_KEY })
     : null;
+  // testRunId is the DB UUID for the in-flight run — obtained from the init
+  // call below. Used for partial-findings and heartbeat PATCH endpoints.
+  let testRunId = null;
+
   if (durableClient) {
     setDurablePhaseReporter((payload) => {
       durableClient.reportPhase({
@@ -8670,9 +8736,29 @@ async function runPipeline(config, runId) {
         metadata: { success },
       }).catch(() => undefined);
     });
+
+    // Create the test_runs row early so partial findings and heartbeats have
+    // a DB target. Fire-and-forget: if this fails the pipeline keeps running.
+    durableClient.initTestRun({
+      creationName: config.projectName || 'Untitled Run',
+      projectPath: config.projectPath || null,
+    }).then((result) => {
+      if (result?.id) {
+        testRunId = result.id;
+        // Wire heartbeat and partial-findings reporters now that we have the row.
+        setHeartbeatReporter((phase) => {
+          durableClient.patchHeartbeat({ testRunId, phase }).catch(() => undefined);
+        });
+        setPartialFindingsReporter((findings) => {
+          durableClient.patchFindings({ testRunId, findings }).catch(() => undefined);
+        });
+      }
+    }).catch(() => undefined);
   } else {
     setDurablePhaseReporter(null);
     setStageBudgetReporter(null);
+    setHeartbeatReporter(null);
+    setPartialFindingsReporter(null);
   }
 
   // Kill any leftover Healix-started dev server from a previous run.
@@ -10375,6 +10461,16 @@ async function runPipeline(config, runId) {
       runId,
     });
 
+    // Merge partial findings with final findings and flip status to terminal.
+    if (durableClient && testRunId) {
+      const finalStatus = testResults.failed > 0 ? 'completed_with_findings' : 'passed';
+      durableClient.patchComplete({
+        testRunId,
+        status: finalStatus,
+        finalFindings: report.qaFindings || [],
+      }).catch(() => undefined);
+    }
+
     // Commit-back: push newly-written Tier-0 specs and open a PR when the
     // caller opted in. Skipped when writtenCount === 0 (surface unchanged).
     if (config.commitTier0 && config.githubToken && (deterministicTier0Pack?.writtenCount || 0) > 0) {
@@ -10491,6 +10587,11 @@ async function runPipeline(config, runId) {
         remainingMs: getBudgetRemainingMs(runBudget),
       },
     }, telemetryReporter);
+
+    // Mark the run as errored so the dashboard flips out of "running".
+    if (durableClient && testRunId) {
+      durableClient.patchComplete({ testRunId, status: 'error' }).catch(() => undefined);
+    }
 
     try {
       const reportGen = new ReportGenerator();
@@ -10776,4 +10877,8 @@ module.exports = {
   boundDecisionMetadata,
   pickAgentsForRun,
   rescuePartialGeneration,
+  buildTier0PartialFindings,
+  setHeartbeatReporter,
+  setPartialFindingsReporter,
+  updateStatus,
 };
