@@ -18,9 +18,13 @@ npm run db:migrate          # Apply pending migrations to the database
 npm run start:testbot       # Start the MCP server (stdin/stdout transport)
 
 # Tests (MCP only — webapp has no tests yet)
-npm run test:testbot        # Run all 27 MCP unit tests (node --test)
+npm run test:testbot        # Run all MCP unit tests (node --test)
 # Run a single test file:
 cd testbot-mcp && node --test test/classifier.test.js
+# Run specific test suites:
+cd testbot-mcp && node --test test/dispatch.test.js        # Dispatch router + taxonomy
+cd testbot-mcp && node --test test/git-corpus.test.js      # Tier-0 commit-back
+cd testbot-mcp && node --test test/qa-contracts-isolation.test.js  # Per-finding isolation
 ```
 
 ## Environment Setup
@@ -28,7 +32,7 @@ cd testbot-mcp && node --test test/classifier.test.js
 Copy `.env.example` to `webapp/.env.local`. Required vars:
 
 | Var | Where | Purpose |
-|-----|-------|---------|
+| --- | ----- | ------- |
 | `DATABASE_URL` | webapp | PostgreSQL connection string |
 | `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | webapp | Auth + artifact storage |
 | `OPENAI_API_KEY` | webapp | GPT calls — server-side only, never in MCP |
@@ -49,21 +53,41 @@ Thin orchestration client installed in developer IDEs. Entry: `bin/healix-mcp.js
 Registers two MCP tools: `healix_test_my_app` and `healix_configure`.
 
 **Pipeline flow** (`pipeline-worker.js`):
+
 1. Auto-detect project settings (port, framework, start command) — `auto-detector.js`
 2. Launch app under test via `multi-service-starter.js`
 3. Browser exploration via `browser-use-driver.js` (Python subprocess) or Playwright heuristic fallback
 4. Parse PRD/AC from URLs via webapp `/api/parse-prd`
 5. Generate Playwright tests via webapp `/api/generate-tests` (sync or Inngest async)
-6. Inject credentials per role → `storageState` files in `.healix/` — `credentials-injector.js`
-7. Execute tests in **three tiers**:
+6. Write **Tier-0 QA contract specs** (`qa-contracts.js`) — one `healix-qac-<id>.spec.ts` per obligation. Skips files whose content hasn't changed. Preserved across resets so AI-tier failures don't wipe deterministic specs. `writtenCount` tracks new vs reused files to gate commit-back.
+7. Inject credentials per role → `storageState` files in `.healix/` — `credentials-injector.js`
+8. Execute tests in **three tiers**:
    - Tier A: Public flows (no auth)
    - Tier B: Per-role authenticated flows
    - Tier C: API/backend tests
-8. Upload screenshots/videos/traces to Supabase Storage — `artifact-uploader.js`
-9. POST results to webapp `/api/test-runs/ingest`
-10. Open dashboard deep-link
+9. Upload screenshots/videos/traces to Supabase Storage — `artifact-uploader.js`
+10. POST results to webapp `/api/test-runs/ingest`
+11. **Dispatch findings** (`dispatch/router.js`) — non-fatal step; reads `.healix/dispatch.json`; routes P0/P1/P2/P3 findings to Slack, GitHub Issues, or Jira via exact-match severity; idempotency tracked in `.healix/dispatched_findings.json`
+12. Open dashboard deep-link
+13. **Commit-back** (optional) — if `commitTier0: true` + `githubToken` are passed as tool args, pushes newly-written Tier-0 specs to a `healix/tier0-<runId>` branch and opens a PR via `@octokit/rest` (`git-corpus.js`). Skipped when `writtenCount === 0`.
 
 **Failure triage** (`failure-triage/`): three-tier pipeline — deterministic `classifier.js` rules first, then AI via `agent-response.js`, with `error-remediations.js` producing patch suggestions. Playwright traces parsed by `trace-parser.js`.
+
+**Defect taxonomy** (`report-generator.js`): `inferQaCategory` reads the `[CAT:xxx]` tag from the **test title only** — suite-level tags from enclosing `describe` blocks are intentionally ignored to prevent mis-tagging (e.g. an a11y test inside a `[CAT:api_auth]` suite must not be classified as `api_auth`). Severity is derived from category: `api_auth` → P0, `filter_logic/api_contract/form_validation/boundary` → P1, `a11y` → P2, `other` → P3.
+
+**Dispatch config** (`.healix/dispatch.json` in the project under test):
+
+```json
+{
+  "adapters": [
+    { "type": "slack",  "severity": "P0", "webhook": "https://hooks.slack.com/..." },
+    { "type": "github", "severity": "P1", "owner": "org", "repo": "repo", "token": "ghp_..." },
+    { "type": "jira",   "severity": "P2", "baseUrl": "https://org.atlassian.net", "email": "...", "apiToken": "...", "project": "KEY" }
+  ]
+}
+```
+
+Each adapter entry routes findings whose `severity` exactly matches its configured value. Multiple adapters for the same severity are supported. Findings already dispatched are recorded in `.healix/dispatched_findings.json` and skipped on re-runs.
 
 ### `webapp/` — Next.js app (deployed to Vercel)
 
@@ -87,6 +111,7 @@ Drizzle ORM over PostgreSQL (Supabase). Schema lives in `webapp/src/lib/db/schem
 Key tables: `profiles` (users), `testRuns` (execution results with JSONB fields for report/analysis/triage), `testLists` (named collections), `testListItems` (items in a collection, soft FK to testRuns). The `testLists`/`testListItems` tables own a manually-tracked `testCount` that is incremented/decremented on item add/delete — it is not computed from a JOIN.
 
 **API route conventions:**
+
 - All routes call `getCurrentUser()` and return 401 if unauthenticated
 - Ownership is validated by adding `userId` to every WHERE clause — never trust an ID from the request body alone
 - DB returns camelCase; API responses map to snake_case to match `src/lib/types/database.ts`
@@ -97,7 +122,7 @@ Key tables: `profiles` (users), `testRuns` (execution results with JSONB fields 
 
 ## Testing Conventions
 
-MCP tests use Node.js built-in `node:test` runner — no Jest or Vitest. Test files in `testbot-mcp/test/`. The 27 tests cover: pipeline phases, async job polling, failure triage classifier, AI response parsing, trace parsing, port pre-flight, credentials injection, and artifact upload.
+MCP tests use Node.js built-in `node:test` runner — no Jest or Vitest. Test files in `testbot-mcp/test/`. Tests cover: pipeline phases, async job polling, failure triage classifier, AI response parsing, trace parsing, port pre-flight, credentials injection, artifact upload, defect taxonomy, dispatch router + adapters + idempotency, Tier-0 per-finding isolation, and git corpus commit-back.
 
 Webapp has no tests yet. `webapp/tests/generated/` directory exists but is empty.
 
