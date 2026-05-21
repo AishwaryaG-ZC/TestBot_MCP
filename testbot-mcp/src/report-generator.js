@@ -440,9 +440,11 @@ class ReportGenerator {
   }
 
   inferQaCategory(test = {}) {
-    const rawText = `${test.title || ''} ${test.file || ''} ${test.suite || ''}`;
-    const taggedCategory = this.categoryFromCatTag(rawText);
+    // Only check [CAT:xxx] in the test's own title — the suite tag comes from the enclosing
+    // describe block and reflects the block's contract type, not this test's semantic category.
+    const taggedCategory = this.categoryFromCatTag(test.title || '');
     if (taggedCategory) return taggedCategory;
+    const rawText = `${test.title || ''} ${test.file || ''} ${test.suite || ''}`;
     const text = rawText.toLowerCase();
     if (/form_validation|form-validation|boundary|validation|required|string|whitespace|api_negative/.test(text)) return 'validation';
     if (/a11y|accessib|aria|interactive/.test(text)) return 'a11y';

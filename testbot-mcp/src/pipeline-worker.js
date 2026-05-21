@@ -10296,7 +10296,26 @@ async function runPipeline(config, runId) {
     }
 
     // -------------------------------------------------------
-    // 8. Open dashboard
+    // 8. Dispatch findings (Slack / GitHub / Jira)
+    // -------------------------------------------------------
+    try {
+      const { dispatchFindings } = require('./dispatch/router');
+      const dispatchResult = await dispatchFindings(
+        report.qaFindings || [],
+        config.projectPath
+      );
+      if (!dispatchResult.skipped && dispatchResult.dispatched > 0) {
+        Logger.info('PipelineWorker', 'Dispatch complete', {
+          dispatched: dispatchResult.dispatched,
+          results: dispatchResult.results,
+        });
+      }
+    } catch (dispatchErr) {
+      Logger.warn('PipelineWorker', 'Dispatch failed (non-fatal)', { error: dispatchErr?.message });
+    }
+
+    // -------------------------------------------------------
+    // 9. Open dashboard
     // -------------------------------------------------------
     let dashboardUrl = null;
     if (config.openDashboard) {
