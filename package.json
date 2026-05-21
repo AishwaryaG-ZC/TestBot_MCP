@@ -11,7 +11,9 @@
     "compat:matrix": "node scripts/run-compat-matrix.mjs",
     "docker:build": "./webapp/docker/build.sh",
     "docker:run": "./webapp/docker/build.sh --run",
-    "docker:migrate-run": "./webapp/docker/build.sh --run --migrate"
+    "docker:migrate-run": "./webapp/docker/build.sh --run --migrate",
+    "test:soap": "npm run test -w @healix/mcp -- --test-name-pattern soap",
+    "start:pulseboard-soap": "node compat-fixtures/pulseboard-soap/src/server.js"
   },
   "workspaces": [
     "testbot-mcp",

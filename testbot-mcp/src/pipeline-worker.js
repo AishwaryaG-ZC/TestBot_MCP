@@ -44,6 +44,7 @@ const {
   buildQaContractQuestions,
 } = require('./qa-contracts');
 const { detectGitContext, commitTier0Branch, createTier0PR } = require('./git-corpus');
+const { runSoapTier0 } = require('./soap/soap-tier0');
 const Logger = require('./logger');
 const MCPTelemetryReporter = require('./mcp-telemetry');
 
@@ -7444,6 +7445,23 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       roles,
       testType: config.testType,
     });
+
+    // SOAP Tier-0: detect WSDLs and emit SoapUI project + Groovy scaffolds (non-blocking)
+    runSoapTier0({
+      projectPath: config.projectPath,
+      outputDir: require('path').join(config.projectPath, 'tests', 'soap'),
+    }).then((soapResult) => {
+      if (soapResult.writtenCount > 0) {
+        Logger.info('PipelineWorker', '[soap-tier0] SOAP test files written', {
+          writtenCount: soapResult.writtenCount,
+          operations:   soapResult.operations,
+          services:     soapResult.services,
+        });
+      }
+    }).catch((soapErr) => {
+      Logger.warn('PipelineWorker', '[soap-tier0] SOAP codegen skipped', { reason: soapErr.message });
+    });
+
     if (qaContractPack.written) {
       Logger.info('PipelineWorker', 'Wrote deterministic QA contract spec', {
         filename: qaContractPack.filename,

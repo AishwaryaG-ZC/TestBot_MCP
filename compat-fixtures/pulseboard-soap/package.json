@@ -1,0 +1,15 @@
+{
+  "name": "pulseboard-soap",
+  "version": "1.0.0",
+  "description": "Sample SOAP service fixture for Healix SOAP/WSDL codegen testing",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
