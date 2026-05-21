@@ -1289,6 +1289,46 @@ ${contracts.map((contract) => {
 `;
 }
 
+function isTier0SpecFilename(name) {
+  return typeof name === 'string' && name.startsWith('healix-qac-') && /\.spec\.ts$/.test(name);
+}
+
+// Returns one spec object per obligation: { filename, content, id, contractType, contractIds }.
+// Filename pattern: healix-qac-<id>.spec.ts — stable across runs for the same surface.
+function buildQaContractSpecFiles({ qaContracts = {}, roles = [], testType = 'both' } = {}) {
+  const normalizedType = String(testType || 'both').toLowerCase();
+  const includeApi = normalizedType !== 'frontend';
+  const includeUi = normalizedType !== 'backend';
+  const verifiedRoleCount = getVerifiedRoleCount(roles);
+  const obligations = runnableQaObligations(qaContracts, roles);
+  const header = `// ${GENERATED_BY}. Do not edit by hand.\nimport { test, expect } from '@playwright/test';\n\n${buildContractRuntimeHelpers()}\n`;
+  const specs = [];
+
+  const emit = (contract, body, contractType) => {
+    if (!body || !body.trim()) return;
+    specs.push({
+      filename: `healix-qac-${contract.id}.spec.ts`,
+      content: header + body + '\n',
+      id: contract.id,
+      contractType,
+      contractIds: [contract.id],
+    });
+  };
+
+  if (includeApi) {
+    for (const c of obligations.filters) emit(c, buildFilterContractTests([c]), 'filter');
+    for (const c of obligations.statuses) emit(c, buildStatusContractTests([c], roles), 'status');
+    for (const c of obligations.boundaries) emit(c, buildBoundaryContractTests([c], roles), 'boundary');
+    for (const c of obligations.rbac) emit(c, buildRbacContractTests([c], roles), 'rbac');
+  }
+  if (includeUi) {
+    for (const c of obligations.forms) emit(c, buildFormContractTests([c], roles), 'form');
+    for (const c of obligations.a11y) emit(c, buildA11yContractTests([c], verifiedRoleCount), 'a11y');
+  }
+
+  return specs;
+}
+
 function buildQaContractSpec({ qaContracts = {}, roles = [], testType = 'both' } = {}) {
   const normalizedType = String(testType || 'both').toLowerCase();
   const includeApi = normalizedType !== 'frontend';
@@ -1335,37 +1375,65 @@ ${buildRbacContractTests(rbacContracts, roles)}
 
 function ensureQaContractSpec({ projectPath, context = {}, roles = [], testType = 'both' } = {}) {
   const qaContracts = context.qaContracts || {};
-  const spec = buildQaContractSpec({ qaContracts, roles, testType });
+  const specs = buildQaContractSpecFiles({ qaContracts, roles, testType });
   const questions = buildQaContractQuestions(qaContracts);
   const summary = summarizeQaContracts(qaContracts);
+
+  const byType = (type) => specs.filter((s) => s.contractType === type).flatMap((s) => s.contractIds);
   const result = {
     written: false,
+    writtenCount: 0,
+    filenames: [],
+    paths: [],
     filename: null,
     path: null,
     generatedTests: 0,
     generatedContracts: {
-      filterContracts: spec?.filterContracts || [],
-      formValidationContracts: spec?.formValidationContracts || [],
-      a11yContracts: spec?.a11yContracts || [],
-      statusCodeContracts: spec?.statusCodeContracts || [],
-      boundaryValidationContracts: spec?.boundaryValidationContracts || [],
-      rbacContracts: spec?.rbacContracts || [],
+      filterContracts: byType('filter'),
+      formValidationContracts: byType('form'),
+      a11yContracts: byType('a11y'),
+      statusCodeContracts: byType('status'),
+      boundaryValidationContracts: byType('boundary'),
+      rbacContracts: byType('rbac'),
     },
     qaContractSummary: summary,
     qaContractQuestions: questions,
     qaContractWarnings: [],
   };
-  if (!spec) {
-    return result;
-  }
+
+  if (specs.length === 0) return result;
+
   const generatedDir = path.join(projectPath, 'tests', 'generated');
   fs.mkdirSync(generatedDir, { recursive: true });
-  const targetPath = path.join(generatedDir, spec.filename);
-  fs.writeFileSync(targetPath, spec.content, 'utf-8');
-  result.written = true;
-  result.filename = spec.filename;
-  result.path = targetPath;
-  result.generatedTests = (spec.content.match(/\btest\s*\(/g) || []).length;
+
+  // Remove stale per-finding files whose obligation no longer exists in the surface.
+  const currentFilenames = new Set(specs.map((s) => s.filename));
+  try {
+    for (const entry of fs.readdirSync(generatedDir, { withFileTypes: true })) {
+      if (isTier0SpecFilename(entry.name) && !currentFilenames.has(entry.name)) {
+        fs.rmSync(path.join(generatedDir, entry.name), { force: true });
+      }
+    }
+  } catch { /* dir may not exist on first run */ }
+
+  let totalTests = 0;
+  for (const spec of specs) {
+    const targetPath = path.join(generatedDir, spec.filename);
+    const testCount = (spec.content.match(/\btest\s*\(/g) || []).length;
+    totalTests += testCount;
+    result.filenames.push(spec.filename);
+    result.paths.push(targetPath);
+    if (fs.existsSync(targetPath) && fs.readFileSync(targetPath, 'utf-8') === spec.content) {
+      continue; // surface unchanged for this obligation — reuse existing file
+    }
+    fs.writeFileSync(targetPath, spec.content, 'utf-8');
+    result.writtenCount++;
+  }
+
+  result.written = result.filenames.length > 0;
+  result.filename = result.filenames[0] || null;
+  result.path = result.paths[0] || null;
+  result.generatedTests = totalTests;
   return result;
 }
 
@@ -1423,6 +1491,8 @@ module.exports = {
   summarizeQaContracts,
   buildQaContractQuestions,
   buildQaContractSpec,
+  buildQaContractSpecFiles,
+  isTier0SpecFilename,
   ensureQaContractSpec,
   auditQaContractCoverage,
 };

@@ -466,6 +466,7 @@ function StatusBadge({ status }: { status: string }) {
 
 function runStatusLabel(status: string | null | undefined): string {
   if (status === 'completed_with_findings') return 'completed with findings';
+  if (status === 'completed-partial') return 'partial (Tier-0 only)';
   return status || 'unknown';
 }
 
@@ -474,6 +475,7 @@ function runStatusClass(status: string | null | undefined): string {
   if (status === 'failed') return 'bg-red-500/10 border border-red-500/20 text-red-400';
   if (status === 'running') return 'bg-blue-500/10 border border-blue-500/20 text-blue-400';
   if (status === 'completed_with_findings') return 'bg-amber-500/10 border border-amber-500/25 text-amber-300';
+  if (status === 'completed-partial') return 'bg-orange-500/10 border border-orange-500/25 text-orange-300';
   return 'bg-amber-500/10 border border-amber-500/20 text-amber-400';
 }
 

@@ -641,6 +641,8 @@ class HealixMCPServer {
         : (Array.isArray(context.services) ? context.services : undefined),
       apiOnly: typeof params.apiOnly === 'boolean' ? params.apiOnly : detectedApiOnly,
       jira: params.jira,
+      commitTier0: params.commitTier0 === true,
+      githubToken: params.githubToken || null,
       openDashboard: params.openDashboard !== false,
       generationMode: resolvedGenerationMode,
       artifactMode: params.artifactMode || 'hybrid',
@@ -1069,6 +1071,8 @@ class HealixMCPServer {
           resultMerge: RESULT_MERGE_OPTIONS_SCHEMA.describe('Result merge options'),
           logRedaction: LOG_REDACTION_OPTIONS_SCHEMA.describe('Log redaction controls'),
           force: z.boolean().optional().describe('Start a fresh run even if a very recent run for this project is still in-flight or just failed. Default false — without this flag, a repeat invocation within 10 minutes returns the prior run\'s status/error instead of re-opening the configurator, so an agent retry loop does not force the user to re-enter the same settings.'),
+          commitTier0: z.boolean().optional().describe('Commit newly-written Tier-0 QA contract specs back to the repo and open a GitHub PR. Skipped automatically on subsequent runs where all specs are reused unchanged. Requires githubToken.'),
+          githubToken: z.string().optional().describe('GitHub personal access token (repo scope) used to push the Tier-0 branch and open the PR. Only required when commitTier0 is true.'),
         }),
       },
       async (args, extra) => {

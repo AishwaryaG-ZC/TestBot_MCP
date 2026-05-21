@@ -43,6 +43,7 @@ const {
   summarizeQaContracts,
   buildQaContractQuestions,
 } = require('./qa-contracts');
+const { detectGitContext, commitTier0Branch, createTier0PR } = require('./git-corpus');
 const Logger = require('./logger');
 const MCPTelemetryReporter = require('./mcp-telemetry');
 
@@ -92,6 +93,9 @@ const STRICT_AI_REQUIRED_CATEGORIES = [
 ];
 
 const GENERATED_SPEC_FILE_PATTERN = /\.(?:spec|test)\.(?:ts|js|mts|mjs|cts|cjs)$/i;
+// Matches per-finding tier-0 spec files: healix-qac-<id>.spec.ts
+const TIER0_SPEC_PATTERN = /^healix-qac-.+\.spec\.ts$/;
+function isTier0Spec(name) { return TIER0_SPEC_PATTERN.test(name); }
 const GENERATED_SPEC_FILENAME_PATTERN = /[A-Za-z0-9_.-]+\.(?:spec|test)\.(?:ts|js|mts|mjs|cts|cjs)\b/g;
 
 const CURSOR_FIXTURE_BASENAME = '__healix-fixture';
@@ -3647,7 +3651,16 @@ function resolveFailureAnalysisProvider() {
 
 function resetGeneratedTestsDir(projectPath) {
   const testsDir = path.join(projectPath, 'tests', 'generated');
-  fs.rmSync(testsDir, { recursive: true, force: true });
+  if (fs.existsSync(testsDir)) {
+    for (const entry of fs.readdirSync(testsDir, { withFileTypes: true })) {
+      if (!isTier0Spec(entry.name)) {
+        fs.rmSync(path.join(testsDir, entry.name), { recursive: true, force: true });
+      }
+    }
+    // Remove the old monolithic spec left by runs before per-finding naming was introduced.
+    const legacy = path.join(testsDir, 'healix-qa-contracts.spec.ts');
+    if (fs.existsSync(legacy)) fs.rmSync(legacy, { force: true });
+  }
   ensureDir(testsDir);
   return testsDir;
 }
@@ -8252,6 +8265,17 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           if (!recoveredPack.written || recoveredPack.generatedTests <= 0) {
             throw new Error('No runnable deterministic QA contract tests were available for rescue.');
           }
+          // Remove any broken AI-generated partials so validation only sees Tier-0.
+          // AI partials may have been written before the failure and would cause
+          // compile errors that mask a perfectly valid Tier-0 spec.
+          const tier0Dir = path.join(config.projectPath, 'tests', 'generated');
+          if (fs.existsSync(tier0Dir)) {
+            for (const entry of fs.readdirSync(tier0Dir, { withFileTypes: true })) {
+              if (!isTier0Spec(entry.name)) {
+                fs.rmSync(path.join(tier0Dir, entry.name), { recursive: true, force: true });
+              }
+            }
+          }
           generationMeta.fixtureWiring = applyFixtureWiring(`${generatorName}-qa-contracts`);
           const validation = await runValidation(`${generatorName}-qa-contracts`);
           generationMeta.provider = generatorName;
@@ -10331,6 +10355,45 @@ async function runPipeline(config, runId) {
       dashboard: dashboardUrl || report.url,
       runId,
     });
+
+    // Commit-back: push newly-written Tier-0 specs and open a PR when the
+    // caller opted in. Skipped when writtenCount === 0 (surface unchanged).
+    if (config.commitTier0 && config.githubToken && (deterministicTier0Pack?.writtenCount || 0) > 0) {
+      try {
+        const gitCtx = await detectGitContext(config.projectPath);
+        if (gitCtx) {
+          const branch = await commitTier0Branch(
+            config.projectPath,
+            deterministicTier0Pack.paths,
+            runId,
+          );
+          const pr = await createTier0PR(
+            config.githubToken,
+            gitCtx.owner,
+            gitCtx.repo,
+            branch,
+            gitCtx.branch,
+            deterministicTier0Pack.writtenCount,
+          );
+          updateStatus(statusDir, 'tier0_committed', {
+            runId,
+            prUrl: pr.html_url,
+            prNumber: pr.number,
+            branch,
+            filesCommitted: deterministicTier0Pack.writtenCount,
+          }, telemetryReporter);
+          Logger.info('PipelineWorker', 'Tier-0 specs committed and PR opened', {
+            prUrl: pr.html_url,
+            branch,
+            filesCommitted: deterministicTier0Pack.writtenCount,
+          });
+        } else {
+          Logger.warn('PipelineWorker', 'Tier-0 commit-back skipped — project is not a GitHub-tracked git repo');
+        }
+      } catch (commitErr) {
+        Logger.warn('PipelineWorker', 'Tier-0 commit-back failed (non-fatal)', { reason: commitErr.message });
+      }
+    }
 
     // Stop any secondary (monorepo) services we started — primary server is
     // handled by playwright.runTests()'s own teardown (or by our pre-start
