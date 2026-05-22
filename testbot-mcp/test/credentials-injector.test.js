@@ -136,6 +136,36 @@ test('credential injector treats discovered successIndicator as advisory', () =>
   }), false);
 });
 
+test('credential injector accepts login when form fields disappear with no error (SPA same-URL flow)', () => {
+  // SPA that stays on "/" after login: URL unchanged, no auth-named cookie,
+  // no visible success text — but the login form is gone.
+  assert.equal(shouldAcceptLoginVerification({
+    urlChanged: false,
+    successIndicatorVisible: false,
+    authStateEvidence: { hasAuthState: false },
+    failureVisible: false,
+    formGone: true,
+  }), true, 'form gone without error should accept');
+
+  // failureVisible overrides even when form is gone
+  assert.equal(shouldAcceptLoginVerification({
+    urlChanged: false,
+    successIndicatorVisible: false,
+    authStateEvidence: { hasAuthState: false },
+    failureVisible: true,
+    formGone: true,
+  }), false, 'failure text must still block acceptance');
+
+  // formGone=false with no other signals → still reject
+  assert.equal(shouldAcceptLoginVerification({
+    urlChanged: false,
+    successIndicatorVisible: false,
+    authStateEvidence: { hasAuthState: false },
+    failureVisible: false,
+    formGone: false,
+  }), false, 'no signals at all should reject');
+});
+
 test('credential injector checks durable logged-in markers and username text', () => {
   const locators = buildSuccessLocators(
     { successIndicator: 'nav >> text=Signed in' },

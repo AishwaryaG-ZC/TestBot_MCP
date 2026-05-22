@@ -254,14 +254,26 @@ async function fillFirstVisible(page, selectors = [], value, timeoutMs = 10_000)
   };
 }
 
+async function areLoginFieldsGone(page, userSelectors = [], passSelectors = [], timeout = 800) {
+  const fieldsToCheck = unique([...userSelectors, ...passSelectors]).slice(0, 6);
+  for (const selector of fieldsToCheck) {
+    try {
+      const visible = await page.locator(selector).first().isVisible({ timeout }).catch(() => false);
+      if (visible) return false;
+    } catch { /* try next */ }
+  }
+  return fieldsToCheck.length > 0;
+}
+
 function shouldAcceptLoginVerification({
   urlChanged = false,
   successIndicatorVisible = false,
   authStateEvidence = null,
   failureVisible = false,
+  formGone = false,
 } = {}) {
   if (failureVisible) return false;
-  return Boolean(urlChanged || successIndicatorVisible || authStateEvidence?.hasAuthState);
+  return Boolean(urlChanged || successIndicatorVisible || authStateEvidence?.hasAuthState || formGone);
 }
 
 async function waitForLoginVerification({
@@ -271,6 +283,8 @@ async function waitForLoginVerification({
   loginPathname,
   authFlow,
   credentials,
+  userFieldSelectors = [],
+  passFieldSelectors = [],
   timeoutMs = 25_000,
 } = {}) {
   const start = Date.now();
@@ -281,6 +295,7 @@ async function waitForLoginVerification({
     authStateEvidence: null,
     successSelector: null,
     failureText: null,
+    formGone: false,
   };
 
   while (Date.now() - start < timeoutMs) {
@@ -292,6 +307,12 @@ async function waitForLoginVerification({
     const marker = await isAnyLocatorVisible(page, successLocators, 500);
     const authStateEvidence = await collectAuthStateEvidence(page, context, baseURL);
     const urlChanged = finalPathname !== loginPathname;
+    // If the login form fields have disappeared without a visible error, the SPA
+    // most likely navigated away or unmounted the form after a successful login.
+    // Only treat form-gone as a signal after the first 1 s to let the page settle.
+    const formGone = (Date.now() - start) > 1_000
+      ? await areLoginFieldsGone(page, userFieldSelectors, passFieldSelectors)
+      : false;
 
     last = {
       finalPathname,
@@ -299,6 +320,7 @@ async function waitForLoginVerification({
       authStateEvidence,
       successSelector: marker.selector,
       failureText,
+      formGone,
     };
 
     if (shouldAcceptLoginVerification({
@@ -306,6 +328,7 @@ async function waitForLoginVerification({
       successIndicatorVisible: marker.visible,
       authStateEvidence,
       failureVisible,
+      formGone,
     })) {
       return {
         ok: true,
@@ -313,7 +336,9 @@ async function waitForLoginVerification({
           ? `success_selector:${marker.selector}`
           : authStateEvidence.hasAuthState
             ? `auth_state:${authStateEvidence.cookieName || authStateEvidence.storageKey}`
-            : `url_changed:${loginPathname}->${finalPathname}`,
+            : formGone
+              ? 'form_gone:login_fields_no_longer_visible'
+              : `url_changed:${loginPathname}->${finalPathname}`,
       };
     }
 
@@ -334,9 +359,10 @@ async function waitForLoginVerification({
   const authStateNote = last.authStateEvidence?.hasAuthState
     ? `; auth state present via ${last.authStateEvidence.cookieName || last.authStateEvidence.storageKey}`
     : '; no auth-like cookie/localStorage/sessionStorage observed';
+  const formNote = last.formGone ? '; login form was gone but no other auth signal confirmed' : '';
   return {
     ok: false,
-    reason: `Login verification timed out after submitting ${loginPathname}; final path ${last.finalPathname}${last.query || ''}${indicatorNote}${authStateNote}`,
+    reason: `Login verification timed out after submitting ${loginPathname}; final path ${last.finalPathname}${last.query || ''}${indicatorNote}${authStateNote}${formNote}`,
   };
 }
 
@@ -427,6 +453,8 @@ async function driveLogin({ baseURL, authFlow, credentials, storageStatePath }) 
           loginPathname,
           authFlow: effectiveAuthFlow,
           credentials,
+          userFieldSelectors: userFieldCandidates,
+          passFieldSelectors: passFieldCandidates,
           timeoutMs: effectiveAuthFlow?.successIndicator ? 30_000 : 25_000,
         });
 

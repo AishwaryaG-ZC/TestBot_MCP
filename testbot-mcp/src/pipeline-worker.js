@@ -6006,12 +6006,19 @@ async function maybeGenerateViaSaaS({
   const strictAI = strictAIEnabled(config);
   const client = new WebappClient({ apiKey: healixApiKey });
 
+  // Only pass roles whose login was actually verified. Sending unverified roles
+  // to the generator causes it to produce @auth/@tierB tests that will all fail
+  // at execution time. An empty roles array is the correct signal to the
+  // generator that auth is unavailable → generate public-route and API tests only.
+  const verifiedRoles = (roles || []).filter((r) => r && r.loginVerified && r.storageStatePath);
+  const authAvailable = verifiedRoles.length > 0;
+
   const sharedPayload = {
     context,
     prd: prdContent || '',
     parsedPRD: parsedPRD || null,
     explorationArtifact: explorationArtifact || null,
-    roles: roles || [],
+    roles: verifiedRoles,
     testType: config.testType,
     projectInfo,
     options: {
@@ -6025,6 +6032,19 @@ async function maybeGenerateViaSaaS({
       maxExpansionAttempts: Number.isFinite(Number(config.maxExpansionAttempts))
         ? Math.max(0, Math.floor(Number(config.maxExpansionAttempts)))
         : 0,
+      // When auth is unavailable, tell the generator to avoid @auth/@tierB tests
+      // and focus on public routes and public API endpoints instead.
+      ...(!authAvailable && {
+        skipAuthTests: true,
+        generationFeedback: {
+          instructions: [
+            'Authentication credentials are unavailable or could not be verified. Do NOT generate tests tagged @auth or @tierB.',
+            'Focus ONLY on: (1) public page routes accessible without login, (2) public/unauthenticated API endpoints tagged @api or @tierC, (3) smoke tests and health checks.',
+            'If all observed routes require authentication, generate API-level tests for any REST endpoints in the codebase that can be called without a session (e.g. returning 200 or 401).',
+            'Tag all API tests with @api so they run in Tier C.',
+          ],
+        },
+      }),
     },
   };
 
@@ -7320,6 +7340,8 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     finishedAt: null,
   };
 
+  const verifiedRoles = (roles || []).filter((r) => r && r.loginVerified && r.storageStatePath);
+
   const validateGeneratedTests = config.validateGeneratedTests !== false;
   const qualityRecoveryEvents = [];
   let deterministicTier0Pack = null;
@@ -8112,7 +8134,6 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
   const applyFixtureWiring = (generatorName) => {
     if (!config.generateTests) return null;
     try {
-      const verifiedRoles = (roles || []).filter((r) => r && r.loginVerified && r.storageStatePath);
       const fixtureResult = ensureHealixFixtureImports({ projectPath: config.projectPath, roles: verifiedRoles });
       if (fixtureResult.applied && fixtureResult.patchedFiles > 0) {
         Logger.info('PipelineWorker', 'Rewrote @playwright/test imports to __healix-fixture', {
@@ -8136,7 +8157,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     prd: prdContent || '',
     parsedPRD: parsedPRD || null,
     explorationArtifact: explorationArtifact || null,
-    roles: roles || [],
+    roles: verifiedRoles,
     testType: config.testType,
     projectInfo,
     options: {
@@ -9391,34 +9412,63 @@ async function runPipeline(config, runId) {
 
     routeAccessSummary = routeAccessSummary || buildRouteAccessSummary(explorationArtifact);
     const verifiedRoleCount = roles.filter((r) => r && r.loginVerified && r.storageStatePath).length;
+    const credentialsWereProvided = Array.isArray(config.testCredentials) && config.testCredentials.length > 0;
     if (
       routeAccessSummary.totalObservedRoutes > 0 &&
       routeAccessSummary.publicRoutes.length === 0 &&
       routeAccessSummary.protectedRoutes.length > 0 &&
       verifiedRoleCount === 0
     ) {
-      const authErr = new Error('All observed routes require authentication, but no verified credentials are available.');
-      authErr.code = 'AUTH_REQUIRED_NO_CREDENTIALS';
-      authErr.diagnostics = {
-        stage: 'auth',
-        reason: 'all_observed_routes_protected_no_verified_credentials',
+      if (!credentialsWereProvided) {
+        // No credentials supplied at all — hard abort.
+        const authErr = new Error('All observed routes require authentication, but no verified credentials are available.');
+        authErr.code = 'AUTH_REQUIRED_NO_CREDENTIALS';
+        authErr.diagnostics = {
+          stage: 'auth',
+          reason: 'all_observed_routes_protected_no_verified_credentials',
+          routeAccessSummary,
+        };
+        recordRunDecision(statusDir, telemetryReporter, {
+          runId,
+          decisionType: 'auth_decision',
+          phase: 'auth',
+          status: 'error',
+          errorCode: authErr.code,
+          reason: authErr.diagnostics.reason,
+          message: authErr.message,
+          metadata: {
+            verifiedRoleCount,
+            routeAccessSummary,
+            roles: summarizeAuthRoles(roles),
+          },
+        });
+        throw authErr;
+      }
+      // Credentials were provided but login verification could not confirm
+      // success (e.g. SPA that doesn't redirect or uses non-standard auth
+      // signals). Warn and proceed — tests may still pass if the app is
+      // actually authenticated, and a test-level auth failure is more
+      // actionable than a pipeline abort.
+      Logger.warn('PipelineWorker', 'All observed routes are protected but login verification could not confirm success; proceeding with unverified credentials', {
+        credentialCount: config.testCredentials.length,
         routeAccessSummary,
-      };
+        roles: summarizeAuthRoles(roles),
+      });
       recordRunDecision(statusDir, telemetryReporter, {
         runId,
         decisionType: 'auth_decision',
         phase: 'auth',
-        status: 'error',
-        errorCode: authErr.code,
-        reason: authErr.diagnostics.reason,
-        message: authErr.message,
+        status: 'warning',
+        errorCode: 'AUTH_UNVERIFIED_CREDENTIALS_PROCEEDING',
+        reason: 'all_observed_routes_protected_verification_failed_credentials_provided',
+        message: 'Login verification failed for all roles but credentials were supplied; proceeding anyway.',
         metadata: {
           verifiedRoleCount,
+          credentialCount: config.testCredentials.length,
           routeAccessSummary,
           roles: summarizeAuthRoles(roles),
         },
       });
-      throw authErr;
     }
 
     // -------------------------------------------------------
